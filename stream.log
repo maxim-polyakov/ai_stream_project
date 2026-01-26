@@ -172,3 +172,14 @@
 2026-01-27 01:08:09,458 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
 2026-01-27 01:08:10,102 - __main__ - ERROR - Ошибка Edge TTS: No audio was received. Please verify that your parameters are correct.
 2026-01-27 01:08:17,956 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-01-27 01:09:32,260 - __main__ - INFO - Edge TTS Manager инициализирован
+2026-01-27 01:09:32,260 - __main__ - INFO - AI Stream Manager инициализирован с 4 агентами
+2026-01-27 01:09:35,265 - __main__ - INFO - Выбрана тема: Изменение климата: могут ли технологии спасти планету или нужно менять образ жизни?
+2026-01-27 01:09:42,020 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-01-27 01:10:12,627 - google_auth_oauthlib.flow - INFO - "GET /?state=VXX66SXUOJTIa3jDjJ3ESKHmPJadxx&code=4/0ASc3gC2EylquXkwbq6Usn2WiMywjMx9JEly_9WyKtK2bOPkyvpdoGxl2bNePHlslPUt9eg&scope=https://www.googleapis.com/auth/youtube.force-ssl HTTP/1.1" 200 65
+2026-01-27 01:10:13,044 - googleapiclient.discovery_cache - INFO - file_cache is only supported with oauth2client<4.0.0
+2026-01-27 01:10:13,592 - googleapiclient.http - WARNING - Encountered 403 Forbidden with reason "livePermissionBlocked"
+2026-01-27 01:10:19,053 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-01-27 01:10:21,333 - __main__ - ERROR - Ошибка Edge TTS: No audio was received. Please verify that your parameters are correct.
+2026-01-27 01:10:31,313 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-01-27 01:11:15,592 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"

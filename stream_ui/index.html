@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🤖 AI Agents Live Stream</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #0c2461, #1e3799);
+            color: white;
+            width: 1920px;
+            height: 1080px;
+            overflow: hidden;
+        }
+
+        .stream-container {
+            width: 100%;
+            height: 100%;
+            position: relative;
+            background: radial-gradient(circle at 20% 30%, rgba(74, 105, 255, 0.15), transparent 40%),
+                        radial-gradient(circle at 80% 70%, rgba(255, 107, 139, 0.15), transparent 40%);
+        }
+
+        /* Header */
+        .header {
+            position: absolute;
+            top: 40px;
+            left: 0;
+            width: 100%;
+            text-align: center;
+            padding: 20px;
+            z-index: 100;
+        }
+
+        .title {
+            font-size: 56px;
+            font-weight: 800;
+            background: linear-gradient(90deg, #4a69ff, #6a89ff, #ff6b8b);
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+            margin-bottom: 10px;
+            text-shadow: 0 2px 10px rgba(0, 0, 0, 0.3);
+        }
+
+        .subtitle {
+            font-size: 28px;
+            color: #a5b4ff;
+            font-weight: 300;
+        }
+
+        /* Topic Panel */
+        .topic-panel {
+            position: absolute;
+            top: 160px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(28, 40, 104, 0.9);
+            backdrop-filter: blur(10px);
+            border: 3px solid rgba(74, 105, 255, 0.6);
+            border-radius: 20px;
+            padding: 20px 40px;
+            max-width: 85%;
+            z-index: 90;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+        }
+
+        #current-topic {
+            font-size: 32px;
+            font-weight: 600;
+            text-align: center;
+            color: white;
+            line-height: 1.4;
+        }
+
+        .topic-info {
+            font-size: 20px;
+            color: #a5b4ff;
+            text-align: center;
+            margin-top: 10px;
+        }
+
+        /* Agents Grid */
+        .agents-grid {
+            position: absolute;
+            top: 280px;
+            left: 0;
+            width: 100%;
+            height: 620px;
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            grid-template-rows: repeat(2, 1fr);
+            gap: 40px;
+            padding: 0 80px;
+            z-index: 80;
+        }
+
+        .agent-card {
+            background: rgba(28, 40, 104, 0.8);
+            backdrop-filter: blur(10px);
+            border-radius: 25px;
+            border: 2px solid rgba(255, 255, 255, 0.1);
+            padding: 30px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .agent-card.active {
+            border-color: var(--agent-color);
+            box-shadow: 0 15px 40px var(--agent-glow);
+            transform: translateY(-5px);
+            background: rgba(38, 50, 114, 0.95);
+        }
+
+        .agent-avatar {
+            width: 140px;
+            height: 140px;
+            border-radius: 50%;
+            border: 4px solid var(--agent-color);
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 60px;
+            background: rgba(255, 255, 255, 0.1);
+            transition: all 0.3s;
+        }
+
+        .agent-card.active .agent-avatar {
+            transform: scale(1.05);
+            box-shadow: 0 0 30px var(--agent-glow);
+            border-width: 5px;
+        }
+
+        .agent-name {
+            font-size: 32px;
+            font-weight: 700;
+            margin-bottom: 8px;
+            text-align: center;
+        }
+
+        .agent-expertise {
+            font-size: 22px;
+            color: var(--agent-color);
+            margin-bottom: 20px;
+            text-align: center;
+            font-weight: 500;
+        }
+
+        .agent-message {
+            font-size: 20px;
+            color: #e8eeff;
+            text-align: center;
+            line-height: 1.5;
+            min-height: 140px;
+            padding: 20px;
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 15px;
+            width: 100%;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            overflow-y: auto;
+            max-height: 140px;
+        }
+
+        /* Speech Indicator */
+        .speech-indicator {
+            display: flex;
+            gap: 6px;
+            margin-top: 20px;
+            opacity: 0;
+            transition: opacity 0.3s;
+            height: 30px;
+            align-items: flex-end;
+        }
+
+        .agent-card.active .speech-indicator {
+            opacity: 1;
+        }
+
+        .speech-bar {
+            width: 6px;
+            background: var(--agent-color);
+            border-radius: 3px;
+            animation: speechWave 1.4s infinite ease-in-out;
+        }
+
+        .speech-bar:nth-child(1) { animation-delay: 0.0s; height: 15px; }
+        .speech-bar:nth-child(2) { animation-delay: 0.1s; height: 20px; }
+        .speech-bar:nth-child(3) { animation-delay: 0.2s; height: 25px; }
+        .speech-bar:nth-child(4) { animation-delay: 0.3s; height: 20px; }
+        .speech-bar:nth-child(5) { animation-delay: 0.4s; height: 15px; }
+
+        @keyframes speechWave {
+            0%, 100% { transform: scaleY(0.5); }
+            50% { transform: scaleY(1.2); }
+        }
+
+        /* Footer */
+        .footer {
+            position: absolute;
+            bottom: 40px;
+            left: 0;
+            width: 100%;
+            padding: 0 80px;
+            z-index: 100;
+        }
+
+        .stats-bar {
+            background: rgba(28, 40, 104, 0.9);
+            backdrop-filter: blur(10px);
+            border: 2px solid rgba(74, 105, 255, 0.4);
+            border-radius: 20px;
+            padding: 20px 40px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .stat-item {
+            font-size: 22px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .stat-icon {
+            font-size: 26px;
+        }
+
+        #online-status {
+            color: #ff3838;
+            font-weight: 700;
+        }
+
+        /* Time Display */
+        .time-display {
+            position: absolute;
+            top: 50px;
+            right: 50px;
+            font-size: 22px;
+            color: #a5b4ff;
+            font-family: 'Courier New', monospace;
+            background: rgba(0, 0, 0, 0.3);
+            padding: 10px 20px;
+            border-radius: 10px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        /* Message Counter */
+        .message-counter {
+            position: absolute;
+            top: 50px;
+            left: 50px;
+            font-size: 22px;
+            color: #a5b4ff;
+            background: rgba(0, 0, 0, 0.3);
+            padding: 10px 20px;
+            border-radius: 10px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+    </style>
+</head>
+<body>
+    <div class="stream-container">
+        <!-- Time Display -->
+        <div class="time-display" id="current-time">00:00:00</div>
+
+        <!-- Message Counter -->
+        <div class="message-counter">
+            <span id="message-count">Сообщений: 0</span>
+        </div>
+
+        <!-- Header -->
+        <div class="header">
+            <h1 class="title">🎙️ AI AGENTS LIVE DEBATE</h1>
+            <div class="subtitle">Автономные ИИ обсуждают науку в реальном времени</div>
+        </div>
+
+        <!-- Topic Panel -->
+        <div class="topic-panel">
+            <div id="current-topic">Загрузка темы дискуссии...</div>
+            <div class="topic-info">Раунд: <span id="current-round">1</span></div>
+        </div>
+
+        <!-- Agents Grid -->
+        <div class="agents-grid" id="agents-grid">
+            <!-- Agents loaded by JavaScript -->
+        </div>
+
+        <!-- Footer -->
+        <div class="footer">
+            <div class="stats-bar">
+                <div class="stat-item">
+                    <span class="stat-icon">🤖</span>
+                    <span>4 AI агента</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-icon">🔴</span>
+                    <span id="online-status">● В ЭФИРЕ</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-icon">⚡</span>
+                    <span id="stream-status">Генерация ответов через OpenAI GPT-4</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script>
+        // Initialize WebSocket
+        const socket = io('http://localhost:5000');
+
+        // State
+        let agents = [];
+        let currentTopic = '';
+        let currentRound = 1;
+        let messageCount = 0;
+        let activeAgent = null;
+
+        // DOM Elements
+        const agentsGrid = document.getElementById('agents-grid');
+        const currentTopicEl = document.getElementById('current-topic');
+        const currentRoundEl = document.getElementById('current-round');
+        const messageCountEl = document.getElementById('message-count');
+        const currentTimeEl = document.getElementById('current-time');
+        const onlineStatusEl = document.getElementById('online-status');
+        const streamStatusEl = document.getElementById('stream-status');
+
+        // Agent colors with glow effects
+        const agentStyles = {
+            1: { color: '#4a69ff', glow: 'rgba(74, 105, 255, 0.4)' },
+            2: { color: '#ff6b8b', glow: 'rgba(255, 107, 139, 0.4)' },
+            3: { color: '#1dd1a1', glow: 'rgba(29, 209, 161, 0.4)' },
+            4: { color: '#f9ca24', glow: 'rgba(249, 202, 36, 0.4)' }
+        };
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', function() {
+            console.log('🎬 AI Stream UI загружен');
+            updateTime();
+            initLoadingState();
+        });
+
+        // Update current time
+        function updateTime() {
+            const now = new Date();
+            currentTimeEl.textContent = now.toLocaleTimeString('ru-RU', {
+                hour12: false,
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit'
+            });
+            setTimeout(updateTime, 1000);
+        }
+
+        // Initialize loading state
+        function initLoadingState() {
+            agentsGrid.innerHTML = '';
+
+            for (let i = 1; i <= 4; i++) {
+                const style = agentStyles[i];
+                const card = document.createElement('div');
+                card.className = 'agent-card';
+                card.id = `agent-${i}`;
+                card.style.setProperty('--agent-color', style.color);
+                card.style.setProperty('--agent-glow', style.glow);
+
+                const avatars = ['👨‍🔬', '👩‍🔬', '👨‍⚕️', '👩‍💻'];
+                const names = ['Загрузка...', 'Загрузка...', 'Загрузка...', 'Загрузка...'];
+                const expertise = ['Подключение...', 'Подключение...', 'Подключение...', 'Подключение...'];
+
+                card.innerHTML = `
+                    <div class="agent-avatar">${avatars[i-1]}</div>
+                    <div class="agent-name">${names[i-1]}</div>
+                    <div class="agent-expertise">${expertise[i-1]}</div>
+                    <div class="agent-message">Подключение к OpenAI GPT-4...</div>
+                    <div class="speech-indicator">
+                        <div class="speech-bar"></div>
+                        <div class="speech-bar"></div>
+                        <div class="speech-bar"></div>
+                        <div class="speech-bar"></div>
+                        <div class="speech-bar"></div>
+                    </div>
+                `;
+
+                agentsGrid.appendChild(card);
+            }
+        }
+
+        // Initialize agents from server data
+        function initAgents(agentsData) {
+            agentsGrid.innerHTML = '';
+
+            agentsData.forEach(agent => {
+                const style = agentStyles[agent.id] || agentStyles[1];
+                const card = document.createElement('div');
+                card.className = 'agent-card';
+                card.id = `agent-${agent.id}`;
+                card.style.setProperty('--agent-color', agent.color || style.color);
+                card.style.setProperty('--agent-glow', style.glow);
+
+                card.innerHTML = `
+                    <div class="agent-avatar">${agent.avatar || '🤖'}</div>
+                    <div class="agent-name">${agent.name}</div>
+                    <div class="agent-expertise">${agent.expertise}</div>
+                    <div class="agent-message">Ожидание начала дискуссии...</div>
+                    <div class="speech-indicator">
+                        <div class="speech-bar"></div>
+                        <div class="speech-bar"></div>
+                        <div class="speech-bar"></div>
+                        <div class="speech-bar"></div>
+                        <div class="speech-bar"></div>
+                    </div>
+                `;
+
+                agentsGrid.appendChild(card);
+            });
+
+            agents = agentsData;
+        }
+
+        // WebSocket Event Handlers
+        socket.on('connect', () => {
+            console.log('✅ Подключено к стрим серверу');
+            onlineStatusEl.textContent = '● В ЭФИРЕ';
+            onlineStatusEl.style.color = '#ff3838';
+            streamStatusEl.textContent = 'Подключено к OpenAI GPT-4';
+        });
+
+        socket.on('connected', (data) => {
+            console.log('📊 Получены данные сервера:', data);
+
+            if (data.topic) {
+                currentTopic = data.topic;
+                currentTopicEl.textContent = currentTopic;
+            }
+
+            if (data.agents) {
+                initAgents(data.agents);
+            }
+
+            if (data.stats) {
+                messageCount = data.stats.message_count || 0;
+                messageCountEl.textContent = `Сообщений: ${messageCount}`;
+                currentRound = data.stats.discussion_round || 1;
+                currentRoundEl.textContent = currentRound;
+            }
+        });
+
+        socket.on('topic_update', (data) => {
+            currentTopic = data.topic;
+            currentTopicEl.textContent = currentTopic;
+            currentRound = data.round || currentRound;
+            currentRoundEl.textContent = currentRound;
+
+            // Animation
+            currentTopicEl.style.animation = 'none';
+            setTimeout(() => {
+                currentTopicEl.style.animation = 'pulse 0.5s';
+            }, 10);
+        });
+
+        socket.on('agent_start_speaking', (data) => {
+            activeAgent = data.agent_id;
+            updateAgentCards();
+            streamStatusEl.textContent = `${data.agent_name} генерирует ответ...`;
+        });
+
+        socket.on('new_message', (data) => {
+            const agentCard = document.getElementById(`agent-${data.agent_id}`);
+            if (agentCard) {
+                const messageEl = agentCard.querySelector('.agent-message');
+                messageEl.textContent = data.message;
+
+                // Update expertise
+                const expertiseEl = agentCard.querySelector('.agent-expertise');
+                if (expertiseEl && data.expertise) {
+                    expertiseEl.textContent = data.expertise;
+                }
+
+                // Update avatar
+                const avatarEl = agentCard.querySelector('.agent-avatar');
+                if (avatarEl && data.avatar) {
+                    avatarEl.textContent = data.avatar;
+                }
+
+                // Update color
+                if (data.color) {
+                    agentCard.style.setProperty('--agent-color', data.color);
+                    const speechBars = agentCard.querySelectorAll('.speech-bar');
+                    speechBars.forEach(bar => {
+                        bar.style.background = data.color;
+                    });
+                }
+
+                // Message animation
+                messageEl.style.animation = 'none';
+                setTimeout(() => {
+                    messageEl.style.animation = 'fadeIn 0.5s';
+                }, 10);
+            }
+
+            messageCount = data.message_count || messageCount + 1;
+            messageCountEl.textContent = `Сообщений: ${messageCount}`;
+            streamStatusEl.textContent = `${data.agent_name} говорит...`;
+        });
+
+        socket.on('agent_stop_speaking', (data) => {
+            if (data && data.agent_id === activeAgent) {
+                activeAgent = null;
+                updateAgentCards();
+                streamStatusEl.textContent = 'Обработка следующего агента...';
+            }
+        });
+
+        socket.on('round_complete', (data) => {
+            currentRound = data.round;
+            currentRoundEl.textContent = currentRound;
+            streamStatusEl.textContent = `Раунд ${currentRound} завершен. Следующий через ${data.next_round_in}с`;
+        });
+
+        socket.on('discussion_started', () => {
+            console.log('▶️ Дискуссия начата');
+            onlineStatusEl.textContent = '● ОБСУЖДЕНИЕ АКТИВНО';
+            onlineStatusEl.style.color = '#1dd1a1';
+        });
+
+        socket.on('discussion_stopped', () => {
+            console.log('⏸️ Дискуссия остановлена');
+            onlineStatusEl.textContent = '● В ЭФИРЕ';
+            onlineStatusEl.style.color = '#ff3838';
+        });
+
+        socket.on('topic_changed', (data) => {
+            currentTopic = data.topic;
+            currentTopicEl.textContent = currentTopic;
+            streamStatusEl.textContent = 'Тема обновлена. Продолжение дискуссии...';
+        });
+
+        function updateAgentCards() {
+            document.querySelectorAll('.agent-card').forEach(card => {
+                card.classList.remove('active');
+            });
+
+            if (activeAgent) {
+                const agentCard = document.getElementById(`agent-${activeAgent}`);
+                if (agentCard) {
+                    agentCard.classList.add('active');
+                }
+            }
+        }
+
+        // Auto-reconnect
+        socket.on('disconnect', () => {
+            console.log('❌ Отключено от сервера');
+            onlineStatusEl.textContent = '● ПЕРЕПОДКЛЮЧЕНИЕ...';
+            onlineStatusEl.style.color = '#f9ca24';
+            streamStatusEl.textContent = 'Потеряно соединение с сервером';
+
+            setTimeout(() => {
+                socket.connect();
+            }, 3000);
+        });
+
+        // Add some CSS animations
+        const style = document.createElement('style');
+        style.textContent = `
+            @keyframes pulse {
+                0% { transform: scale(1); }
+                50% { transform: scale(1.02); }
+                100% { transform: scale(1); }
+            }
+
+            @keyframes fadeIn {
+                from { opacity: 0; transform: translateY(10px); }
+                to { opacity: 1; transform: translateY(0); }
+            }
+        `;
+        document.head.appendChild(style);
+    </script>
+</body>
+</html>

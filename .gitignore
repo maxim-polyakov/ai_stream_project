@@ -4,3 +4,4 @@
 *.log
 stream.log
 client_secret.json
+.env

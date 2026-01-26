@@ -285,3 +285,33 @@
 2026-01-27 01:49:10,253 - __main__ - ERROR - Ошибка воспроизведения: music_drmp3: corrupt mp3 file (bad tags).
 2026-01-27 01:49:13,882 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 403 Forbidden"
 2026-01-27 01:49:13,882 - __main__ - ERROR - Ошибка генерации ответа для Профессор Мария Соколова: Error code: 403 - {'error': {'code': 'unsupported_country_region_territory', 'message': 'Country, region, or territory not supported', 'param': None, 'type': 'request_forbidden'}}
+2026-01-27 02:06:43,394 - __main__ - INFO - Edge TTS Manager инициализирован
+2026-01-27 02:06:43,394 - __main__ - INFO - AI Stream Manager инициализирован с 4 агентами
+2026-01-27 02:06:46,398 - __main__ - INFO - Выбрана тема: Колонизация Марса: научная необходимость или дорогая фантазия?
+2026-01-27 02:06:55,308 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-01-27 02:07:39,588 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-01-27 02:07:40,222 - __main__ - ERROR - Ошибка Edge TTS: No audio was received. Please verify that your parameters are correct.
+2026-01-27 02:07:52,363 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-01-27 02:08:39,821 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-01-27 02:10:03,438 - __main__ - INFO - Edge TTS Manager инициализирован
+2026-01-27 02:10:03,439 - __main__ - INFO - AI Stream Manager инициализирован с 4 агентами
+2026-01-27 02:10:06,443 - __main__ - INFO - Выбрана тема: Колонизация Марса: научная необходимость или дорогая фантазия?
+2026-01-27 02:10:14,759 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-01-27 02:11:41,570 - __main__ - INFO - Edge TTS Manager инициализирован
+2026-01-27 02:11:41,570 - __main__ - INFO - AI Stream Manager инициализирован с 4 агентами
+2026-01-27 02:11:43,694 - googleapiclient.discovery_cache - INFO - file_cache is only supported with oauth2client<4.0.0
+2026-01-27 02:11:44,255 - googleapiclient.http - WARNING - Encountered 403 Forbidden with reason "livePermissionBlocked"
+2026-01-27 02:11:44,574 - __main__ - INFO - Выбрана тема: Изменение климата: могут ли технологии спасти планету или нужно менять образ жизни?
+2026-01-27 02:11:50,639 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-01-27 02:12:24,956 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-01-27 02:14:27,341 - __main__ - INFO - Edge TTS Manager инициализирован
+2026-01-27 02:14:27,341 - __main__ - INFO - AI Stream Manager инициализирован с 4 агентами
+2026-01-27 02:14:30,345 - __main__ - INFO - Выбрана тема: Бионические импланты и трансгуманизм: что значит быть человеком в XXI веке?
+2026-01-27 02:14:30,731 - googleapiclient.discovery_cache - INFO - file_cache is only supported with oauth2client<4.0.0
+2026-01-27 02:14:32,541 - googleapiclient.http - WARNING - Encountered 403 Forbidden with reason "livePermissionBlocked"
+2026-01-27 02:14:35,667 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-01-27 02:19:54,740 - __main__ - INFO - Edge TTS Manager инициализирован
+2026-01-27 02:19:54,741 - __main__ - INFO - AI Stream Manager инициализирован с 4 агентами
+2026-01-27 02:19:57,745 - __main__ - INFO - Выбрана тема: Генная инженерия и CRISPR: где граница между лечением и дизайном человека?
+2026-01-27 02:19:58,312 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 403 Forbidden"
+2026-01-27 02:19:58,313 - __main__ - ERROR - Ошибка генерации ответа для Профессор Мария Соколова: Error code: 403 - {'error': {'code': 'unsupported_country_region_territory', 'message': 'Country, region, or territory not supported', 'param': None, 'type': 'request_forbidden'}}

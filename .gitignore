@@ -6,3 +6,4 @@ stream.log
 client_secret.json
 .env
 *.log
+token.json

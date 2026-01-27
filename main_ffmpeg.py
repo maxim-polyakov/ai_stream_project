@@ -2010,7 +2010,15 @@ def api_change_topic():
     return jsonify({'success': True, 'topic': topic})
 
 
+def signal_handler(signum, frame):
+    """Обработчик сигналов"""
+    print(f"\n🛑 Получен сигнал {signum}. Завершение...")
 
+    # Останавливаем стрим
+    if ffmpeg_manager.is_streaming:
+        ffmpeg_manager.stop_stream()
+
+    sys.exit(0)
 
 
 if __name__ == '__main__':

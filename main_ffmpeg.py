@@ -629,8 +629,8 @@ class YouTubeOAuthStream:
 
 # ========== FFMPEG STREAM MANAGER с ПАЙПАМИ ==========
 
-class FFmpegPipeStreamManager:
-    """Управление FFmpeg стримом на YouTube с пайпами для аудио"""
+class FFmpegStreamManager:
+    """Управление FFmpeg стримом на YouTube"""
 
     def __init__(self):
         self.stream_process = None
@@ -638,12 +638,18 @@ class FFmpegPipeStreamManager:
         self.stream_key = None
         self.rtmp_url = None
         self.ffmpeg_pid = None
-        self.last_error = None
-        self.stream_start_time = None
+        self.video_source = "black"
+        self.ffmpeg_stdin = None
+        self.start_time = None
+        self.audio_queue = []  # Очередь аудио файлов для воспроизведения
+        self.is_playing_audio = False
 
-        # Создаем папки для временных файлов
-        os.makedirs('temp_videos', exist_ok=True)
-        os.makedirs('audio_cache', exist_ok=True)
+        # Настройки аудио
+        self.audio_sample_rate = 44100
+        self.audio_channels = 2
+
+        # Флаг для определения, используем ли мы PyAudio
+        self.use_pyaudio = PYTHON_AUDIO_AVAILABLE
 
     def set_stream_key(self, stream_key: str):
         """Установка ключа стрима"""
@@ -652,456 +658,486 @@ class FFmpegPipeStreamManager:
         logger.info(f"🔑 Stream Key установлен: {stream_key[:10]}...")
         return True
 
-    def start_stream(self) -> Dict[str, Any]:
-        """Запуск FFmpeg стрима - УПРОЩЕННАЯ РАБОЧАЯ ВЕРСИЯ"""
+    def set_video_source(self, source_type: str, source_param: str = None):
+        """Установка источника видео"""
+        self.video_source = source_type
+        self.video_param = source_param
+        logger.info(f"📹 Источник видео: {source_type}")
+
+    def start_stream(self, use_audio: bool = True):
+        """Запуск FFmpeg стрима с передачей аудио"""
         if not self.stream_key:
             logger.error("❌ Stream Key не установлен!")
-            return {'success': False, 'error': 'Stream Key не установлен'}
+            return False
 
         try:
-            self.stream_start_time = time.time()
+            self.start_time = time.time()
 
-            # УПРОЩЕННАЯ КОМАНДА FFMPEG БЕЗ ПАЙПОВ
-            # Основной поток с тишиной, аудио будет добавляться отдельными процессами
+            # Видео источник
+            if self.video_source == "http":
+                video_input = [
+                    '-f', 'image2pipe',
+                    '-i', 'http://localhost:5000/video_feed',
+                    '-framerate', '30'
+                ]
+            elif self.video_source == "x11grab":
+                video_input = [
+                    '-f', 'x11grab',
+                    '-i', ':99',
+                    '-video_size', '1920x1080',
+                    '-framerate', '30'
+                ]
+            else:
+                video_input = [
+                    '-f', 'lavfi',
+                    '-i',
+                    f'color=c=black:s=1920x1080:r=30:drawtext=text="AI\\\\ Stream\\\\ {datetime.now().strftime("%H:%M")}":fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2'
+                ]
+
+            # Параметры аудио
+            if use_audio and self.use_pyaudio:
+                # Аудио вход из stdin (сырые данные)
+                audio_input = [
+                    '-f', 's16le',  # 16-bit little-endian PCM
+                    '-ar', str(self.audio_sample_rate),
+                    '-ac', str(self.audio_channels),
+                    '-i', 'pipe:0',  # Читать из stdin
+                ]
+            else:
+                # Тихий аудио
+                audio_input = [
+                    '-f', 'lavfi',
+                    '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100'
+                ]
+
+            # Команда FFmpeg
             ffmpeg_cmd = [
                 'ffmpeg',
-                '-re',  # Реальное время
-                '-f', 'lavfi',
-                '-i',
-                "color=c=black:s=1920x1080:r=30,drawtext=text='AI Live Stream':fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2:box=1:boxcolor=black@0.5",
-                '-f', 'lavfi',
-                '-i', 'anullsrc=r=44100:cl=stereo',  # Тишина
+                '-re',  # Реальное время для видео
+                *video_input,
+                *audio_input,
+
+                # Кодек видео
                 '-c:v', 'libx264',
                 '-preset', 'veryfast',
                 '-tune', 'zerolatency',
                 '-pix_fmt', 'yuv420p',
                 '-g', '60',
-                '-b:v', '3000k',
-                '-maxrate', '3500k',
-                '-bufsize', '6000k',
+                '-b:v', '4500k',
+                '-maxrate', '4500k',
+                '-bufsize', '9000k',
+
+                # Кодек аудио
                 '-c:a', 'aac',
                 '-b:a', '128k',
                 '-ar', '44100',
                 '-ac', '2',
+
+                # Формат вывода
                 '-f', 'flv',
                 self.rtmp_url
             ]
 
-            logger.info(f"🚀 Запуск FFmpeg стрима")
-            logger.info(f"📍 RTMP URL: {self.rtmp_url}")
+            logger.info(f"🚀 Запуск FFmpeg: {' '.join(ffmpeg_cmd[:10])}...")
 
             # Запускаем FFmpeg
             self.stream_process = subprocess.Popen(
                 ffmpeg_cmd,
-                stdin=subprocess.PIPE,
+                stdin=subprocess.PIPE if (use_audio and self.use_pyaudio) else None,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
-                bufsize=1,
-                universal_newlines=False
+                text=False,
+                bufsize=0
             )
 
             self.is_streaming = True
             self.ffmpeg_pid = self.stream_process.pid
+            self.ffmpeg_stdin = self.stream_process.stdin
 
-            # Запускаем мониторинг
-            self._start_monitor_thread()
+            # Запуск мониторинга
+            threading.Thread(target=self._monitor_ffmpeg, daemon=True).start()
+
+            # Запуск обработчика аудио
+            if use_audio and self.use_pyaudio:
+                threading.Thread(target=self._audio_processor, daemon=True).start()
 
             logger.info(f"🎬 FFmpeg стрим запущен (PID: {self.ffmpeg_pid})")
-
-            # Даем время на запуск
-            time.sleep(2)
-
-            return {
-                'success': True,
-                'pid': self.ffmpeg_pid,
-                'stream_key': self.stream_key,
-                'rtmp_url': self.rtmp_url,
-                'message': 'FFmpeg стрим запущен. Ждите 30-60 секунд для начала трансляции на YouTube.'
-            }
+            return True
 
         except Exception as e:
             logger.error(f"❌ Ошибка запуска FFmpeg: {e}", exc_info=True)
-            return {'success': False, 'error': str(e)}
+            return False
 
-    def _send_test_audio(self):
-        """Отправка тестового аудио для проверки"""
+    def _monitor_ffmpeg(self):
+        """Мониторинг процесса FFmpeg"""
         try:
-            # Ждем запуска FFmpeg
-            time.sleep(5)
+            stream_connected = False
 
-            # Генерируем простое тестовое аудио
-            test_text = "Тестовое аудио для проверки стрима. Звук должен быть слышен на трансляции."
+            for line in iter(self.stream_process.stderr.readline, b''):
+                line = line.decode('utf-8', errors='ignore').strip()
 
-            # Создаем временный файл с тестовым аудио
-            temp_audio = os.path.join('temp_audio', f'test_{int(time.time())}.mp3')
+                # Проверяем подключение
+                if 'rtmp://' in line and ('connected' in line.lower() or 'connected to' in line.lower()):
+                    if not stream_connected:
+                        stream_connected = True
+                        logger.info("✅ Успешное подключение к YouTube RTMP серверу")
+                        socketio.emit('stream_connected', {'status': 'connected'})
 
-            # Создаем тестовое аудио с помощью edge-tts
-            import edge_tts
-            communicate = edge_tts.Communicate(
-                text=test_text,
-                voice='ru-RU-DmitryNeural'
-            )
+                # Логируем статистику
+                if 'frame=' in line and 'fps=' in line:
+                    logger.debug(f"FFmpeg: {line}")
+                elif 'error' in line.lower() or 'failed' in line.lower():
+                    logger.error(f"FFmpeg error: {line}")
+                    socketio.emit('stream_error', {'message': line})
 
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(communicate.save(temp_audio))
-
-            # Отправляем в очередь
-            if os.path.exists(temp_audio):
-                self.play_audio(temp_audio)
-                logger.info("🔊 Тестовое аудио отправлено")
+            # Ждем завершения процесса
+            self.stream_process.wait()
 
         except Exception as e:
-            logger.warning(f"⚠️ Не удалось отправить тестовое аудио: {e}")
-
-    def _start_text_updater(self):
-        """Обновление текста на видео"""
-
-        def updater():
-            while self.is_streaming:
+            logger.error(f"Ошибка мониторинга FFmpeg: {e}")
+        finally:
+            self.is_streaming = False
+            if self.ffmpeg_stdin:
                 try:
-                    current_time = datetime.now().strftime("%H:%M:%S")
-                    status = "Трансляция активна" if self.is_streaming else "Пауза"
-
-                    # Обновляем файл с текстом
-                    with open('dynamic_text.txt', 'w', encoding='utf-8') as f:
-                        f.write(f"Время: {current_time} | {status}")
-
-                    time.sleep(1)
+                    self.ffmpeg_stdin.close()
                 except:
-                    time.sleep(5)
+                    pass
 
-        thread = threading.Thread(target=updater, daemon=True)
-        thread.start()
+    def _audio_processor(self):
+        """Обработчик аудио очереди"""
+        import numpy as np
 
-    def _start_audio_handler(self):
-        """Запуск обработчика аудио очереди"""
-
-        def audio_handler():
-            logger.info("🎵 Запуск обработчика аудио")
-
-            # Открываем пайп для записи
+        while self.is_streaming:
             try:
-                with open(self.audio_pipe, 'wb') as pipe_fd:
-                    logger.info("✅ Аудио пайп открыт для записи")
+                if self.audio_queue:
+                    audio_file = self.audio_queue.pop(0)
+                    self.is_playing_audio = True
+                    self.stream_audio_realtime(audio_file)
+                    self.is_playing_audio = False
+                else:
+                    # Отправляем тишину
+                    silence_duration = 0.1  # 100 мс
+                    samples = int(self.audio_sample_rate * silence_duration)
+                    silence = np.zeros(samples * self.audio_channels, dtype=np.int16).tobytes()
 
-                    # Сначала отправляем тишину для инициализации
-                    silence_samples = int(44100 * 1.0 * 2 * 2)  # 1 сек тишины
-                    silence_data = bytes(silence_samples)
-                    pipe_fd.write(silence_data)
-                    pipe_fd.flush()
-
-                    while self.is_streaming:
+                    if self.ffmpeg_stdin:
                         try:
-                            # Ждем аудио файл в очереди
-                            audio_file = self.audio_queue.get(timeout=1)
-                            if audio_file and os.path.exists(audio_file):
-                                logger.info(f"🎵 Отправка аудио в пайп: {os.path.basename(audio_file)}")
-                                self._send_audio_to_pipe(pipe_fd, audio_file)
-                        except queue.Empty:
-                            # Если очередь пуста, отправляем тишину
-                            silence_samples = int(44100 * 0.1 * 2 * 2)  # 100 мс тишины
-                            silence_data = bytes(silence_samples)
-                            pipe_fd.write(silence_data)
-                            pipe_fd.flush()
-                            continue
-                        except Exception as e:
-                            logger.error(f"❌ Ошибка обработки аудио: {e}")
+                            self.ffmpeg_stdin.write(silence)
+                            self.ffmpeg_stdin.flush()
+                        except:
+                            break
+
+                    time.sleep(silence_duration)
             except Exception as e:
-                logger.error(f"❌ Ошибка в обработчике аудио: {e}")
+                logger.error(f"Ошибка обработчика аудио: {e}")
+                time.sleep(0.1)
 
-        self.audio_thread = threading.Thread(target=audio_handler, daemon=True)
-        self.audio_thread.start()
+    def add_audio_to_queue(self, audio_file: str):
+        """Добавление аудио файла в очередь на воспроизведение"""
+        if not os.path.exists(audio_file):
+            logger.error(f"❌ Аудио файл не найден: {audio_file}")
+            return False
 
-    def _send_audio_to_pipe(self, pipe_fd, audio_file: str):
-        """Отправка аудио файла в пайп FFmpeg"""
+        self.audio_queue.append(audio_file)
+        logger.info(f"🎵 Аудио добавлено в очередь: {os.path.basename(audio_file)}")
+        logger.info(f"📊 Очередь аудио: {len(self.audio_queue)} файлов")
+        return True
+
+    def send_audio_to_stream(self, audio_data: bytes):
+        """Отправка аудио данных в стрим"""
+        if not self.is_streaming or not self.ffmpeg_stdin:
+            logger.warning("⚠️ Не могу отправить аудио: стрим не активен")
+            return False
+
         try:
-            if not os.path.exists(audio_file):
-                logger.error(f"❌ Аудио файл не найден: {audio_file}")
+            # Отправляем аудио в FFmpeg
+            self.ffmpeg_stdin.write(audio_data)
+            self.ffmpeg_stdin.flush()
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка отправки аудио: {e}")
+            return False
+
+    def play_audio_file(self, audio_file: str):
+        """Воспроизведение аудио файла (MP3) и отправка в стрим"""
+        if not os.path.exists(audio_file):
+            logger.error(f"❌ Аудио файл не найден: {audio_file}")
+            return False
+
+        try:
+            # Используем ffmpeg для конвертации MP3 в сырое аудио
+            ffmpeg_cmd = [
+                'ffmpeg',
+                '-i', audio_file,  # Входной MP3 файл
+                '-f', 's16le',  # Формат выхода: 16-bit PCM
+                '-ar', '44100',  # Частота дискретизации
+                '-ac', '2',  # Стерео
+                '-acodec', 'pcm_s16le',  # Кодек для выхода
+                '-'  # Вывод в stdout
+            ]
+
+            logger.debug(f"Конвертируем аудио: {os.path.basename(audio_file)}")
+
+            # Запускаем ffmpeg для конвертации
+            process = subprocess.Popen(
+                ffmpeg_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=10 ** 8  # Большой буфер для плавного воспроизведения
+            )
+
+            # Читаем выходные данные и отправляем в стрим
+            while True:
+                audio_data = process.stdout.read(4096)  # Читаем порциями
+                if not audio_data:
+                    break
+
+                # Отправляем в FFmpeg stdin
+                if self.ffmpeg_stdin:
+                    try:
+                        self.ffmpeg_stdin.write(audio_data)
+                        self.ffmpeg_stdin.flush()
+                    except BrokenPipeError:
+                        logger.error("❌ FFmpeg stdin закрыт")
+                        break
+
+            # Ждем завершения конвертации
+            process.wait()
+
+            # Проверяем на ошибки
+            if process.returncode != 0:
+                error_output = process.stderr.read().decode('utf-8', errors='ignore')
+                logger.error(f"Ошибка конвертации аудио: {error_output}")
                 return False
 
+            logger.info(f"✅ Аудио отправлено в стрим: {os.path.basename(audio_file)}")
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка воспроизведения аудио файла: {e}")
+            return False
+
+    def stream_audio_realtime(self, audio_file: str):
+        """Стриминг аудио в реальном времени с синхронизацией"""
+        if not self.is_streaming:
+            logger.warning("Стрим не активен")
+            return False
+
+        try:
             # Получаем длительность аудио
             duration = self._get_audio_duration(audio_file)
-            logger.info(f"⏱️  Длительность аудио: {duration:.1f} сек")
 
-            # Конвертируем аудио в сырой формат для пайпа
-            raw_audio_file = audio_file.replace('.mp3', '.raw')
+            # Команда для конвертации и отправки аудио в реальном времени
+            ffmpeg_cmd = [
+                'ffmpeg',
+                '-re',  # Реальное время (важно для синхронизации!)
+                '-i', audio_file,  # Входной файл
+                '-f', 's16le',  # Формат выхода
+                '-ar', '44100',  # Частота дискретизации
+                '-ac', '2',  # Стерео
+                '-c:a', 'pcm_s16le',  # Кодек аудио
+                '-'  # Вывод в stdout
+            ]
 
+            logger.info(f"🎵 Стриминг аудио: {os.path.basename(audio_file)} ({duration:.1f} сек)")
+
+            process = subprocess.Popen(
+                ffmpeg_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0
+            )
+
+            # Стримим аудио порциями
+            chunk_size = 88200  # 0.5 секунды аудио (44100 Гц * 2 канала * 2 байта)
+
+            while True:
+                audio_data = process.stdout.read(chunk_size)
+                if not audio_data:
+                    break
+
+                if self.ffmpeg_stdin:
+                    try:
+                        self.ffmpeg_stdin.write(audio_data)
+                        self.ffmpeg_stdin.flush()
+                    except BrokenPipeError:
+                        logger.error("FFmpeg перестал принимать аудио")
+                        break
+
+            process.wait()
+            logger.info(f"✅ Аудио завершено: {os.path.basename(audio_file)}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Ошибка стриминга аудио: {e}")
+            return False
+
+    def _get_audio_duration(self, audio_file: str) -> float:
+        """Получение длительности аудио файла через ffprobe"""
+        try:
             cmd = [
+                'ffprobe',
+                '-v', 'error',
+                '-show_entries', 'format=duration',
+                '-of', 'csv=p=0',
+                audio_file
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                return float(result.stdout.strip())
+        except:
+            pass
+
+        # Если не получилось, оцениваем примерно
+        try:
+            # Примерная оценка: 0.1 секунды на слово
+            import re
+            with open(audio_file, 'rb') as f:
+                # Читаем ID3 тег для MP3
+                f.seek(-128, 2)
+                tag = f.read(3)
+                if tag == b'TAG':
+                    # MP3 с тегом
+                    return 5.0
+        except:
+            pass
+
+        return 5.0  # Значение по умолчанию
+
+    def stream_audio_sync(self, audio_file: str, wait_for_completion: bool = True):
+        """Синхронное воспроизведение аудио файла"""
+        if not self.is_streaming:
+            logger.warning("Стрим не активен")
+            return False
+
+        try:
+            # Создаем отдельный процесс для конвертации и отправки аудио
+            ffmpeg_cmd = [
                 'ffmpeg',
                 '-i', audio_file,
                 '-f', 's16le',
                 '-ar', '44100',
                 '-ac', '2',
-                '-acodec', 'pcm_s16le',
-                raw_audio_file
+                '-'
             ]
 
-            # Конвертируем в сырой формат
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-            if result.returncode != 0:
-                logger.error(f"❌ Ошибка конвертации аудио: {result.stderr[:200]}")
-                return False
-
-            # Отправляем сырое аудио в пайп
-            with open(raw_audio_file, 'rb') as audio_fd:
-                # Читаем и отправляем данные
-                chunk_size = 4096
-                bytes_sent = 0
-                while True:
-                    chunk = audio_fd.read(chunk_size)
-                    if not chunk:
-                        break
-                    pipe_fd.write(chunk)
-                    pipe_fd.flush()
-                    bytes_sent += len(chunk)
-
-            logger.info(f"✅ Аудио отправлено в пайп ({bytes_sent} байт)")
-
-            # Удаляем временный файл
-            try:
-                os.remove(raw_audio_file)
-            except:
-                pass
-
-            return True
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка отправки аудио в пайп: {e}", exc_info=True)
-            return False
-
-    def _start_monitor_thread(self):
-        """Мониторинг процесса FFmpeg"""
-
-        def monitor():
-            logger.info(f"👀 Начало мониторинга FFmpeg процесса (PID: {self.ffmpeg_pid})")
-
-            # Читаем stderr для диагностики
-            while self.is_streaming and self.stream_process:
-                try:
-                    line_bytes = self.stream_process.stderr.readline()
-                    if line_bytes:
-                        line = line_bytes.decode('utf-8', errors='ignore').strip()
-                        if line:
-                            # Логируем важные сообщения
-                            if any(keyword in line.lower() for keyword in
-                                   ['error', 'fail', 'invalid', 'unable', 'cannot']):
-                                logger.error(f"FFmpeg ERROR: {line}")
-                                self.last_error = line
-                            elif 'rtmp://' in line and 'connected' in line.lower():
-                                logger.info(f"✅ Подключение к YouTube: {line}")
-                            elif 'frame=' in line and 'fps=' in line:
-                                # Логируем статистику каждые 30 секунд
-                                pass
-                except:
-                    pass
-
-                # Проверяем, жив ли процесс
-                if self.stream_process.poll() is not None:
-                    return_code = self.stream_process.returncode
-                    logger.warning(f"⚠️ FFmpeg процесс завершился с кодом: {return_code}")
-                    self.is_streaming = False
-                    break
-
-                time.sleep(0.1)
-
-            logger.info("👀 Мониторинг FFmpeg завершен")
-
-        self.monitor_thread = threading.Thread(target=monitor, daemon=True)
-        self.monitor_thread.start()
-
-    def _create_video_with_audio(self, audio_file: str) -> Optional[str]:
-        """Создание временного видео файла с аудио и текстом"""
-        try:
-            # Создаем временный файл
-            temp_dir = 'temp_videos'
-            os.makedirs(temp_dir, exist_ok=True)
-
-            temp_video = os.path.join(temp_dir, f'video_audio_{int(time.time())}.mp4')
-
-            # Получаем имя агента из имени файла
-            filename = os.path.basename(audio_file)
-            if '_' in filename:
-                agent_name = filename.split('_')[0]
-            else:
-                agent_name = "AI Agent"
-
-            # Команда для создания видео с текстом и аудио
-            # Используем двойные кавычки для фильтра
-            cmd = [
-                'ffmpeg',
-                '-f', 'lavfi',
-                '-i',
-                f"color=c=black:s=1920x1080:r=30,drawtext=text='{agent_name} Speaking':fontcolor=white:fontsize=60:x=(w-text_w)/2:y=(h-text_h)/2",
-                '-i', audio_file,
-                '-c:v', 'libx264',
-                '-preset', 'veryfast',
-                '-tune', 'zerolatency',
-                '-pix_fmt', 'yuv420p',
-                '-c:a', 'aac',
-                '-b:a', '128k',
-                '-shortest',
-                '-y',  # Перезаписать без подтверждения
-                temp_video
-            ]
-
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=30
+            process = subprocess.Popen(
+                ffmpeg_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=0
             )
 
-            if result.returncode == 0 and os.path.exists(temp_video):
-                logger.debug(f"✅ Видео создано: {temp_video}")
-                return temp_video
-            else:
-                logger.error(f"❌ Ошибка создания видео: {result.stderr[:200]}")
-                return None
-
-        except Exception as e:
-            logger.error(f"❌ Исключение при создании видео: {e}")
-            return None
-
-    def play_audio(self, audio_file: str) -> bool:
-        """Воспроизведение аудио файла в стриме - ПРОСТОЙ РАБОЧИЙ МЕТОД"""
-        if not os.path.exists(audio_file):
-            logger.error(f"❌ Аудио файл не найден: {audio_file}")
-            return False
-
-        if not self.is_streaming:
-            logger.error("❌ Стрим не запущен")
-            return False
-
-        try:
-            # Получаем длительность аудио
-            duration = self._get_audio_duration(audio_file)
-            logger.info(f"🎵 Воспроизведение аудио: {os.path.basename(audio_file)} ({duration:.1f} сек)")
-
-            # Создаем видео с текстом агента и аудио
-            temp_video = self._create_video_with_audio(audio_file)
-            if not temp_video:
-                logger.error("❌ Не удалось создать видео с аудио")
-                return False
-
-            # Команда для отправки видео+аудио в стрим
-            cmd = [
-                'ffmpeg',
-                '-re',
-                '-i', temp_video,
-                '-c:v', 'libx264',
-                '-preset', 'veryfast',
-                '-tune', 'zerolatency',
-                '-pix_fmt', 'yuv420p',
-                '-c:a', 'aac',
-                '-b:a', '128k',
-                '-f', 'flv',
-                self.rtmp_url
-            ]
-
-            logger.info(f"📤 Отправка аудио+видео в стрим")
-
-            # Запускаем процесс в отдельном потоке
+            # Создаем pipe для отправки данных
             def send_audio():
-                try:
-                    process = subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL
-                    )
+                while True:
+                    data = process.stdout.read(4096)
+                    if not data:
+                        break
 
-                    # Ждем завершения (длительность + 2 секунды)
-                    time.sleep(duration + 2)
-
-                    # Останавливаем процесс
-                    if process.poll() is None:
-                        process.terminate()
-                        time.sleep(0.5)
-                        if process.poll() is None:
-                            process.kill()
-
-                    # Удаляем временный файл
-                    try:
-                        os.remove(temp_video)
-                    except:
-                        pass
-
-                    logger.info(f"✅ Аудио отправлено в стрим")
-
-                except Exception as e:
-                    logger.error(f"❌ Ошибка отправки аудио: {e}")
+                    if self.ffmpeg_stdin:
+                        try:
+                            self.ffmpeg_stdin.write(data)
+                            self.ffmpeg_stdin.flush()
+                        except:
+                            break
 
             # Запускаем в отдельном потоке
             audio_thread = threading.Thread(target=send_audio, daemon=True)
             audio_thread.start()
 
+            if wait_for_completion:
+                audio_thread.join(timeout=30)  # Максимум 30 секунд
+
+            process.wait(timeout=5)
             return True
 
         except Exception as e:
-            logger.error(f"❌ Ошибка воспроизведения аудио: {e}", exc_info=True)
+            logger.error(f"Ошибка синхронного воспроизведения аудио: {e}")
             return False
 
-    def _get_audio_duration(self, audio_file: str) -> float:
-        """Получение длительности аудио"""
-        try:
-            result = subprocess.run([
-                'ffprobe',
-                '-v', 'error',
-                '-show_entries', 'format=duration',
-                '-of', 'default=noprint_wrappers=1:nokey=1',
-                audio_file
-            ], capture_output=True, text=True, timeout=5)
+    def play_audio_simple(self, audio_file: str):
+        """Простое воспроизведение аудио файла (самый надежный метод)"""
+        if not self.is_streaming or not self.ffmpeg_stdin:
+            logger.warning("Стрим не активен или stdin недоступен")
+            return False
 
-            duration_str = result.stdout.strip()
-            if duration_str:
-                return float(duration_str)
+        try:
+            # Используем ffmpeg для прямой отправки в rtmp
+            ffmpeg_audio_cmd = [
+                'ffmpeg',
+                '-re',  # Реальное время
+                '-i', audio_file,
+                '-c:a', 'aac',
+                '-b:a', '128k',
+                '-ar', '44100',
+                '-ac', '2',
+                '-f', 'flv',
+                self.rtmp_url
+            ]
+
+            logger.info(f"▶️ Воспроизведение аудио: {os.path.basename(audio_file)}")
+
+            # Запускаем отдельный процесс для аудио
+            process = subprocess.Popen(
+                ffmpeg_audio_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE
+            )
+
+            # Ждем завершения
+            process.wait()
+
+            if process.returncode == 0:
+                logger.info(f"✅ Аудио успешно воспроизведено")
+                return True
             else:
-                return 5.0
-        except:
-            return 5.0
+                error = process.stderr.read().decode('utf-8', errors='ignore')
+                logger.error(f"❌ Ошибка воспроизведения аудио: {error}")
+                return False
+
+        except Exception as e:
+            logger.error(f"Ошибка простого воспроизведения аудио: {e}")
+            return False
 
     def stop_stream(self):
         """Остановка стрима"""
-        try:
+        if self.stream_process:
+            logger.info("🛑 Остановка FFmpeg стрима...")
             self.is_streaming = False
 
-            # Останавливаем процесс FFmpeg
-            if self.stream_process:
-                logger.info("🛑 Остановка FFmpeg стрима...")
+            try:
+                # Очищаем очередь аудио
+                self.audio_queue.clear()
+
+                # Закрываем stdin
+                if self.ffmpeg_stdin:
+                    self.ffmpeg_stdin.close()
+
+                # Отправляем SIGTERM
                 self.stream_process.terminate()
 
                 # Ждем завершения
-                for _ in range(10):
+                for _ in range(20):
                     if self.stream_process.poll() is not None:
                         break
                     time.sleep(0.5)
 
+                # Если все еще жив - SIGKILL
                 if self.stream_process.poll() is None:
                     self.stream_process.kill()
                     self.stream_process.wait()
 
                 logger.info("✅ FFmpeg стрим остановлен")
+                return True
 
-            # Удаляем пайп
-            if self.audio_pipe and os.path.exists(self.audio_pipe):
-                try:
-                    os.remove(self.audio_pipe)
-                    logger.info(f"🗑️ Удален аудио пайп: {self.audio_pipe}")
-                except:
-                    pass
+            except Exception as e:
+                logger.error(f"❌ Ошибка остановки FFmpeg: {e}")
+                return False
 
-            # Удаляем текстовый файл
-            if os.path.exists('dynamic_text.txt'):
-                try:
-                    os.remove('dynamic_text.txt')
-                except:
-                    pass
-
-            return True
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка остановки стрима: {e}")
-            return False
+        return True
 
     def get_status(self):
         """Получение статуса"""
@@ -1110,20 +1146,94 @@ class FFmpegPipeStreamManager:
             'stream_key': self.stream_key[:10] + '...' if self.stream_key else None,
             'rtmp_url': self.rtmp_url,
             'pid': self.ffmpeg_pid,
-            'audio_queue_size': self.audio_queue.qsize(),
-            'last_error': self.last_error,
-            'uptime': time.time() - self.stream_start_time if self.stream_start_time else 0
+            'video_source': self.video_source,
+            'use_pyaudio': self.use_pyaudio,
+            'audio_queue_size': len(self.audio_queue),
+            'is_playing_audio': self.is_playing_audio
         }
+
+    def get_stream_health(self):
+        """Проверка здоровья стрима"""
+        status = self.get_status()
+
+        # Проверяем, жив ли процесс
+        if self.stream_process:
+            status['process_alive'] = (self.stream_process.poll() is None)
+            if not status['process_alive']:
+                status['exit_code'] = self.stream_process.poll()
+        else:
+            status['process_alive'] = False
+
+        # Проверяем время работы
+        if self.start_time:
+            status['uptime'] = time.time() - self.start_time
+
+        return status
+
+    def check_stream_connection(self):
+        """Проверка подключения к YouTube"""
+        if not self.rtmp_url:
+            return {'connected': False, 'error': 'No RTMP URL'}
+
+        try:
+            # Используем ffprobe для проверки подключения
+            cmd = [
+                'ffprobe',
+                '-v', 'error',
+                '-timeout', '5000000',  # 5 секунд таймаут
+                self.rtmp_url
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+
+            return {
+                'connected': result.returncode == 0,
+                'output': result.stdout if result.returncode == 0 else result.stderr
+            }
+
+        except subprocess.TimeoutExpired:
+            return {'connected': False, 'error': 'Connection timeout'}
+        except Exception as e:
+            return {'connected': False, 'error': str(e)}
+
+    def create_test_audio(self, text: str = "Тестовое сообщение", voice: str = "male_ru"):
+        """Создание тестового аудио файла"""
+        try:
+            import tempfile
+            import asyncio
+            import edge_tts
+
+            # Создаем временный файл
+            with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as tmp:
+                temp_path = tmp.name
+
+            # Генерируем аудио
+            async def generate():
+                tts = edge_tts.Communicate(
+                    text=text,
+                    voice='ru-RU-DmitryNeural' if voice == 'male_ru' else 'ru-RU-SvetlanaNeural'
+                )
+                await tts.save(temp_path)
+
+            asyncio.run(generate())
+
+            logger.info(f"✅ Тестовое аудио создано: {temp_path}")
+            return temp_path
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка создания тестового аудио: {e}")
+            return None
 
 # ========== EDGE TTS MANAGER ==========
 
 class EdgeTTSManager:
     """Менеджер TTS для генерации аудио и передачи в стрим"""
 
-    def __init__(self, ffmpeg_manager: FFmpegPipeStreamManager = None):
+    def __init__(self, ffmpeg_manager: FFmpegStreamManager = None):
         self.cache_dir = 'audio_cache'
         os.makedirs(self.cache_dir, exist_ok=True)
         self.ffmpeg_manager = ffmpeg_manager
+
         self.voice_map = {
             'male_ru': 'ru-RU-DmitryNeural',
             'male_ru_deep': 'ru-RU-DmitryNeural',
@@ -1131,6 +1241,7 @@ class EdgeTTSManager:
             'female_ru_soft': 'ru-RU-DariyaNeural'
         }
 
+        # Инициализация pygame для локального воспроизведения
         try:
             pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=2048)
             self.pygame_available = True
@@ -1140,7 +1251,8 @@ class EdgeTTSManager:
 
         logger.info("Edge TTS Manager инициализирован")
 
-    async def text_to_speech_and_stream(self, text: str, voice_id: str = 'male_ru', agent_name: str = "") -> Optional[str]:
+    async def text_to_speech_and_stream(self, text: str, voice_id: str = 'male_ru', agent_name: str = "") -> Optional[
+        str]:
         """Генерация аудио и отправка в стрим"""
         try:
             if voice_id not in self.voice_map:
@@ -1154,70 +1266,86 @@ class EdgeTTSManager:
 
             # Проверяем кэш
             if os.path.exists(cache_file):
-                logger.info(f"♻️ Используем кэшированное аудио: {os.path.basename(cache_file)}")
-            else:
-                # Настройки голоса
-                rate = '+0%'
-                pitch = '+0Hz'
+                logger.debug(f"♻️ Используем кэшированное аудио: {os.path.basename(cache_file)}")
+                await self._play_and_stream(cache_file)
+                return cache_file
 
-                if voice_id == 'male_ru_deep':
-                    rate = '-10%'
-                    pitch = '-20Hz'
-                elif voice_id == 'female_ru_soft':
-                    rate = '-5%'
-                    pitch = '+10Hz'
+            # Настройки голоса
+            rate = '+0%'
+            pitch = '+0Hz'
 
-                # Генерация аудио
-                logger.info(f"🔊 Генерация TTS для {agent_name}: {text[:50]}...")
+            if voice_id == 'male_ru_deep':
+                rate = '-10%'
+                pitch = '-20Hz'
+            elif voice_id == 'female_ru_soft':
+                rate = '-5%'
+                pitch = '+10Hz'
 
-                communicate = edge_tts.Communicate(
-                    text=text,
-                    voice=voice_name,
-                    rate=rate,
-                    pitch=pitch
-                )
+            # Генерация аудио
+            logger.info(f"🔊 Генерация TTS: {agent_name} ({voice_name})")
 
-                # Сохраняем аудио
-                await communicate.save(cache_file)
-                logger.info(f"💾 Аудио сохранено: {cache_file}")
+            communicate = edge_tts.Communicate(
+                text=text,
+                voice=voice_name,
+                rate=rate,
+                pitch=pitch
+            )
 
-            # Проверяем, что файл создан
-            if not os.path.exists(cache_file) or os.path.getsize(cache_file) == 0:
-                logger.error(f"❌ Аудио файл не создан или пустой: {cache_file}")
-                return None
+            await communicate.save(cache_file)
+            logger.info(f"💾 Аудио сохранено: {os.path.basename(cache_file)}")
 
-            # Воспроизводим локально для тестирования
+            # Воспроизводим и отправляем в стрим
+            await self._play_and_stream(cache_file)
+
+            return cache_file
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка Edge TTS: {e}", exc_info=True)
+            return None
+
+    async def _play_and_stream(self, audio_file: str):
+        """Воспроизведение аудио локально и отправка в стрим"""
+        try:
+            # 1. Локальное воспроизведение (если доступно)
             if self.pygame_available:
                 try:
-                    pygame.mixer.music.load(cache_file)
+                    pygame.mixer.music.load(audio_file)
                     pygame.mixer.music.play()
-
-                    # Ждем окончания
-                    duration = self._get_audio_duration(cache_file)
-                    await asyncio.sleep(duration)
-
-                    logger.info(f"🔊 Локальное воспроизведение завершено")
+                    logger.debug(f"🔊 Локальное воспроизведение: {os.path.basename(audio_file)}")
                 except Exception as e:
                     logger.warning(f"Не удалось воспроизвести локально: {e}")
 
-            # Отправляем в стрим через FFmpeg пайп
+            # 2. Отправка в YouTube стрим
             if self.ffmpeg_manager and self.ffmpeg_manager.is_streaming:
-                logger.info(f"📤 Отправка аудио в стрим: {os.path.basename(cache_file)}")
-                success = self.ffmpeg_manager.play_audio(cache_file)
-
-                if success:
-                    logger.info(f"✅ Аудио отправлено в очередь стрима")
-                    return cache_file
-                else:
-                    logger.error(f"❌ Не удалось отправить аудио в стрим")
-                    return None
-            else:
-                logger.warning("⚠️ FFmpeg стрим не активен, только локальное воспроизведение")
-                return cache_file
+                # Используем ThreadPoolExecutor для запуска в отдельном потоке
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(
+                    None,
+                    self.ffmpeg_manager.play_audio_file,
+                    audio_file
+                )
+                logger.info(f"📤 Аудио отправлено в стрим: {os.path.basename(audio_file)}")
 
         except Exception as e:
-            logger.error(f"❌ Ошибка в text_to_speech_and_stream: {e}", exc_info=True)
-            return None
+            logger.error(f"Ошибка воспроизведения: {e}")
+
+    async def speak_direct(self, text: str, voice_id: str = 'male_ru') -> bool:
+        """Прямое озвучивание текста и отправка в стрим"""
+        try:
+            logger.info(f"🎤 Озвучиваем напрямую: {text[:50]}...")
+
+            audio_file = await self.text_to_speech_and_stream(text, voice_id)
+
+            if audio_file:
+                # Ждем окончания воспроизведения
+                duration = self._get_audio_duration(audio_file)
+                await asyncio.sleep(duration + 0.5)
+                return True
+            return False
+
+        except Exception as e:
+            logger.error(f"Ошибка прямого озвучивания: {e}")
+            return False
 
     def _get_audio_duration(self, audio_file: str) -> float:
         """Получение длительности аудио файла"""
@@ -1238,7 +1366,6 @@ class EdgeTTSManager:
             with open(audio_file, 'rb') as f:
                 size = len(f.read())
             return size / (44100 * 2 * 2)
-
 
 # ========== AI AGENT ==========
 
@@ -1315,14 +1442,12 @@ class AIAgent:
         except Exception as e:
             logger.error(f"❌ Ошибка генерации ответа для {self.name}: {e}")
             return f"Как эксперт в {self.expertise.lower()}, я считаю, что {topic.lower()} требует внимательного изучения."
-
-
 # ========== AI STREAM MANAGER ==========
 
 class AIStreamManager:
     """Менеджер стрима"""
 
-    def __init__(self, ffmpeg_manager: FFmpegPipeStreamManager = None):
+    def __init__(self, ffmpeg_manager: FFmpegStreamManager = None):
         self.agents: List[AIAgent] = []
         self.tts_manager = EdgeTTSManager(ffmpeg_manager)
         self.ffmpeg_manager = ffmpeg_manager
@@ -1350,9 +1475,8 @@ class AIStreamManager:
         return self.current_topic
 
     async def run_discussion_round(self):
-        """Запуск раунда дискуссии"""
+        """Запуск раунда дискуссии с отправкой звука в стрим"""
         if self.is_discussion_active:
-            logger.warning("⚠️ Дискуссия уже активна")
             return
 
         self.is_discussion_active = True
@@ -1362,21 +1486,13 @@ class AIStreamManager:
             if not self.current_topic:
                 self.select_topic()
 
-            logger.info(f"🚀 Начало раунда #{self.discussion_round}: {self.current_topic}")
+            logger.info(f"🚀 Начало раунда #{self.discussion_round}")
 
             # Определяем порядок выступлений
             speaking_order = random.sample(self.agents, len(self.agents))
 
-            # Уведомляем о начале раунда
-            socketio.emit('round_started', {
-                'round': self.discussion_round,
-                'topic': self.current_topic,
-                'agents': [{'id': a.id, 'name': a.name} for a in speaking_order]
-            })
-
             for agent in speaking_order:
                 if not self.is_discussion_active:
-                    logger.info("⏸️ Дискуссия остановлена")
                     break
 
                 # Агент начинает говорить
@@ -1411,26 +1527,37 @@ class AIStreamManager:
 
                 logger.info(f"💬 {agent.name}: {message[:80]}...")
 
-                # Генерация и отправка аудио
+                # Генерация аудио и отправка в стрим
                 logger.info(f"🔊 Генерация TTS для {agent.name}...")
 
-                audio_file = await self.tts_manager.text_to_speech_and_stream(
-                    text=message,
-                    voice_id=agent.voice,
-                    agent_name=agent.name
+                audio_task = asyncio.create_task(
+                    self.tts_manager.text_to_speech_and_stream(
+                        text=message,
+                        voice_id=agent.voice,
+                        agent_name=agent.name
+                    )
                 )
 
-                if audio_file:
-                    logger.info(f"✅ Аудио сгенерировано и отправлено: {os.path.basename(audio_file)}")
+                # Ждем завершения генерации аудио
+                audio_file = await audio_task
 
-                    # Ждем пока аудио должно воспроизводиться
-                    audio_duration = self.tts_manager._get_audio_duration(audio_file)
+                if audio_file:
+                    logger.info(f"✅ Аудио сгенерировано: {os.path.basename(audio_file)}")
+
+                    # Получаем длительность аудио
+                    try:
+                        audio_duration = self._get_audio_duration(audio_file)
+                    except:
+                        # Приблизительная длительность
+                        word_count = len(message.split())
+                        audio_duration = max(3, min(word_count * 0.4, 15))
+
                     logger.info(f"⏱️  Длительность аудио: {audio_duration:.1f} сек")
 
-                    # Добавляем небольшую задержку для надежности
-                    await asyncio.sleep(audio_duration + 1)
+                    # Ждем пока аудио воспроизведется
+                    await asyncio.sleep(audio_duration)
                 else:
-                    # Если аудио не сгенерировалось, ждем по количеству слов
+                    # Если аудио не сгенерировалось
                     word_count = len(message.split())
                     pause_duration = max(3, min(word_count * 0.3, 10))
                     logger.warning(f"⚠️ Аудио не сгенерировано, ждем {pause_duration} сек")
@@ -1454,12 +1581,16 @@ class AIStreamManager:
                 'next_round_in': Config.DISCUSSION_INTERVAL
             })
 
-            # Случайная смена темы (30% вероятность)
+            # Пауза перед следующим раундом
+            await asyncio.sleep(Config.DISCUSSION_INTERVAL)
+
+            # Случайная смена темы
             if random.random() > 0.7:
                 self.select_topic()
 
         except Exception as e:
             logger.error(f"❌ Ошибка в раунде дискуссии: {e}", exc_info=True)
+
             socketio.emit('error', {
                 'message': f'Ошибка в дискуссии: {str(e)}',
                 'round': self.discussion_round
@@ -1468,6 +1599,24 @@ class AIStreamManager:
         finally:
             self.is_discussion_active = False
             self.active_agent = None
+
+    def _get_audio_duration(self, audio_file: str) -> float:
+        """Получение длительности аудио файла"""
+        try:
+            result = subprocess.run([
+                'ffprobe',
+                '-v', 'error',
+                '-show_entries', 'format=duration',
+                '-of', 'default=noprint_wrappers=1:nokey=1',
+                audio_file
+            ], capture_output=True, text=True)
+
+            duration = float(result.stdout.strip())
+            return duration
+
+        except Exception as e:
+            logger.warning(f"Не удалось получить длительность аудио: {e}")
+            return 5.0
 
     def get_agents_state(self) -> List[Dict[str, Any]]:
         """Состояние агентов"""
@@ -1497,10 +1646,7 @@ class AIStreamManager:
             'ffmpeg_streaming': self.ffmpeg_manager.is_streaming if self.ffmpeg_manager else False
         }
 
-
-# ========== ГЛОБАЛЬНЫЕ ОБЪЕКТЫ ==========
-
-ffmpeg_manager = FFmpegPipeStreamManager()
+ffmpeg_manager = FFmpegStreamManager()
 stream_manager = AIStreamManager(ffmpeg_manager)
 
 # Инициализация YouTube OAuth
@@ -1529,67 +1675,44 @@ else:
 # ========== АСИНХРОННЫЙ ЦИКЛ ==========
 
 async def discussion_loop():
-    """Основной цикл дискуссии с активным ожиданием"""
-    await asyncio.sleep(2)  # Даем время на запуск сервера
-    logger.info("🔄 Запуск цикла дискуссии AI агентов")
+    """Основной цикл дискуссии"""
+    await asyncio.sleep(2)
+    logger.info("🔄 Запуск цикла дискуссии")
 
-    # Автоматически выбираем первую тему
-    if not stream_manager.current_topic:
-        stream_manager.select_topic()
-
-    print(f"📝 Начальная тема: {stream_manager.current_topic}")
-    print("🤖 Агенты готовы к дискуссии")
-
-    # Флаг для ручного запуска
-    manual_trigger = asyncio.Event()
+    # Выбираем первую тему
+    stream_manager.select_topic()
 
     while True:
         try:
-            # Активно ждем флаг запуска дискуссии
-            while not stream_manager.is_discussion_active:
-                # Проверяем каждую секунду
-                await asyncio.sleep(1)
-                continue
-
-            # Когда флаг установлен, запускаем дискуссию
-            print(f"🚀 Запуск дискуссии (раунд #{stream_manager.discussion_round + 1})")
-            await stream_manager.run_discussion_round()
-
-            # После завершения раунда - пауза
-            logger.info(f"⏸️  Пауза между раундами: {Config.DISCUSSION_INTERVAL} сек")
-            await asyncio.sleep(Config.DISCUSSION_INTERVAL)
-
+            if not stream_manager.is_discussion_active:
+                await stream_manager.run_discussion_round()
+            await asyncio.sleep(0.5)
         except asyncio.CancelledError:
-            logger.info("🔚 Цикл дискуссии остановлен")
             break
         except Exception as e:
-            logger.error(f"❌ Ошибка в цикле дискуссии: {e}", exc_info=True)
+            logger.error(f"❌ Ошибка в основном цикле: {e}", exc_info=True)
             await asyncio.sleep(5)
 
 
 def start_discussion_loop():
     """Запуск цикла в отдельном потоке"""
-    global discussion_loop_event_loop, discussion_loop_task
-
-    try:
-        # Создаем новый event loop для этого потока
-        discussion_loop_event_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(discussion_loop_event_loop)
-
-        print("🔄 Event loop дискуссии создан")
-
-        # Запускаем основной цикл
-        discussion_loop_event_loop.run_until_complete(discussion_loop())
-
-    except Exception as e:
-        logger.error(f"❌ Ошибка в цикле дискуссии: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        print("🔚 Цикл дискуссии завершен")
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(discussion_loop())
 
 
 # ========== FLASK РОУТЫ ==========
+
+@app.route('/health')
+def health():
+    """Проверка здоровья"""
+    return jsonify({
+        'status': 'ok',
+        'time': datetime.now().isoformat(),
+        'agents': len(stream_manager.agents),
+        'streaming': ffmpeg_manager.is_streaming,
+        'discussion_active': stream_manager.is_discussion_active
+    })
 
 @app.route('/oauth')
 def oauth_start():
@@ -1878,24 +2001,7 @@ def api_change_topic():
     return jsonify({'success': True, 'topic': topic})
 
 
-# ========== ЗАПУСК СЕРВЕРА ==========
 
-def signal_handler(signum, frame):
-    """Обработчик сигналов"""
-    print(f"\n🛑 Получен сигнал {signum}. Завершение...")
-
-    # Останавливаем стрим
-    if ffmpeg_manager.is_streaming:
-        ffmpeg_manager.stop_stream()
-
-    # Останавливаем YouTube трансляцию если активна
-    if youtube_oauth and youtube_oauth.is_live:
-        try:
-            youtube_oauth.complete_broadcast()
-        except:
-            pass
-
-    sys.exit(0)
 
 
 if __name__ == '__main__':
@@ -1904,324 +2010,590 @@ if __name__ == '__main__':
     signal.signal(signal.SIGTERM, signal_handler)
 
     print("=" * 70)
-    print("🤖 AI AGENTS STREAM WITH FFMPEG (PIPE Version)")
+    print("🤖 AI AGENTS STREAM WITH FFMPEG")
     print("=" * 70)
 
-    # Информация о OAuth
-    youtube_status_msg = "❌ Не настроен"
-    if youtube_oauth:
-        if youtube_oauth.youtube:
-            youtube_status_msg = "✅ Аутентифицирован через OAuth"
-            metrics = youtube_oauth.get_metrics()
-            print(f"   YouTube OAuth: {youtube_status_msg}")
-            print(f"   Метрики: {metrics['broadcasts_created']} трансляций, {metrics['streams_created']} потоков")
-        else:
-            youtube_status_msg = "⚠️ Требуется авторизация"
-            print(f"   YouTube OAuth: {youtube_status_msg}")
-            print(f"   🔗 Авторизация: http://localhost:5500/oauth")
+    # Информация о зависимостях
+    print(f"📦 Версии зависимостей:")
+    print(f"   Flask: 2.3.0")
+    print(f"   Flask-SocketIO: 5.3.0")
+    print(f"   OpenAI: >=1.3.0")
+    print(f"   Edge TTS: >=6.1.9")
+    print(f"   FFmpeg: системный")
+
+    if YOUTUBE_API_AVAILABLE:
+        print(f"   YouTube API: Доступен ✅")
     else:
-        print(f"   YouTube OAuth: {youtube_status_msg}")
-        print(f"   Используйте ручной Stream Key или настройте OAuth")
+        print(f"   YouTube API: Не доступен (используйте ручной Stream Key)")
 
-    # Проверяем зависимости
-    print("\n🔧 Проверка зависимостей...")
+    # Создаем директории
+    os.makedirs("stream_ui", exist_ok=True)
+    os.makedirs("audio_cache", exist_ok=True)
 
-    # Проверяем FFmpeg
-    try:
-        result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True)
-        if result.returncode == 0:
-            print("✅ FFmpeg установлен")
-        else:
-            print("❌ FFmpeg не найден. Установите: sudo apt install ffmpeg")
-    except:
-        print("❌ Не удалось запустить FFmpeg")
-
-    # Проверяем Edge TTS (исправлено - без await в этом контексте)
-    try:
-        import edge_tts
-        print("✅ Edge TTS установлен")
-        print("   Доступные голоса (с русским):")
-        print("   • ru-RU-DmitryNeural - мужской голос")
-        print("   • ru-RU-SvetlanaNeural - женский голос")
-        print("   • ru-RU-DariyaNeural - женский мягкий")
-    except ImportError:
-        print("❌ Edge TTS не установлен: pip install edge-tts")
-
-    # Проверяем Pygame
-    try:
-        import pygame
-        pygame.mixer.init()
-        pygame.mixer.quit()
-        print("✅ Pygame установлен")
-    except:
-        print("⚠️ Pygame не установлен, локальное воспроизведение недоступно")
-
-    # Проверяем OpenAI
-    if Config.OPENAI_API_KEY:
-        print("✅ OpenAI API ключ настроен")
+    # Очищаем старые аудио файлы
+    if os.path.exists('audio_cache'):
+        try:
+            for filename in os.listdir('audio_cache'):
+                file_path = os.path.join('audio_cache', filename)
+                try:
+                    if os.path.isfile(file_path) or os.path.islink(file_path):
+                        os.unlink(file_path)
+                    elif os.path.isdir(file_path):
+                        shutil.rmtree(file_path)
+                except Exception as e:
+                    logger.warning(f"Не удалось удалить {file_path}: {e}")
+            print("✅ Очищена директория audio_cache")
+        except Exception as e:
+            logger.error(f"Ошибка очистки audio_cache: {e}")
     else:
-        print("⚠️ OpenAI API ключ не найден, будет использоваться демо-режим")
-
-    # Запускаем цикл дискуссии в отдельном потоке
-    print("\n🔄 Запуск цикла дискуссии AI агентов...")
-    discussion_thread = threading.Thread(target=start_discussion_loop, daemon=True)
-    discussion_thread.start()
-    time.sleep(2)
-    print("✅ Цикл дискуссии запущен")
-
-    # Статистика агентов
-    print(f"👥 Загружено {len(stream_manager.agents)} AI агентов:")
-    for agent in stream_manager.agents:
-        print(f"   • {agent.name} - {agent.expertise} ({agent.voice})")
-
-    print("\n" + "=" * 70)
-    print("🌐 Веб-интерфейс доступен по адресу: http://localhost:5000")
-    print("🔗 Тестирование аудио агентов:")
-    for agent in stream_manager.agents:
-        print(f"   • {agent.name}: http://localhost:5000/api/test_audio/{agent.id}")
-    print("=" * 70)
+        os.makedirs('audio_cache', exist_ok=True)
 
     # Создаем UI если его нет
     ui_dir = "stream_ui"
     if not os.path.exists(ui_dir):
         os.makedirs(ui_dir, exist_ok=True)
 
-        # Создаем простой HTML интерфейс
-        index_html = '''<!DOCTYPE html>
+    # Создаем основной index.html
+    index_path = os.path.join(ui_dir, "index.html")
+    if not os.path.exists(index_path):
+        print("📁 Создаю основной UI...")
+        with open(index_path, 'w', encoding='utf-8') as f:
+            f.write('''<!DOCTYPE html>
 <html>
 <head>
-    <title>🤖 AI Stream Control</title>
-    <meta charset="utf-8">
+    <meta charset="UTF-8">
+    <title>AI Stream Control</title>
     <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background: #1a1a1a; color: white; }
-        .container { max-width: 1200px; margin: 0 auto; }
-        .header { text-align: center; margin-bottom: 30px; }
-        .agents-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
-        .agent-card { background: #2d2d2d; padding: 20px; border-radius: 10px; border-left: 5px solid; }
-        .speaking { box-shadow: 0 0 20px rgba(0, 255, 0, 0.5); }
-        .topic-box { background: #2d2d2d; padding: 20px; border-radius: 10px; margin: 20px 0; }
-        .controls { display: flex; flex-wrap: wrap; gap: 10px; margin: 20px 0; }
-        button { padding: 10px 20px; background: #4a69ff; color: white; border: none; border-radius: 5px; cursor: pointer; }
-        button:hover { background: #3a59ef; }
-        button.test { background: #ff6b4a; }
-        button.test:hover { background: #ff5b3a; }
-        .status { padding: 10px; border-radius: 5px; margin: 10px 0; }
-        .status-streaming { background: #1a5a1a; }
-        .status-stopped { background: #5a1a1a; }
-        .audio-test { margin-top: 10px; }
+        body { font-family: Arial; padding: 20px; max-width: 1200px; margin: 0 auto; }
+        .panel { background: #f5f5f5; padding: 20px; border-radius: 10px; margin: 20px 0; }
+        .status { padding: 10px; margin: 10px 0; border-radius: 5px; }
+        .online { background: #d4edda; }
+        .offline { background: #f8d7da; }
+        .info { background: #d1ecf1; }
+        button { margin: 5px; padding: 10px 20px; border: none; cursor: pointer; border-radius: 5px; }
+        .btn-primary { background: #007bff; color: white; }
+        .btn-success { background: #28a745; color: white; }
+        .btn-danger { background: #dc3545; color: white; }
+        .agent-card { display: inline-block; padding: 15px; margin: 10px; border-radius: 8px; }
+        .speaking { border: 3px solid #28a745; }
+        .message { background: white; padding: 10px; margin: 5px 0; border-radius: 5px; border-left: 4px solid #007bff; }
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1>🤖 AI Agents Live Stream Control</h1>
-            <p>Управление автономными ИИ агентами и YouTube трансляцией</p>
-        </div>
+    <h1>🤖 AI Stream Control Panel</h1>
 
-        <div id="status" class="status status-stopped">
-            Статус: Загрузка...
-        </div>
+    <div class="panel">
+        <h2>📊 Статус системы</h2>
+        <div id="system-status" class="status offline">Загрузка...</div>
+        <div id="agents-container"></div>
+    </div>
 
-        <div id="topic-box" class="topic-box">
-            <h3>Текущая тема дискуссии:</h3>
-            <p id="current-topic">Загрузка...</p>
-        </div>
-
-        <div class="controls">
-            <button onclick="startDiscussion()">▶️ Начать дискуссию</button>
-            <button onclick="stopDiscussion()">⏹️ Остановить дискуссию</button>
-            <button onclick="changeTopic()">🔄 Сменить тему</button>
-            <button onclick="startYouTubeStream()">📺 Запустить YouTube стрим</button>
-        </div>
-
-        <div class="agents-grid" id="agents-container">
-            <!-- AI агенты будут здесь -->
-        </div>
-
-        <div id="messages" style="margin-top: 30px;">
-            <h3>Последние сообщения:</h3>
-            <div id="messages-list"></div>
+    <div class="panel">
+        <h2>🎬 Управление стримом</h2>
+        <div>
+            <button class="btn-primary" onclick="manualStream()">🔑 Ручной запуск стрима</button>
+            <button class="btn-success" onclick="youtubeApiStream()">🚀 Автоматический YouTube стрим</button>
+            <button class="btn-danger" onclick="stopStream()">🛑 Остановить стрим</button>
+            <a href="/youtube-control" target="_blank">
+                <button class="btn-primary">⚙️ YouTube API Control</button>
+            </a>
         </div>
     </div>
 
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.0/socket.io.min.js"></script>
+    <div class="panel">
+        <h2>💬 Управление дискуссией</h2>
+        <div id="topic-display">Тема: <span id="current-topic">Загрузка...</span></div>
+        <button class="btn-primary" onclick="startDiscussion()">▶️ Начать дискуссию</button>
+        <button class="btn-danger" onclick="stopDiscussion()">⏸️ Остановить дискуссию</button>
+        <button class="btn-primary" onclick="changeTopic()">🔄 Сменить тему</button>
+        <button class="btn-primary" onclick="testAudio()">🔊 Тест звука</button>
+    </div>
+
+    <div class="panel">
+        <h2>📨 Сообщения</h2>
+        <div id="messages-container"></div>
+    </div>
+
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
     <script>
         const socket = io();
 
-        socket.on('connect', () => {
-            console.log('Connected to server');
-            updateStatus('connected');
-        });
-
-        socket.on('topic_update', (data) => {
+        socket.on('connected', function(data) {
+            updateSystemStatus(data);
+            updateAgents(data.agents);
             document.getElementById('current-topic').textContent = data.topic;
         });
 
-        socket.on('agent_start_speaking', (data) => {
-            const agentCard = document.getElementById(`agent-${data.agent_id}`);
-            if (agentCard) {
-                agentCard.classList.add('speaking');
-                agentCard.innerHTML += `<div style="color: #4a69ff; margin-top: 10px;">🎤 Говорит сейчас...</div>`;
-            }
+        socket.on('update', function(data) {
+            updateSystemStatus(data);
+            updateAgents(data.agents);
+            document.getElementById('current-topic').textContent = data.topic;
         });
 
-        socket.on('agent_stop_speaking', (data) => {
-            const agentCard = document.getElementById(`agent-${data.agent_id}`);
-            if (agentCard) {
-                agentCard.classList.remove('speaking');
-                // Убираем сообщение "Говорит"
-                const speakingMsg = agentCard.querySelector('div[style*="color: #4a69ff"]');
-                if (speakingMsg) speakingMsg.remove();
-            }
+        socket.on('stream_connected', function(data) {
+            alert('✅ Стрим успешно подключен к YouTube!');
+            document.getElementById('system-status').className = 'status online';
+            document.getElementById('system-status').innerHTML = 'Стрим активен и подключен к YouTube';
         });
 
-        socket.on('new_message', (data) => {
-            const messagesList = document.getElementById('messages-list');
-            const messageDiv = document.createElement('div');
-            messageDiv.style.background = '#2d2d2d';
-            messageDiv.style.padding = '10px';
-            messageDiv.style.margin = '10px 0';
-            messageDiv.style.borderRadius = '5px';
-            messageDiv.style.borderLeft = `5px solid ${data.color}`;
-
-            messageDiv.innerHTML = `
-                <strong>${data.agent_name}</strong> (${data.expertise}):<br>
-                ${data.message}
-                <div style="font-size: 12px; color: #888; margin-top: 5px;">
-                    ${new Date(data.timestamp).toLocaleTimeString()}
-                </div>
-            `;
-
-            messagesList.prepend(messageDiv);
-
-            // Ограничиваем количество сообщений
-            if (messagesList.children.length > 10) {
-                messagesList.removeChild(messagesList.lastChild);
-            }
+        socket.on('new_message', function(data) {
+            addMessage(data);
         });
 
-        function updateStatus(status) {
-            const statusDiv = document.getElementById('status');
-            statusDiv.textContent = `Статус: ${status}`;
-            if (status.includes('подключен') || status.includes('запущен')) {
-                statusDiv.className = 'status status-streaming';
+        socket.on('agent_start_speaking', function(data) {
+            highlightAgent(data.agent_id, true);
+        });
+
+        socket.on('agent_stop_speaking', function(data) {
+            highlightAgent(data.agent_id, false);
+        });
+
+        function updateSystemStatus(data) {
+            const statusDiv = document.getElementById('system-status');
+            let html = `<strong>Статус:</strong> `;
+
+            if(data.stream_status.is_streaming) {
+                statusDiv.className = 'status online';
+                html += `Стрим активен (PID: ${data.stream_status.pid})<br>`;
+                html += `<strong>RTMP URL:</strong> ${data.stream_status.rtmp_url || 'Не указан'}<br>`;
             } else {
-                statusDiv.className = 'status status-stopped';
+                statusDiv.className = 'status offline';
+                html += `Стрим не активен<br>`;
+            }
+
+            html += `<strong>Агентов:</strong> ${data.agents.length}<br>`;
+            html += `<strong>Сообщений:</strong> ${data.stats.message_count}<br>`;
+            html += `<strong>Раунд:</strong> ${data.stats.discussion_round}`;
+
+            statusDiv.innerHTML = html;
+        }
+
+        function updateAgents(agents) {
+            const container = document.getElementById('agents-container');
+            let html = '';
+
+            agents.forEach(agent => {
+                html += `<div class="agent-card ${agent.is_speaking ? 'speaking' : ''}" 
+                         style="background: ${agent.color}; color: white; min-width: 200px;">
+                    <strong>${agent.name}</strong><br>
+                    <small>${agent.expertise}</small><br>
+                    <span>Сообщений: ${agent.message_count}</span>
+                    ${agent.is_speaking ? '<br><span>🎤 Говорит</span>' : ''}
+                </div>`;
+            });
+
+            container.innerHTML = html;
+        }
+
+        function addMessage(data) {
+            const container = document.getElementById('messages-container');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message';
+            messageDiv.innerHTML = `
+                <strong>${data.agent_name}</strong> (${data.expertise})<br>
+                ${data.message}<br>
+                <small>${new Date(data.timestamp).toLocaleTimeString()}</small>
+            `;
+            container.insertBefore(messageDiv, container.firstChild);
+        }
+
+        function highlightAgent(agentId, isSpeaking) {
+            const agents = document.querySelectorAll('.agent-card');
+            agents.forEach(card => {
+                if(card.textContent.includes(agentId)) {
+                    if(isSpeaking) {
+                        card.classList.add('speaking');
+                    } else {
+                        card.classList.remove('speaking');
+                    }
+                }
+            });
+        }
+
+        function manualStream() {
+            const key = prompt('Введите YouTube Stream Key:');
+            if(key) {
+                fetch('/api/start_stream', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({stream_key: key})
+                })
+                .then(res => res.json())
+                .then(data => {
+                    if(data.status === 'started') {
+                        alert('✅ Стрим запущен!');
+                    } else {
+                        alert('❌ Ошибка: ' + data.message);
+                    }
+                });
+            }
+        }
+
+        function youtubeApiStream() {
+            if(!confirm('Запустить автоматический YouTube стрим через API?\n(Требуется client_secrets.json)')) {
+                return;
+            }
+
+            const title = prompt('Название трансляции:', '🤖 AI Agents Live: Научные дебаты ИИ');
+            if(title) {
+                fetch('/api/start_youtube_stream', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({title: title})
+                })
+                .then(res => res.json())
+                .then(data => {
+                    if(data.status === 'started') {
+                        alert(`✅ YouTube трансляция создана!\nСмотреть: ${data.watch_url}`);
+                    } else {
+                        alert('❌ Ошибка: ' + data.message);
+                    }
+                });
+            }
+        }
+
+        function stopStream() {
+            if(confirm('Остановить стрим?')) {
+                fetch('/api/stop_stream', {
+                    method: 'POST'
+                })
+                .then(res => res.json())
+                .then(data => {
+                    if(data.status === 'stopped') {
+                        alert('✅ Стрим остановлен');
+                    } else {
+                        alert('❌ Ошибка: ' + data.message);
+                    }
+                });
             }
         }
 
         function startDiscussion() {
-            fetch('/api/start_discussion', { method: 'POST' })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
-                        alert('Дискуссия начата: ' + data.topic);
-                    } else {
-                        alert('Ошибка: ' + data.message);
-                    }
-                })
-                .catch(err => console.error('Error:', err));
+            fetch('/api/control', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({action: 'start_discussion'})
+            })
+            .then(res => res.json())
+            .then(data => {
+                if(data.status === 'started') {
+                    alert('✅ Дискуссия начата');
+                }
+            });
         }
 
         function stopDiscussion() {
-            fetch('/api/stop_discussion', { method: 'POST' })
-                .then(response => response.json())
-                .then(data => alert(data.message || 'Дискуссия остановлена'))
-                .catch(err => console.error('Error:', err));
+            fetch('/api/control', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({action: 'stop_discussion'})
+            })
+            .then(res => res.json())
+            .then(data => {
+                if(data.status === 'stopped') {
+                    alert('✅ Дискуссия остановлена');
+                }
+            });
         }
 
         function changeTopic() {
-            fetch('/api/change_topic', { method: 'POST' })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.topic) {
-                        document.getElementById('current-topic').textContent = data.topic;
-                        alert('Тема изменена: ' + data.topic);
-                    }
-                })
-                .catch(err => console.error('Error:', err));
-        }
-
-        function startYouTubeStream() {
-            const title = prompt('Введите заголовок трансляции:', '🤖 AI Agents Live: Научные дебаты ИИ');
-            if (!title) return;
-
-            fetch('/api/start_youtube_oauth_stream', {
+            fetch('/api/control', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ title: title })
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({action: 'change_topic'})
             })
-            .then(response => response.json())
+            .then(res => res.json())
             .then(data => {
-                if (data.status === 'started') {
-                    alert(`YouTube трансляция запущена!\\nСсылка: ${data.watch_url}`);
-                } else if (data.status === 'auth_required') {
-                    window.open(data.auth_url, '_blank');
-                    alert('Требуется авторизация в YouTube. Откройте ссылку для авторизации.');
-                } else {
-                    alert('Ошибка: ' + (data.message || 'Неизвестная ошибка'));
+                if(data.status === 'changed') {
+                    alert('✅ Тема изменена: ' + data.topic);
                 }
-            })
-            .catch(err => console.error('Error:', err));
+            });
         }
 
-        function testAudio(agentId, agentName) {
-            if (confirm(`Тестировать аудио для ${agentName}?`)) {
-                fetch(`/api/test_audio/${agentId}`)
-                    .then(response => response.json())
-                    .then(data => {
-                        if (data.success) {
-                            alert(data.message || 'Тестовое аудио отправлено');
-                        } else {
-                            alert('Ошибка: ' + (data.error || 'Неизвестная ошибка'));
-                        }
-                    })
-                    .catch(err => console.error('Error:', err));
+        function testAudio() {
+            const text = prompt('Текст для теста звука:', 'Привет! Это тест звука на YouTube стриме.');
+            if(text) {
+                fetch('/api/test_audio', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({text: text, voice: 'male_ru'})
+                })
+                .then(res => res.json())
+                .then(data => {
+                    alert(data.message);
+                });
             }
         }
 
-        // Загружаем начальное состояние
-        fetch('/api/agents')
-            .then(response => response.json())
-            .then(agents => {
-                const container = document.getElementById('agents-container');
-                agents.forEach(agent => {
-                    const card = document.createElement('div');
-                    card.className = 'agent-card';
-                    card.id = `agent-${agent.id}`;
-                    card.style.borderLeftColor = agent.color;
-
-                    card.innerHTML = `
-                        <h3>${agent.avatar} ${agent.name}</h3>
-                        <p><em>${agent.expertise}</em></p>
-                        <p>Сообщений: ${agent.message_count}</p>
-                        <div class="audio-test">
-                            <button class="test" onclick="testAudio(${agent.id}, '${agent.name}')">🔊 Тест аудио</button>
-                        </div>
-                        ${agent.is_speaking ? '<div style="color: #4a69ff; margin-top: 10px;">🎤 Говорит сейчас...</div>' : ''}
-                    `;
-
-                    container.appendChild(card);
-                });
-            })
-            .catch(err => console.error('Error loading agents:', err));
-
-        fetch('/api/stats')
-            .then(response => response.json())
-            .then(stats => {
-                if (stats.current_topic) {
-                    document.getElementById('current-topic').textContent = stats.current_topic;
-                }
-                updateStatus(`Активность: ${stats.is_active ? 'Дискуссия идет' : 'Пауза'} | Сообщений: ${stats.message_count}`);
-            })
-            .catch(err => console.error('Error loading stats:', err));
+        // Автоматическое обновление статуса
+        setInterval(() => {
+            fetch('/api/stream_status')
+            .then(res => res.json())
+            .then(data => {
+                socket.emit('request_update');
+            });
+        }, 5000);
     </script>
 </body>
-</html>'''
+</html>''')
 
-        with open(os.path.join(ui_dir, 'index.html'), 'w', encoding='utf-8') as f:
-            f.write(index_html)
-        print("📁 Создан веб-интерфейс в папке stream_ui")
+    # Создаем страницу управления YouTube API
+    youtube_control_path = os.path.join(ui_dir, "youtube_control.html")
+    if not os.path.exists(youtube_control_path):
+        print("📁 Создаю YouTube API UI...")
+        with open(youtube_control_path, 'w', encoding='utf-8') as f:
+            f.write('''<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>YouTube API Control</title>
+    <style>
+        body { font-family: Arial; padding: 20px; max-width: 800px; margin: 0 auto; }
+        .panel { background: #f5f5f5; padding: 20px; border-radius: 10px; margin: 20px 0; }
+        .btn { background: #4285f4; color: white; border: none; padding: 10px 20px; margin: 5px; cursor: pointer; border-radius: 5px; }
+        .btn:hover { background: #3367d6; }
+        .btn-danger { background: #ea4335; }
+        .btn-success { background: #34a853; }
+        .status { padding: 10px; border-radius: 5px; margin: 10px 0; }
+        .online { background: #d4edda; }
+        .offline { background: #f8d7da; }
+        .info { background: #d1ecf1; }
+        input, textarea { width: 100%; padding: 8px; margin: 5px 0; }
+    </style>
+</head>
+<body>
+    <h1>🎬 YouTube API Control Panel</h1>
+
+    <div id="youtube-status" class="status offline">
+        YouTube API: Проверка доступности...
+    </div>
+
+    <div class="panel">
+        <h3>Автоматический запуск YouTube трансляции</h3>
+        <div>
+            <label>Название трансляции:</label><br>
+            <input type="text" id="stream-title" value="🤖 AI Agents Live: Научные дебаты ИИ">
+        </div>
+        <div>
+            <label>Описание:</label><br>
+            <textarea id="stream-description" rows="8"></textarea>
+        </div>
+        <button class="btn btn-success" onclick="startYoutubeStream()">🎬 Создать YouTube трансляцию</button>
+        <button class="btn" onclick="checkYouTubeStatus()">🔄 Проверить статус</button>
+    </div>
+
+    <div class="panel" id="stream-controls" style="display: none;">
+        <h3>Управление трансляцией</h3>
+        <div id="stream-info" class="status info">Информация не доступна</div>
+        <button class="btn" onclick="updateStreamInfo()">✏️ Обновить информацию</button>
+        <button class="btn" onclick="getChatId()">💬 Получить ID чата</button>
+        <button class="btn btn-danger" onclick="endYoutubeStream()">🛑 Завершить трансляцию</button>
+    </div>
+
+    <div class="panel">
+        <h3>Статус FFmpeg</h3>
+        <div id="ffmpeg-status" class="status">Загрузка...</div>
+        <button class="btn" onclick="checkFFmpegStatus()">🔄 Обновить статус FFmpeg</button>
+    </div>
+
+    <script>
+        // Автоматически заполняем описание
+        document.getElementById('stream-description').value = `Автономные ИИ-агенты обсуждают науку в реальном времени.
+
+Участники:
+• Доктор Алексей Волков - Квантовая физика
+• Профессор Мария Соколова - Нейробиология
+• Доктор Иван Петров - Климатология
+• Исследователь София Ковалева - ИИ и робототехника
+
+Темы: Искусственный интеллект, квантовые вычисления, изменение климата, нейроинтерфейсы.
+
+Стрим создан автоматически с помощью Python и OpenAI GPT-4.`;
+
+        // Проверяем доступность YouTube API при загрузке
+        window.addEventListener('load', function() {
+            checkYouTubeStatus();
+            checkFFmpegStatus();
+        });
+
+        function checkYouTubeStatus() {
+            fetch('/api/youtube_control', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({action: 'get_info'})
+            })
+            .then(res => res.json())
+            .then(data => {
+                const statusDiv = document.getElementById('youtube-status');
+                if(data.status === 'success') {
+                    statusDiv.className = 'status online';
+                    statusDiv.innerHTML = 'YouTube API: Доступен';
+                    document.getElementById('stream-controls').style.display = 'block';
+                    updateStreamInfoDisplay(data);
+                } else {
+                    statusDiv.className = 'status offline';
+                    statusDiv.innerHTML = 'YouTube API: Не доступен. Установите client_secrets.json';
+                }
+            })
+            .catch(err => {
+                document.getElementById('youtube-status').className = 'status offline';
+                document.getElementById('youtube-status').innerHTML = 'YouTube API: Ошибка подключения';
+            });
+        }
+
+        function startYoutubeStream() {
+            const title = document.getElementById('stream-title').value;
+            const description = document.getElementById('stream-description').value;
+
+            if(!title.trim()) {
+                alert('Введите название трансляции');
+                return;
+            }
+
+            fetch('/api/start_youtube_stream', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({title, description})
+            })
+            .then(res => res.json())
+            .then(data => {
+                if(data.status === 'started') {
+                    alert('✅ YouTube трансляция создана!\\nСсылка: ' + data.watch_url);
+                    document.getElementById('stream-controls').style.display = 'block';
+                    updateStreamInfoDisplay({
+                        status: 'success',
+                        broadcast_id: data.broadcast_id,
+                        stream_id: data.stream_id,
+                        is_live: true,
+                        stream_info: {
+                            stream_key: data.stream_key,
+                            rtmp_url: data.rtmp_url
+                        }
+                    });
+                } else {
+                    alert('❌ Ошибка: ' + data.message);
+                }
+            })
+            .catch(err => {
+                alert('❌ Ошибка сети: ' + err);
+            });
+        }
+
+        function updateStreamInfo() {
+            const title = document.getElementById('stream-title').value;
+            const description = document.getElementById('stream-description').value;
+
+            fetch('/api/youtube_control', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    action: 'update_info',
+                    title: title,
+                    description: description
+                })
+            })
+            .then(res => res.json())
+            .then(data => {
+                if(data.status === 'updated') {
+                    alert('✅ Информация обновлена');
+                } else {
+                    alert('❌ Ошибка обновления');
+                }
+            });
+        }
+
+        function getChatId() {
+            fetch('/api/youtube_control', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({action: 'get_chat_id'})
+            })
+            .then(res => res.json())
+            .then(data => {
+                if(data.chat_id) {
+                    alert('💬 ID чата: ' + data.chat_id);
+                } else {
+                    alert('❌ Чат не найден');
+                }
+            });
+        }
+
+        function endYoutubeStream() {
+            if(confirm('Завершить YouTube трансляцию?')) {
+                fetch('/api/youtube_control', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({action: 'end_stream'})
+                })
+                .then(res => res.json())
+                .then(data => {
+                    if(data.status === 'ended') {
+                        alert('✅ Трансляция завершена');
+                        document.getElementById('stream-controls').style.display = 'none';
+                        document.getElementById('stream-info').innerHTML = 'Информация не доступна';
+                    } else {
+                        alert('❌ Ошибка завершения');
+                    }
+                });
+            }
+        }
+
+        function updateStreamInfoDisplay(data) {
+            const infoDiv = document.getElementById('stream-info');
+            let html = '';
+
+            if(data.broadcast_id) {
+                html += `<strong>ID трансляции:</strong> ${data.broadcast_id}<br>`;
+                html += `<strong>Статус:</strong> ${data.is_live ? 'В эфире 🟢' : 'Не в эфире 🔴'}<br>`;
+                html += `<strong>Stream Key:</strong> ${data.stream_info?.stream_key || 'Не указан'}<br>`;
+                html += `<strong>RTMP URL:</strong> ${data.stream_info?.rtmp_url || 'Не указан'}`;
+            }
+
+            infoDiv.innerHTML = html || 'Информация не доступна';
+        }
+
+        function checkFFmpegStatus() {
+            fetch('/api/stream_status')
+            .then(res => res.json())
+            .then(data => {
+                const statusDiv = document.getElementById('ffmpeg-status');
+                if(data.is_streaming) {
+                    statusDiv.className = 'status online';
+                    statusDiv.innerHTML = `FFmpeg: Работает (PID: ${data.pid})<br>
+                                           RTMP: ${data.rtmp_url || 'Не указан'}`;
+                } else {
+                    statusDiv.className = 'status offline';
+                    statusDiv.innerHTML = 'FFmpeg: Не запущен';
+                }
+            })
+            .catch(err => {
+                document.getElementById('ffmpeg-status').innerHTML = 'FFmpeg: Ошибка проверки';
+            });
+        }
+    </script>
+</body>
+</html>''')
+
+    # Запускаем поток дискуссии
+    print("🔄 Запуск цикла дискуссии...")
+    discussion_thread = threading.Thread(target=start_discussion_loop, daemon=True)
+    discussion_thread.start()
+
+    print("🚀 Запуск веб-сервера...")
+    print("🌐 Основной интерфейс: http://localhost:5000")
+    print("🎬 YouTube API интерфейс: http://localhost:5000/youtube-control")
+    print("🔧 API Endpoints:")
+    print("   GET  /health                     - Проверка здоровья")
+    print("   POST /api/start_stream           - Ручной запуск стрима")
+    print("   POST /api/start_youtube_stream   - Автоматический запуск через YouTube API")
+    print("   POST /api/youtube_control        - Управление YouTube трансляцией")
+    print("   GET  /api/stream_status          - Статус стрима")
+    print("   POST /api/test_audio             - Тест звука")
+    print("")
+    print("📝 Доступные методы запуска стрима:")
+    print("   1. Ручной: Ввести Stream Key в основном интерфейсе")
+    print("   2. Автоматический: Использовать YouTube API (требуется client_secrets.json)")
+    print("=" * 70)
 
     try:
         socketio.run(app,

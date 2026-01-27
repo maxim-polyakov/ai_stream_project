@@ -1277,7 +1277,7 @@ def start_stream():
 
 @app.route('/api/start_youtube_stream', methods=['POST'])
 def start_youtube_stream():
-    """Запуск стрима через YouTube API (автоматическое создание)"""
+    """Запуск стрима через YouTube API (исправленная версия)"""
     try:
         if not YOUTUBE_API_AVAILABLE or not youtube_api_manager:
             return jsonify({
@@ -1296,62 +1296,43 @@ def start_youtube_stream():
 
         logger.info(f"🎬 Запуск YouTube стрима через API: {title}")
 
-        # Запускаем стрим через YouTube API
-        try:
-            success = youtube_api_manager.start_stream(title, description)
-        except Exception as e:
-            logger.error(f"Ошибка YouTube API: {e}")
-            return jsonify({
-                'status': 'error',
-                'message': f'Ошибка YouTube API: {str(e)}'
-            }), 500
+        # Запускаем стрим с FFmpeg
+        result = youtube_api_manager.start_stream_with_ffmpeg(
+            title=title,
+            description=description,
+            ffmpeg_manager=ffmpeg_manager  # Передаем менеджер FFmpeg
+        )
 
-        if not success:
-            return jsonify({
-                'status': 'error',
-                'message': 'Не удалось создать YouTube трансляцию'
-            }), 500
-
-        # Получаем информацию о стриме
-        try:
+        if result is True:
+            # Успешный запуск
             stream_info = youtube_api_manager.get_stream_info()
-        except Exception as e:
-            logger.error(f"Ошибка получения stream_info: {e}")
-            return jsonify({
-                'status': 'error',
-                'message': 'Не удалось получить информацию о стриме'
-            }), 500
 
-        if not stream_info or 'stream_key' not in stream_info:
-            return jsonify({
-                'status': 'error',
-                'message': 'Не удалось получить Stream Key от YouTube API'
-            }), 500
-
-        # Устанавливаем stream key в FFmpeg manager
-        ffmpeg_manager.set_stream_key(stream_info['stream_key'])
-
-        # Запускаем FFmpeg стрим
-        if ffmpeg_manager.start_stream():
             return jsonify({
                 'status': 'started',
                 'broadcast_id': youtube_api_manager.broadcast_id,
                 'stream_id': youtube_api_manager.stream_id,
                 'watch_url': f"https://youtube.com/watch?v={youtube_api_manager.broadcast_id}",
-                'stream_key': stream_info['stream_key'],
-                'rtmp_url': stream_info['rtmp_url'],
+                'stream_key': stream_info.get('stream_key'),
+                'rtmp_url': stream_info.get('rtmp_url'),
                 'pid': ffmpeg_manager.ffmpeg_pid,
                 'message': 'YouTube трансляция создана и стрим запущен'
             })
+
+        elif isinstance(result, dict):
+            # Создана трансляция, но FFmpeg не запущен
+            return jsonify({
+                'status': 'broadcast_created',
+                'broadcast_id': result['broadcast_id'],
+                'stream_key': result['stream_key'],
+                'rtmp_url': result['rtmp_url'],
+                'watch_url': result['watch_url'],
+                'message': 'Трансляция создана, запустите FFmpeg вручную'
+            })
+
         else:
-            # Если FFmpeg не запустился, останавливаем YouTube трансляцию
-            try:
-                youtube_api_manager.end_stream()
-            except:
-                pass
             return jsonify({
                 'status': 'error',
-                'message': 'Не удалось запустить FFmpeg стрим'
+                'message': 'Не удалось создать YouTube трансляцию'
             }), 500
 
     except Exception as e:

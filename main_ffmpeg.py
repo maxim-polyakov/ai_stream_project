@@ -113,6 +113,8 @@ class FFmpegStreamManager:
         self.video_source = "black"
         self.ffmpeg_stdin = None
         self.start_time = None
+        self.audio_queue = []  # Очередь аудио файлов для воспроизведения
+        self.is_playing_audio = False
 
         # Настройки аудио
         self.audio_sample_rate = 44100
@@ -227,6 +229,10 @@ class FFmpegStreamManager:
             # Запуск мониторинга
             threading.Thread(target=self._monitor_ffmpeg, daemon=True).start()
 
+            # Запуск обработчика аудио
+            if use_audio and self.use_pyaudio:
+                threading.Thread(target=self._audio_processor, daemon=True).start()
+
             logger.info(f"🎬 FFmpeg стрим запущен (PID: {self.ffmpeg_pid})")
             return True
 
@@ -269,6 +275,46 @@ class FFmpegStreamManager:
                 except:
                     pass
 
+    def _audio_processor(self):
+        """Обработчик аудио очереди"""
+        import numpy as np
+
+        while self.is_streaming:
+            try:
+                if self.audio_queue:
+                    audio_file = self.audio_queue.pop(0)
+                    self.is_playing_audio = True
+                    self.stream_audio_realtime(audio_file)
+                    self.is_playing_audio = False
+                else:
+                    # Отправляем тишину
+                    silence_duration = 0.1  # 100 мс
+                    samples = int(self.audio_sample_rate * silence_duration)
+                    silence = np.zeros(samples * self.audio_channels, dtype=np.int16).tobytes()
+
+                    if self.ffmpeg_stdin:
+                        try:
+                            self.ffmpeg_stdin.write(silence)
+                            self.ffmpeg_stdin.flush()
+                        except:
+                            break
+
+                    time.sleep(silence_duration)
+            except Exception as e:
+                logger.error(f"Ошибка обработчика аудио: {e}")
+                time.sleep(0.1)
+
+    def add_audio_to_queue(self, audio_file: str):
+        """Добавление аудио файла в очередь на воспроизведение"""
+        if not os.path.exists(audio_file):
+            logger.error(f"❌ Аудио файл не найден: {audio_file}")
+            return False
+
+        self.audio_queue.append(audio_file)
+        logger.info(f"🎵 Аудио добавлено в очередь: {os.path.basename(audio_file)}")
+        logger.info(f"📊 Очередь аудио: {len(self.audio_queue)} файлов")
+        return True
+
     def send_audio_to_stream(self, audio_data: bytes):
         """Отправка аудио данных в стрим"""
         if not self.is_streaming or not self.ffmpeg_stdin:
@@ -286,23 +332,169 @@ class FFmpegStreamManager:
             return False
 
     def play_audio_file(self, audio_file: str):
-        """Воспроизведение аудио файла и отправка в стрим"""
+        """Воспроизведение аудио файла (MP3) и отправка в стрим"""
         if not os.path.exists(audio_file):
             logger.error(f"❌ Аудио файл не найден: {audio_file}")
             return False
 
         try:
-            # Конвертируем MP3 в сырое аудио и отправляем
+            # Используем ffmpeg для конвертации MP3 в сырое аудио
+            ffmpeg_cmd = [
+                'ffmpeg',
+                '-i', audio_file,  # Входной MP3 файл
+                '-f', 's16le',  # Формат выхода: 16-bit PCM
+                '-ar', '44100',  # Частота дискретизации
+                '-ac', '2',  # Стерео
+                '-acodec', 'pcm_s16le',  # Кодек для выхода
+                '-'  # Вывод в stdout
+            ]
+
+            logger.debug(f"Конвертируем аудио: {os.path.basename(audio_file)}")
+
+            # Запускаем ffmpeg для конвертации
+            process = subprocess.Popen(
+                ffmpeg_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=10 ** 8  # Большой буфер для плавного воспроизведения
+            )
+
+            # Читаем выходные данные и отправляем в стрим
+            while True:
+                audio_data = process.stdout.read(4096)  # Читаем порциями
+                if not audio_data:
+                    break
+
+                # Отправляем в FFmpeg stdin
+                if self.ffmpeg_stdin:
+                    try:
+                        self.ffmpeg_stdin.write(audio_data)
+                        self.ffmpeg_stdin.flush()
+                    except BrokenPipeError:
+                        logger.error("❌ FFmpeg stdin закрыт")
+                        break
+
+            # Ждем завершения конвертации
+            process.wait()
+
+            # Проверяем на ошибки
+            if process.returncode != 0:
+                error_output = process.stderr.read().decode('utf-8', errors='ignore')
+                logger.error(f"Ошибка конвертации аудио: {error_output}")
+                return False
+
+            logger.info(f"✅ Аудио отправлено в стрим: {os.path.basename(audio_file)}")
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка воспроизведения аудио файла: {e}")
+            return False
+
+    def stream_audio_realtime(self, audio_file: str):
+        """Стриминг аудио в реальном времени с синхронизацией"""
+        if not self.is_streaming:
+            logger.warning("Стрим не активен")
+            return False
+
+        try:
+            # Получаем длительность аудио
+            duration = self._get_audio_duration(audio_file)
+
+            # Команда для конвертации и отправки аудио в реальном времени
+            ffmpeg_cmd = [
+                'ffmpeg',
+                '-re',  # Реальное время (важно для синхронизации!)
+                '-i', audio_file,  # Входной файл
+                '-f', 's16le',  # Формат выхода
+                '-ar', '44100',  # Частота дискретизации
+                '-ac', '2',  # Стерео
+                '-c:a', 'pcm_s16le',  # Кодек аудио
+                '-'  # Вывод в stdout
+            ]
+
+            logger.info(f"🎵 Стриминг аудио: {os.path.basename(audio_file)} ({duration:.1f} сек)")
+
+            process = subprocess.Popen(
+                ffmpeg_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0
+            )
+
+            # Стримим аудио порциями
+            chunk_size = 88200  # 0.5 секунды аудио (44100 Гц * 2 канала * 2 байта)
+
+            while True:
+                audio_data = process.stdout.read(chunk_size)
+                if not audio_data:
+                    break
+
+                if self.ffmpeg_stdin:
+                    try:
+                        self.ffmpeg_stdin.write(audio_data)
+                        self.ffmpeg_stdin.flush()
+                    except BrokenPipeError:
+                        logger.error("FFmpeg перестал принимать аудио")
+                        break
+
+            process.wait()
+            logger.info(f"✅ Аудио завершено: {os.path.basename(audio_file)}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Ошибка стриминга аудио: {e}")
+            return False
+
+    def _get_audio_duration(self, audio_file: str) -> float:
+        """Получение длительности аудио файла через ffprobe"""
+        try:
+            cmd = [
+                'ffprobe',
+                '-v', 'error',
+                '-show_entries', 'format=duration',
+                '-of', 'csv=p=0',
+                audio_file
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                return float(result.stdout.strip())
+        except:
+            pass
+
+        # Если не получилось, оцениваем примерно
+        try:
+            # Примерная оценка: 0.1 секунды на слово
+            import re
+            with open(audio_file, 'rb') as f:
+                # Читаем ID3 тег для MP3
+                f.seek(-128, 2)
+                tag = f.read(3)
+                if tag == b'TAG':
+                    # MP3 с тегом
+                    return 5.0
+        except:
+            pass
+
+        return 5.0  # Значение по умолчанию
+
+    def stream_audio_sync(self, audio_file: str, wait_for_completion: bool = True):
+        """Синхронное воспроизведение аудио файла"""
+        if not self.is_streaming:
+            logger.warning("Стрим не активен")
+            return False
+
+        try:
+            # Создаем отдельный процесс для конвертации и отправки аудио
             ffmpeg_cmd = [
                 'ffmpeg',
                 '-i', audio_file,
-                '-f', 's16le',  # Сырое 16-битное аудио
-                '-ar', str(self.audio_sample_rate),
-                '-ac', str(self.audio_channels),
+                '-f', 's16le',
+                '-ar', '44100',
+                '-ac', '2',
                 '-'
             ]
 
-            # Запускаем ffmpeg для конвертации
             process = subprocess.Popen(
                 ffmpeg_cmd,
                 stdout=subprocess.PIPE,
@@ -310,21 +502,76 @@ class FFmpegStreamManager:
                 bufsize=0
             )
 
-            # Читаем выходные данные и отправляем в стрим
-            while True:
-                audio_data = process.stdout.read(4096)
-                if not audio_data:
-                    break
+            # Создаем pipe для отправки данных
+            def send_audio():
+                while True:
+                    data = process.stdout.read(4096)
+                    if not data:
+                        break
 
-                if not self.send_audio_to_stream(audio_data):
-                    break
+                    if self.ffmpeg_stdin:
+                        try:
+                            self.ffmpeg_stdin.write(data)
+                            self.ffmpeg_stdin.flush()
+                        except:
+                            break
 
-            process.wait()
-            logger.info(f"🎵 Аудио отправлено в стрим: {os.path.basename(audio_file)}")
+            # Запускаем в отдельном потоке
+            audio_thread = threading.Thread(target=send_audio, daemon=True)
+            audio_thread.start()
+
+            if wait_for_completion:
+                audio_thread.join(timeout=30)  # Максимум 30 секунд
+
+            process.wait(timeout=5)
             return True
 
         except Exception as e:
-            logger.error(f"❌ Ошибка воспроизведения аудио файла: {e}")
+            logger.error(f"Ошибка синхронного воспроизведения аудио: {e}")
+            return False
+
+    def play_audio_simple(self, audio_file: str):
+        """Простое воспроизведение аудио файла (самый надежный метод)"""
+        if not self.is_streaming or not self.ffmpeg_stdin:
+            logger.warning("Стрим не активен или stdin недоступен")
+            return False
+
+        try:
+            # Используем ffmpeg для прямой отправки в rtmp
+            ffmpeg_audio_cmd = [
+                'ffmpeg',
+                '-re',  # Реальное время
+                '-i', audio_file,
+                '-c:a', 'aac',
+                '-b:a', '128k',
+                '-ar', '44100',
+                '-ac', '2',
+                '-f', 'flv',
+                self.rtmp_url
+            ]
+
+            logger.info(f"▶️ Воспроизведение аудио: {os.path.basename(audio_file)}")
+
+            # Запускаем отдельный процесс для аудио
+            process = subprocess.Popen(
+                ffmpeg_audio_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE
+            )
+
+            # Ждем завершения
+            process.wait()
+
+            if process.returncode == 0:
+                logger.info(f"✅ Аудио успешно воспроизведено")
+                return True
+            else:
+                error = process.stderr.read().decode('utf-8', errors='ignore')
+                logger.error(f"❌ Ошибка воспроизведения аудио: {error}")
+                return False
+
+        except Exception as e:
+            logger.error(f"Ошибка простого воспроизведения аудио: {e}")
             return False
 
     def stop_stream(self):
@@ -334,6 +581,9 @@ class FFmpegStreamManager:
             self.is_streaming = False
 
             try:
+                # Очищаем очередь аудио
+                self.audio_queue.clear()
+
                 # Закрываем stdin
                 if self.ffmpeg_stdin:
                     self.ffmpeg_stdin.close()
@@ -369,8 +619,82 @@ class FFmpegStreamManager:
             'rtmp_url': self.rtmp_url,
             'pid': self.ffmpeg_pid,
             'video_source': self.video_source,
-            'use_pyaudio': self.use_pyaudio
+            'use_pyaudio': self.use_pyaudio,
+            'audio_queue_size': len(self.audio_queue),
+            'is_playing_audio': self.is_playing_audio
         }
+
+    def get_stream_health(self):
+        """Проверка здоровья стрима"""
+        status = self.get_status()
+
+        # Проверяем, жив ли процесс
+        if self.stream_process:
+            status['process_alive'] = (self.stream_process.poll() is None)
+            if not status['process_alive']:
+                status['exit_code'] = self.stream_process.poll()
+        else:
+            status['process_alive'] = False
+
+        # Проверяем время работы
+        if self.start_time:
+            status['uptime'] = time.time() - self.start_time
+
+        return status
+
+    def check_stream_connection(self):
+        """Проверка подключения к YouTube"""
+        if not self.rtmp_url:
+            return {'connected': False, 'error': 'No RTMP URL'}
+
+        try:
+            # Используем ffprobe для проверки подключения
+            cmd = [
+                'ffprobe',
+                '-v', 'error',
+                '-timeout', '5000000',  # 5 секунд таймаут
+                self.rtmp_url
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+
+            return {
+                'connected': result.returncode == 0,
+                'output': result.stdout if result.returncode == 0 else result.stderr
+            }
+
+        except subprocess.TimeoutExpired:
+            return {'connected': False, 'error': 'Connection timeout'}
+        except Exception as e:
+            return {'connected': False, 'error': str(e)}
+
+    def create_test_audio(self, text: str = "Тестовое сообщение", voice: str = "male_ru"):
+        """Создание тестового аудио файла"""
+        try:
+            import tempfile
+            import asyncio
+            import edge_tts
+
+            # Создаем временный файл
+            with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as tmp:
+                temp_path = tmp.name
+
+            # Генерируем аудио
+            async def generate():
+                tts = edge_tts.Communicate(
+                    text=text,
+                    voice='ru-RU-DmitryNeural' if voice == 'male_ru' else 'ru-RU-SvetlanaNeural'
+                )
+                await tts.save(temp_path)
+
+            asyncio.run(generate())
+
+            logger.info(f"✅ Тестовое аудио создано: {temp_path}")
+            return temp_path
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка создания тестового аудио: {e}")
+            return None
 
 
 # ========== EDGE TTS MANAGER ==========

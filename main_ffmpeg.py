@@ -443,10 +443,31 @@ class YouTubeOAuthStream:
                 logger.error("❌ Нет активной трансляции")
                 return False
 
+            # Сначала проверяем текущий статус трансляции
+            request = self.youtube.liveBroadcasts().list(
+                part='status',
+                id=self.broadcast_id
+            )
+            response = request.execute()
+
+            if 'items' not in response or len(response['items']) == 0:
+                logger.error("❌ Трансляция не найдена")
+                return False
+
+            current_status = response['items'][0]['status']['lifeCycleStatus']
+            logger.info(f"📊 Текущий статус трансляции: {current_status}")
+
+            # Можно переводить в live только из статусов 'ready' или 'testing'
+            if current_status not in ['ready', 'testing']:
+                logger.error(f"❌ Невозможно начать трансляцию из статуса {current_status}")
+                logger.info("ℹ️ Ожидайте 1-2 минуты после создания трансляции")
+                return False
+
+            # Теперь переводим в live
             request = self.youtube.liveBroadcasts().transition(
                 broadcastStatus='live',
                 id=self.broadcast_id,
-                part='status'
+                part='id,snippet,status'
             )
 
             response = request.execute()
@@ -457,9 +478,20 @@ class YouTubeOAuthStream:
 
             return True
 
+        except HttpError as e:
+            error_details = json.loads(e.content.decode('utf-8'))
+            logger.error(f"❌ Ошибка начала трансляции: {error_details}")
+
+            if 'invalidTransition' in str(error_details):
+                logger.info("📋 Возможные причины:")
+                logger.info("1. Трансляция уже идет (status: live)")
+                logger.info("2. Трансляция еще не готова (status: created)")
+                logger.info("3. Не прошло достаточно времени после создания")
+                logger.info("4. Не привязан stream или stream не активен")
+
+            return False
         except Exception as e:
             logger.error(f"❌ Ошибка начала трансляции: {e}")
-            self.metrics['errors'].append(str(e))
             return False
 
     def complete_broadcast(self) -> bool:
@@ -548,6 +580,11 @@ class YouTubeOAuthStream:
                 return None
             print("✅ Трансляция привязана к потоку")
 
+            # 5. ПЕРЕДАЕМ УПРАВЛЕНИЕ FFMPEG
+            print("🔧 Шаг 5: Запуск FFmpeg стрима...")
+            # Здесь мы НЕ запускаем трансляцию через API
+            # Ждем, пока FFmpeg подключится к YouTube
+
             result = {
                 'success': True,
                 'broadcast_id': self.broadcast_id,
@@ -555,7 +592,7 @@ class YouTubeOAuthStream:
                 'watch_url': f"https://youtube.com/watch?v={self.broadcast_id}",
                 'stream_key': stream_info['stream_key'],
                 'rtmp_url': stream_info['rtmp_url'],
-                'message': "Трансляция создана, запустите FFmpeg для начала стрима"
+                'message': "Трансляция создана, запустите FFmpeg для начала стрима. Трансляция автоматически начнется когда YouTube получит поток."
             }
 
             print("\n" + "=" * 70)
@@ -564,6 +601,9 @@ class YouTubeOAuthStream:
             print(f"📺 Ссылка: {result['watch_url']}")
             print(f"🔑 Stream Key: {result['stream_key']}")
             print(f"📍 RTMP URL: {result['rtmp_url']}")
+            print("\n⚠️  Важно: Трансляция автоматически начнется")
+            print("когда YouTube получит видеопоток от FFmpeg.")
+            print("Обычно это занимает 30-60 секунд.")
             print("=" * 70)
 
             return result
@@ -623,22 +663,22 @@ class FFmpegStreamManager:
         self.video_param = source_param
         logger.info(f"📹 Источник видео: {source_type}")
 
-    def start_stream(self, use_audio: bool = True):
+    def start_stream(self, use_audio: bool = True) -> Dict[str, Any]:
         """Запуск FFmpeg стрима с передачей аудио"""
         if not self.stream_key:
             logger.error("❌ Stream Key не установлен!")
-            return False
+            return {'success': False, 'error': 'Stream Key не установлен'}
 
         try:
             self.start_time = time.time()
 
-            # Базовая команда FFmpeg для YouTube
+            # Базовая команда FFmpeg для YouTube с тестовой картинкой
             ffmpeg_cmd = [
                 'ffmpeg',
                 '-re',  # Реальное время
                 '-f', 'lavfi',
                 '-i',
-                f'color=c=black:s=1920x1080:r=30:drawtext=text="AI\\\\ Stream\\\\ {datetime.now().strftime("%H:%M")}":fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2',
+                f'color=c=black:s=1920x1080:r=30:drawtext=text="AI\\\\ Stream\\\\ {datetime.now().strftime("%H:%M:%S")}":fontcolor=white:fontsize=72:x=(w-text_w)/2:y=(h-text_h)/2',
                 '-f', 'lavfi',
                 '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
                 '-c:v', 'libx264',
@@ -647,6 +687,8 @@ class FFmpegStreamManager:
                 '-pix_fmt', 'yuv420p',
                 '-g', '60',
                 '-b:v', '4500k',
+                '-maxrate', '5000k',
+                '-bufsize', '9000k',
                 '-c:a', 'aac',
                 '-b:a', '128k',
                 '-ar', '44100',
@@ -675,11 +717,18 @@ class FFmpegStreamManager:
             threading.Thread(target=self._monitor_ffmpeg, daemon=True).start()
 
             logger.info(f"🎬 FFmpeg стрим запущен (PID: {self.ffmpeg_pid})")
-            return True
+
+            return {
+                'success': True,
+                'pid': self.ffmpeg_pid,
+                'stream_key': self.stream_key,
+                'rtmp_url': self.rtmp_url,
+                'message': 'FFmpeg стрим запущен. Трансляция начнется автоматически через 30-60 секунд.'
+            }
 
         except Exception as e:
             logger.error(f"❌ Ошибка запуска FFmpeg: {e}", exc_info=True)
-            return False
+            return {'success': False, 'error': str(e)}
 
     def _monitor_ffmpeg(self):
         """Мониторинг процесса FFmpeg"""
@@ -1399,6 +1448,7 @@ def oauth_callback():
         </html>
         """
 
+
 @app.route('/api/start_youtube_oauth_stream', methods=['POST'])
 def start_youtube_oauth_stream():
     """Запуск стрима через YouTube OAuth API"""
@@ -1413,7 +1463,6 @@ def start_youtube_oauth_stream():
         if not youtube_oauth.youtube:
             # Если не аутентифицирован, возвращаем URL для авторизации
             auth_url = youtube_oauth.get_auth_url()
-            print(auth_url)
             if auth_url:
                 return jsonify({
                     'status': 'auth_required',
@@ -1452,10 +1501,9 @@ def start_youtube_oauth_stream():
             ffmpeg_manager.set_stream_key(result['stream_key'])
 
             # Запускаем FFmpeg стрим
-            if ffmpeg_manager.start_stream():
-                # Запускаем YouTube трансляцию (переводим в статус live)
-                youtube_oauth.start_broadcast()
+            ffmpeg_result = ffmpeg_manager.start_stream()
 
+            if ffmpeg_result.get('success'):
                 return jsonify({
                     'status': 'started',
                     'broadcast_id': youtube_oauth.broadcast_id,
@@ -1464,12 +1512,12 @@ def start_youtube_oauth_stream():
                     'stream_key': youtube_oauth.stream_key,
                     'rtmp_url': youtube_oauth.rtmp_url,
                     'pid': ffmpeg_manager.ffmpeg_pid,
-                    'message': 'YouTube трансляция создана и стрим запущен'
+                    'message': 'YouTube трансляция создана и FFmpeg стрим запущен. Трансляция начнется автоматически через 30-60 секунд.'
                 })
             else:
                 return jsonify({
                     'status': 'error',
-                    'message': 'Трансляция создана, но не удалось запустить FFmpeg стрим'
+                    'message': f'Трансляция создана, но не удалось запустить FFmpeg стрим: {ffmpeg_result.get("error", "Unknown error")}'
                 }), 500
         else:
             error_msg = result.get('message', 'Неизвестная ошибка') if result else 'Не удалось создать трансляцию'
@@ -1485,8 +1533,72 @@ def start_youtube_oauth_stream():
             'message': f'Внутренняя ошибка сервера: {str(e)}'
         }), 500
 
-# ... (остальные роуты остаются без изменений, но нужно обновить их для работы с youtube_oauth)
 
+@app.route('/api/youtube/check_status/<broadcast_id>')
+def check_youtube_status(broadcast_id):
+    """Проверка статуса YouTube трансляции"""
+    try:
+        if not youtube_oauth or not youtube_oauth.youtube:
+            return jsonify({
+                'status': 'error',
+                'message': 'YouTube API не инициализирован'
+            })
+
+        # Получаем информацию о трансляции
+        request = youtube_oauth.youtube.liveBroadcasts().list(
+            part='id,snippet,status,contentDetails',
+            id=broadcast_id
+        )
+        response = request.execute()
+
+        if 'items' not in response or len(response['items']) == 0:
+            return jsonify({'status': 'not_found'})
+
+        broadcast = response['items'][0]
+        status = broadcast['status']['lifeCycleStatus']
+
+        return jsonify({
+            'status': status,
+            'title': broadcast['snippet']['title'],
+            'scheduled_start_time': broadcast['snippet'].get('scheduledStartTime'),
+            'actual_start_time': broadcast['snippet'].get('actualStartTime'),
+            'watch_url': f"https://youtube.com/watch?v={broadcast_id}",
+            'is_live': status == 'live',
+            'health_status': broadcast['status'].get('healthStatus', {}).get('status', 'unknown')
+        })
+
+    except Exception as e:
+        logger.error(f"Ошибка проверки статуса: {e}")
+        return jsonify({'status': 'error', 'message': str(e)})
+
+
+@app.route('/api/youtube/start_live', methods=['POST'])
+def start_live_manually():
+    """Ручной запуск трансляции (если не началась автоматически)"""
+    try:
+        if not youtube_oauth or not youtube_oauth.broadcast_id:
+            return jsonify({
+                'status': 'error',
+                'message': 'Нет активной трансляции'
+            })
+
+        success = youtube_oauth.start_broadcast()
+
+        if success:
+            return jsonify({
+                'status': 'success',
+                'message': 'Трансляция переведена в статус live'
+            })
+        else:
+            return jsonify({
+                'status': 'error',
+                'message': 'Не удалось начать трансляцию. Проверьте статус в YouTube Studio.'
+            })
+
+    except Exception as e:
+        logger.error(f"Ошибка ручного запуска: {e}")
+        return jsonify({'status': 'error', 'message': str(e)})
+    
 @app.route('/')
 def index():
     """Главная страница"""

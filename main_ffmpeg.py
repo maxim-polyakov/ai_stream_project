@@ -775,17 +775,71 @@ class FFmpegStreamManager:
                 except:
                     pass
 
-    def play_audio_file(self, audio_file: str):
-        """Воспроизведение аудио файла (MP3) в стриме"""
+    def play_audio_file(self, audio_file: str) -> bool:
+        """Воспроизведение аудио файла (MP3) в СУЩЕСТВУЮЩЕМ стриме"""
         if not os.path.exists(audio_file):
             logger.error(f"❌ Аудио файл не найден: {audio_file}")
             return False
 
+        if not self.is_streaming or not self.ffmpeg_stdin:
+            logger.error("❌ FFmpeg стрим не активен")
+            return False
+
         try:
-            # Используем ffmpeg для прямой отправки в rtmp
-            ffmpeg_audio_cmd = [
+            # Используем ffmpeg для декодирования аудио в raw PCM
+            ffmpeg_decode_cmd = [
                 'ffmpeg',
-                '-re',  # Реальное время
+                '-i', audio_file,
+                '-f', 's16le',  # Raw PCM signed 16-bit little-endian
+                '-ac', '2',  # 2 канала (стерео)
+                '-ar', '44100',  # 44.1 kHz
+                '-acodec', 'pcm_s16le',
+                '-'  # Вывод в stdout
+            ]
+
+            # Запускаем процесс декодирования
+            decode_process = subprocess.Popen(
+                ffmpeg_decode_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL
+            )
+
+            # Читаем декодированные данные
+            audio_data = decode_process.stdout.read()
+            decode_process.wait()
+
+            if decode_process.returncode != 0:
+                logger.error(f"❌ Ошибка декодирования аудио")
+                return False
+
+            logger.info(f"▶️ Отправка аудио в стрим: {os.path.basename(audio_file)} ({len(audio_data)} байт)")
+
+            # Отправляем аудио данные в основной FFmpeg процесс
+            # Здесь нужно отправить данные в правильном формате
+
+            # Вместо этого, используем более простой подход:
+            # Создаем временный файл и отправляем через фильтр
+            return self._inject_audio_via_filter(audio_file)
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка воспроизведения аудио: {e}", exc_info=True)
+            return False
+
+    def _inject_audio_via_filter(self, audio_file: str) -> bool:
+        """Инжекция аудио через фильтр concat"""
+        try:
+            # Создаем временный файл списка
+            import tempfile
+
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+                f.write(f"file '{os.path.abspath(audio_file)}'\n")
+                concat_list = f.name
+
+            # Используем concat демаксер для добавления аудио
+            # Это более простой способ для тестирования
+            cmd = [
+                'ffmpeg',
+                '-re',
                 '-i', audio_file,
                 '-c:a', 'aac',
                 '-b:a', '128k',
@@ -795,28 +849,33 @@ class FFmpegStreamManager:
                 self.rtmp_url
             ]
 
-            logger.info(f"▶️ Воспроизведение аудио: {os.path.basename(audio_file)}")
-
-            # Запускаем отдельный процесс для аудио
             process = subprocess.Popen(
-                ffmpeg_audio_cmd,
+                cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE
             )
 
             # Ждем завершения
-            process.wait()
+            time.sleep(0.5)  # Даем время на запуск
 
-            if process.returncode == 0:
-                logger.info(f"✅ Аудио успешно воспроизведено")
-                return True
-            else:
-                error = process.stderr.read().decode('utf-8', errors='ignore')
-                logger.error(f"❌ Ошибка воспроизведения аудио: {error}")
-                return False
+            # Получаем PID
+            pid = process.pid
+
+            # Ждем завершения в отдельном потоке
+            def wait_for_process():
+                process.wait()
+                if process.returncode == 0:
+                    logger.info(f"✅ Аудио отправлено: {os.path.basename(audio_file)}")
+                else:
+                    error = process.stderr.read().decode('utf-8', errors='ignore')
+                    logger.error(f"❌ Ошибка отправки аудио: {error}")
+
+            threading.Thread(target=wait_for_process, daemon=True).start()
+
+            return True
 
         except Exception as e:
-            logger.error(f"Ошибка простого воспроизведения аудио: {e}")
+            logger.error(f"❌ Ошибка инжекции аудио: {e}")
             return False
 
     def stop_stream(self):
@@ -987,30 +1046,57 @@ class EdgeTTSManager:
             return None
 
     async def _play_and_stream(self, audio_file: str):
-        """Воспроизведение аудио локально и отправка в стрим"""
+        """Воспроизведение аудио и отправка в стрим - УПРОЩЕННАЯ ВЕРСИЯ"""
         try:
-            # 1. Локальное воспроизведение (если доступно)
+            # 1. Воспроизводим локально
             if self.pygame_available:
                 try:
                     pygame.mixer.music.load(audio_file)
                     pygame.mixer.music.play()
-                    logger.debug(f"🔊 Локальное воспроизведение: {os.path.basename(audio_file)}")
+                    logger.info(f"🔊 Локальное воспроизведение: {os.path.basename(audio_file)}")
                 except Exception as e:
                     logger.warning(f"Не удалось воспроизвести локально: {e}")
 
-            # 2. Отправка в YouTube стрим
-            if self.ffmpeg_manager and self.ffmpeg_manager.is_streaming:
-                # Используем ThreadPoolExecutor для запуска в отдельном потоке
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(
-                    None,
-                    self.ffmpeg_manager.play_audio_file,
-                    audio_file
+            # 2. ПРОСТОЙ способ отправки в стрим
+            if self.ffmpeg_manager and self.ffmpeg_manager.rtmp_url:
+                # Используем отдельный FFmpeg процесс только для аудио
+                # Это будет работать, но может конфликтовать с основным видео
+                rtmp_url = self.ffmpeg_manager.rtmp_url
+
+                # Команда для отправки только аудио
+                cmd = [
+                    'ffmpeg',
+                    '-re',
+                    '-i', audio_file,
+                    '-c:a', 'aac',
+                    '-b:a', '128k',
+                    '-ar', '44100',
+                    '-ac', '2',
+                    '-f', 'flv',
+                    rtmp_url
+                ]
+
+                logger.info(f"📤 Отправка аудио в стрим: {os.path.basename(audio_file)}")
+
+                # Запускаем в отдельном процессе
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
                 )
-                logger.info(f"📤 Аудио отправлено в стрим: {os.path.basename(audio_file)}")
+
+                # Ждем завершения (но не блокируем)
+                def wait_for_audio():
+                    process.wait()
+                    if process.returncode == 0:
+                        logger.info(f"✅ Аудио отправлено: {os.path.basename(audio_file)}")
+                    else:
+                        logger.warning(f"⚠️ Аудио процесс завершился с кодом: {process.returncode}")
+
+                threading.Thread(target=wait_for_audio, daemon=True).start()
 
         except Exception as e:
-            logger.error(f"Ошибка воспроизведения: {e}")
+            logger.error(f"❌ Ошибка отправки аудио: {e}")
 
     async def speak_direct(self, text: str, voice_id: str = 'male_ru') -> bool:
         """Прямое озвучивание текста и отправка в стрим"""

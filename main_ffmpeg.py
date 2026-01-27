@@ -644,6 +644,9 @@ class FFmpegStreamManager:
         self.video_source = "black"
         self.audio_mixer = None
         self.current_audio_process = None
+        self.monitor_thread = None
+        self.last_error = None
+        self.stream_start_time = None
 
     def set_stream_key(self, stream_key: str):
         """Установка ключа стрима"""
@@ -659,13 +662,17 @@ class FFmpegStreamManager:
             return {'success': False, 'error': 'Stream Key не установлен'}
 
         try:
+            self.stream_start_time = time.time()
+
             # ПРОСТАЯ РАБОЧАЯ КОМАНДА FFMPEG
+            # Используем escape-последовательности для текста
+            drawtext_filter = "color=c=black:s=1920x1080:r=30,drawtext=text='AI Live Stream':fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2:box=1:boxcolor=black@0.5"
+
             ffmpeg_cmd = [
                 'ffmpeg',
                 '-re',  # Реальное время
                 '-f', 'lavfi',
-                '-i',
-                'color=c=black:s=1920x1080:r=30,drawtext=text=AI\ Live\ Stream:fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2',
+                '-i', drawtext_filter,
                 '-f', 'lavfi',
                 '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
                 '-c:v', 'libx264',
@@ -684,7 +691,7 @@ class FFmpegStreamManager:
                 self.rtmp_url
             ]
 
-            logger.info(f"🚀 Запуск FFmpeg: {' '.join(ffmpeg_cmd)}")
+            logger.info(f"🚀 Запуск FFmpeg с фильтром: {drawtext_filter}")
 
             # Запускаем FFmpeg
             self.stream_process = subprocess.Popen(
@@ -692,17 +699,22 @@ class FFmpegStreamManager:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
-                text=True,
-                bufsize=0
+                bufsize=1,
+                universal_newlines=False  # Важно для бинарного вывода
             )
 
             self.is_streaming = True
             self.ffmpeg_pid = self.stream_process.pid
+            self.last_error = None
 
             # Запускаем мониторинг
-            threading.Thread(target=self._monitor_ffmpeg, daemon=True).start()
+            self.monitor_thread = threading.Thread(target=self._monitor_ffmpeg, daemon=True)
+            self.monitor_thread.start()
 
             logger.info(f"🎬 FFmpeg стрим запущен (PID: {self.ffmpeg_pid})")
+
+            # Даем время на запуск
+            time.sleep(2)
 
             return {
                 'success': True,
@@ -715,6 +727,87 @@ class FFmpegStreamManager:
         except Exception as e:
             logger.error(f"❌ Ошибка запуска FFmpeg: {e}", exc_info=True)
             return {'success': False, 'error': str(e)}
+
+    def _monitor_ffmpeg(self):
+        """Мониторинг процесса FFmpeg"""
+        try:
+            logger.info(f"👀 Начало мониторинга FFmpeg процесса (PID: {self.ffmpeg_pid})")
+            stream_connected = False
+            last_status_time = time.time()
+
+            # Читаем stderr FFmpeg в реальном времени
+            while self.is_streaming and self.stream_process:
+                # Проверяем, жив ли процесс
+                if self.stream_process.poll() is not None:
+                    return_code = self.stream_process.returncode
+                    logger.warning(f"⚠️ FFmpeg процесс завершился с кодом: {return_code}")
+                    self.is_streaming = False
+
+                    # Читаем оставшийся вывод
+                    try:
+                        stderr_output = self.stream_process.stderr.read().decode('utf-8', errors='ignore')
+                        if stderr_output:
+                            logger.error(f"FFmpeg stderr output: {stderr_output[:500]}")
+                    except:
+                        pass
+
+                    break
+
+                # Читаем строку из stderr
+                try:
+                    line_bytes = self.stream_process.stderr.readline()
+                    if not line_bytes:
+                        # Нет данных, небольшая пауза
+                        time.sleep(0.1)
+                        continue
+
+                    line = line_bytes.decode('utf-8', errors='ignore').strip()
+
+                    # Пропускаем пустые строки
+                    if not line:
+                        continue
+
+                    # Логируем важные сообщения
+                    if any(keyword in line.lower() for keyword in ['error', 'fail', 'invalid', 'unable', 'cannot']):
+                        logger.error(f"FFmpeg ERROR: {line}")
+                        self.last_error = line
+                        socketio.emit('stream_error', {'message': line})
+
+                    # Проверяем подключение к YouTube
+                    elif 'rtmp://' in line and ('connected' in line.lower() or 'connected to' in line.lower()):
+                        if not stream_connected:
+                            stream_connected = True
+                            logger.info("✅ Успешное подключение к YouTube RTMP серверу")
+                            socketio.emit('stream_connected', {'status': 'connected', 'rtmp_url': self.rtmp_url})
+
+                    # Проверяем статистику трансляции
+                    elif 'frame=' in line and 'fps=' in line:
+                        # Логируем статистику каждые 10 секунд
+                        current_time = time.time()
+                        if current_time - last_status_time > 10:
+                            logger.info(f"📊 FFmpeg stats: {line}")
+                            last_status_time = current_time
+                            socketio.emit('stream_stats', {'stats': line})
+
+                    # Проверяем предупреждения
+                    elif 'warning' in line.lower():
+                        logger.warning(f"FFmpeg WARNING: {line}")
+
+                    # Логируем прогресс
+                    elif 'time=' in line and 'bitrate=' in line:
+                        # Периодически логируем прогресс
+                        pass
+
+                except Exception as e:
+                    logger.error(f"Ошибка чтения stderr FFmpeg: {e}")
+                    time.sleep(0.1)
+
+            logger.info("👀 Мониторинг FFmpeg завершен")
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка мониторинга FFmpeg: {e}", exc_info=True)
+        finally:
+            self.is_streaming = False
 
     def play_audio_file(self, audio_file: str) -> bool:
         """Воспроизведение аудио файла в стриме - ОСНОВНОЙ РАБОЧИЙ МЕТОД"""
@@ -732,13 +825,18 @@ class FFmpegStreamManager:
             # 1. Сначала получаем длительность аудио
             duration = self._get_audio_duration(audio_file)
 
+            if duration <= 0:
+                logger.error(f"❌ Некорректная длительность аудио: {duration}")
+                return False
+
+            logger.info(f"▶️ Воспроизведение: {os.path.basename(audio_file)} ({duration:.1f} сек)")
+
             # 2. Создаем временный видеофайл с тем же фоном и аудио
             temp_video = self._create_video_with_audio(audio_file)
 
             if not temp_video:
+                logger.error("❌ Не удалось создать видео с аудио")
                 return False
-
-            logger.info(f"▶️ Воспроизведение: {os.path.basename(audio_file)} ({duration:.1f} сек)")
 
             # 3. Отправляем временный видео+аудио файл
             cmd = [
@@ -758,38 +856,130 @@ class FFmpegStreamManager:
             logger.info(f"📤 Отправка аудио+видео в стрим")
 
             # Останавливаем текущий процесс
-            if self.stream_process:
-                self.stream_process.terminate()
-                time.sleep(0.5)
+            if self.stream_process and self.is_streaming:
+                try:
+                    self.stream_process.terminate()
+                    time.sleep(0.5)
 
-            # Запускаем новый процесс
+                    # Ждем завершения
+                    for _ in range(10):
+                        if self.stream_process.poll() is not None:
+                            break
+                        time.sleep(0.1)
+
+                    if self.stream_process.poll() is None:
+                        self.stream_process.kill()
+                        self.stream_process.wait()
+                except Exception as e:
+                    logger.error(f"Ошибка остановки основного потока: {e}")
+
+            # Запускаем новый процесс с аудио
             self.current_audio_process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE
+                stderr=subprocess.PIPE,
+                bufsize=1,
+                universal_newlines=False
             )
 
-            # Ждем завершения аудио
-            time.sleep(duration + 1)
+            audio_pid = self.current_audio_process.pid
+            logger.info(f"🎵 Аудио процесс запущен (PID: {audio_pid})")
+
+            # Ждем завершения аудио (длительность + 1 секунда)
+            wait_time = duration + 1
+            logger.info(f"⏱️  Ожидание завершения аудио: {wait_time:.1f} сек")
+
+            for _ in range(int(wait_time * 10)):
+                if self.current_audio_process.poll() is not None:
+                    break
+                time.sleep(0.1)
 
             # Останавливаем аудио процесс
-            if self.current_audio_process:
-                self.current_audio_process.terminate()
+            if self.current_audio_process and self.current_audio_process.poll() is None:
+                try:
+                    self.current_audio_process.terminate()
+                    time.sleep(0.5)
+                    if self.current_audio_process.poll() is None:
+                        self.current_audio_process.kill()
+                except Exception as e:
+                    logger.error(f"Ошибка остановки аудио процесса: {e}")
 
             # Восстанавливаем основной поток
+            logger.info("🔄 Восстановление основного потока...")
             self.start_stream()
 
             # Удаляем временный файл
             try:
-                os.remove(temp_video)
-            except:
-                pass
+                if os.path.exists(temp_video):
+                    os.remove(temp_video)
+                    logger.debug(f"🗑️ Временный файл удален: {temp_video}")
+            except Exception as e:
+                logger.warning(f"Не удалось удалить временный файл: {e}")
 
-            logger.info(f"✅ Аудио воспроизведено")
+            logger.info(f"✅ Аудио воспроизведено и основной поток восстановлен")
             return True
 
         except Exception as e:
             logger.error(f"❌ Ошибка воспроизведения аудио: {e}", exc_info=True)
+
+            # Пытаемся восстановить основной поток
+            try:
+                if not self.is_streaming:
+                    self.start_stream()
+            except:
+                pass
+
+            return False
+
+    def play_audio_file_simple(self, audio_file: str) -> bool:
+        """Упрощенный метод воспроизведения аудио (без остановки основного потока)"""
+        if not os.path.exists(audio_file):
+            logger.error(f"❌ Аудио файл не найден: {audio_file}")
+            return False
+
+        if not self.rtmp_url:
+            logger.error("❌ RTMP URL не установлен")
+            return False
+
+        try:
+            duration = self._get_audio_duration(audio_file)
+            logger.info(f"🎵 Простое воспроизведение: {os.path.basename(audio_file)} ({duration:.1f} сек)")
+
+            # Просто отправляем аудио отдельным потоком
+            # YouTube может смешать его с основным видео
+            cmd = [
+                'ffmpeg',
+                '-re',
+                '-i', audio_file,
+                '-c:a', 'aac',
+                '-b:a', '128k',
+                '-ar', '44100',
+                '-ac', '2',
+                '-f', 'flv',
+                self.rtmp_url
+            ]
+
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+
+            # Ждем завершения в отдельном потоке
+            def wait_and_log():
+                process.wait()
+                if process.returncode == 0:
+                    logger.info(f"✅ Аудио отправлено (PID: {process.pid})")
+                else:
+                    logger.warning(f"⚠️ Аудио процесс завершился с кодом {process.returncode}")
+
+            threading.Thread(target=wait_and_log, daemon=True).start()
+
+            # Возвращаем успех сразу, не ждем завершения
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка простого воспроизведения аудио: {e}")
             return False
 
     def _get_audio_duration(self, audio_file: str) -> float:
@@ -801,11 +991,24 @@ class FFmpegStreamManager:
                 '-show_entries', 'format=duration',
                 '-of', 'default=noprint_wrappers=1:nokey=1',
                 audio_file
-            ], capture_output=True, text=True)
+            ], capture_output=True, text=True, timeout=5)
 
-            return float(result.stdout.strip())
-        except:
-            return 5.0  # По умолчанию 5 секунд
+            duration_str = result.stdout.strip()
+            if duration_str:
+                return float(duration_str)
+            else:
+                return 5.0
+        except subprocess.TimeoutExpired:
+            logger.warning(f"Таймаут получения длительности аудио")
+            return 5.0
+        except Exception as e:
+            logger.warning(f"Не удалось получить длительность аудио: {e}")
+            # Оценка по размеру файла: примерно 10 КБ в секунду для MP3
+            try:
+                file_size = os.path.getsize(audio_file)
+                return max(3.0, min(file_size / 10000, 30.0))
+            except:
+                return 5.0
 
     def _create_video_with_audio(self, audio_file: str) -> Optional[str]:
         """Создание временного видео файла с аудио"""
@@ -820,56 +1023,150 @@ class FFmpegStreamManager:
 
             # Получаем текст из имени файла
             filename = os.path.basename(audio_file)
-            agent_name = filename.split('_')[0] if '_' in filename else "AI Agent"
+            if '_' in filename:
+                agent_name = filename.split('_')[0]
+            else:
+                agent_name = "AI Agent"
+
+            # Упрощаем текст, убираем пробелы
+            safe_agent_name = agent_name.replace(' ', '_')
 
             # Команда для создания видео с текстом и аудио
+            # Используем одинарные кавычки для текста
             cmd = [
                 'ffmpeg',
                 '-f', 'lavfi',
                 '-i',
-                f'color=c=black:s=1920x1080:r=30,drawtext=text={agent_name}\\ говорит:fontcolor=white:fontsize=60:x=(w-text_w)/2:y=(h-text_h)/2',
+                f"color=c=black:s=1920x1080:r=30,drawtext=text='{safe_agent_name}':fontcolor=white:fontsize=60:x=(w-text_w)/2:y=(h-text_h)/2",
                 '-i', audio_file,
                 '-c:v', 'libx264',
                 '-preset', 'veryfast',
                 '-tune', 'zerolatency',
                 '-pix_fmt', 'yuv420p',
                 '-c:a', 'aac',
-                '-shortest',
+                '-shortest',  # Остановиться когда аудио закончится
                 '-y',  # Перезаписать без подтверждения
                 temp_video
+            ]
+
+            logger.debug(f"Создание видео командой: {' '.join(cmd[:8])}...")
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30  # Таймаут 30 секунд
+            )
+
+            if result.returncode == 0 and os.path.exists(temp_video):
+                file_size = os.path.getsize(temp_video)
+                logger.debug(f"✅ Видео создано: {temp_video} ({file_size} байт)")
+                return temp_video
+            else:
+                error_msg = result.stderr[:200] if result.stderr else "Нет вывода"
+                logger.error(f"❌ Ошибка создания видео: {error_msg}")
+                return None
+
+        except subprocess.TimeoutExpired:
+            logger.error("❌ Таймаут при создании видео")
+            return None
+        except Exception as e:
+            logger.error(f"❌ Исключение при создании видео: {e}")
+            return None
+
+    def stop_stream(self):
+        """Остановка стрима"""
+        try:
+            if self.current_audio_process:
+                logger.info("🛑 Остановка аудио процесса...")
+                try:
+                    self.current_audio_process.terminate()
+                    time.sleep(0.5)
+                    if self.current_audio_process.poll() is None:
+                        self.current_audio_process.kill()
+                        self.current_audio_process.wait()
+                except Exception as e:
+                    logger.error(f"Ошибка остановки аудио процесса: {e}")
+
+            if self.stream_process:
+                logger.info("🛑 Остановка FFmpeg стрима...")
+                self.is_streaming = False
+
+                try:
+                    self.stream_process.terminate()
+
+                    # Ждем завершения
+                    for _ in range(20):
+                        if self.stream_process.poll() is not None:
+                            break
+                        time.sleep(0.5)
+
+                    # Если все еще жив - SIGKILL
+                    if self.stream_process.poll() is None:
+                        self.stream_process.kill()
+                        self.stream_process.wait()
+
+                    logger.info("✅ FFmpeg стрим остановлен")
+                except Exception as e:
+                    logger.error(f"❌ Ошибка остановки FFmpeg: {e}")
+                    return False
+
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Общая ошибка остановки стрима: {e}")
+            return False
+
+    def get_status(self):
+        """Получение статуса"""
+        return {
+            'is_streaming': self.is_streaming,
+            'stream_key': self.stream_key[:10] + '...' if self.stream_key else None,
+            'rtmp_url': self.rtmp_url,
+            'pid': self.ffmpeg_pid,
+            'video_source': self.video_source,
+            'last_error': self.last_error,
+            'uptime': time.time() - self.stream_start_time if self.stream_start_time else 0
+        }
+
+    def check_stream_connection(self):
+        """Проверка подключения к YouTube"""
+        if not self.rtmp_url:
+            return {'connected': False, 'error': 'No RTMP URL'}
+
+        try:
+            # Команда для проверки подключения
+            cmd = [
+                'ffprobe',
+                '-v', 'error',
+                '-rw_timeout', '5000000',
+                '-timeout', '5000000',
+                '-show_entries', 'stream=codec_name',
+                self.rtmp_url
             ]
 
             result = subprocess.run(
                 cmd,
                 capture_output=True,
-                text=True
+                text=True,
+                timeout=10
             )
 
-            if result.returncode == 0 and os.path.exists(temp_video):
-                return temp_video
+            # Проверяем наличие ошибок в stderr
+            if "Connection refused" in result.stderr or "Cannot open" in result.stderr:
+                return {'connected': False, 'error': result.stderr[:200]}
 
-            return None
+            # Если нет критических ошибок, считаем подключение возможным
+            return {
+                'connected': True if result.returncode == 0 else 'maybe',
+                'output': result.stderr[:500]
+            }
 
+        except subprocess.TimeoutExpired:
+            return {'connected': False, 'error': 'Connection timeout'}
         except Exception as e:
-            logger.error(f"❌ Ошибка создания видео: {e}")
-            return None
-
-    def stop_stream(self):
-        """Остановка стрима"""
-        if self.stream_process:
-            logger.info("🛑 Остановка FFmpeg стрима...")
-
-            if self.current_audio_process:
-                self.current_audio_process.terminate()
-
-            self.stream_process.terminate()
-            self.stream_process.wait()
-            self.is_streaming = False
-
-            logger.info("✅ FFmpeg стрим остановлен")
-            return True
-
-        return True
+            logger.error(f"Ошибка проверки подключения: {e}")
+            return {'connected': False, 'error': str(e)}
 
 # ========== EDGE TTS MANAGER ==========
 class AudioVideoMixer:

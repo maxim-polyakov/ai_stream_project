@@ -57,7 +57,7 @@ try:
     # Проверяем наличие файла client_secrets.json
     if os.path.exists('client_secrets.json'):
         try:
-            youtube_api_manager = YouTubeDirectStream()
+            youtube_api_manager = YouTubeDirectStream(api_key=os.environ.get('YOUTUBE_API_KEY'))
             YOUTUBE_API_AVAILABLE = True
             print("✅ YouTube API доступен (client_secrets.json найден)")
         except Exception as e:

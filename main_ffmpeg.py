@@ -121,7 +121,7 @@ class YouTubeOAuthStream:
 
         # OAuth настройки
         self.CLIENT_SECRETS_FILE = 'client_secrets.json'
-        self.REDIRECT_URI = 'http://localhost:5000/oauth2callback'
+        self.REDIRECT_URI = 'http://localhost:5500/oauth2callback'
 
         # Статистика
         self.metrics = {
@@ -1548,7 +1548,7 @@ if __name__ == '__main__':
         else:
             youtube_status_msg = "⚠️ Требуется авторизация"
             print(f"   YouTube OAuth: {youtube_status_msg}")
-            print(f"   🔗 Авторизация: http://localhost:5000/oauth")
+            print(f"   🔗 Авторизация: http://localhost:5500/oauth")
     else:
         print(f"   YouTube OAuth: {youtube_status_msg}")
         print(f"   Используйте ручной Stream Key или настройте OAuth")
@@ -1558,7 +1558,6 @@ if __name__ == '__main__':
     if not os.path.exists(ui_dir):
         os.makedirs(ui_dir, exist_ok=True)
 
-    # ... (остальная часть запуска без изменений)
 
     try:
         socketio.run(app,

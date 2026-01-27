@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 🤖 AI Stream с FFmpeg стримингом на YouTube
 Версия с OAuth 2.0 для YouTube API
@@ -23,8 +24,6 @@ import shutil
 from urllib.parse import urlencode
 import queue
 import tempfile
-import select
-import fcntl
 
 # Проверяем импорты
 try:
@@ -682,11 +681,10 @@ class FFmpegPipeStreamManager:
                 'ffmpeg',
                 '-re',  # Реальное время
                 '-f', 'lavfi',
-                '-i',
-                "color=c=black:s=1920x1080:r=30,drawtext=text='AI Live Stream':fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2:box=1:boxcolor=black@0.5",
+                '-i', "color=c=black:s=1920x1080:r=30,drawtext=text='AI Live Stream':fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2:box=1:boxcolor=black@0.5",
                 '-f', 's16le',  # Формат сырого аудио
                 '-ar', '44100',  # Частота дискретизации
-                '-ac', '2',  # Стерео
+                '-ac', '2',      # Стерео
                 '-i', audio_pipe_path,  # Аудио из пайпа
                 '-c:v', 'libx264',
                 '-preset', 'veryfast',
@@ -742,7 +740,6 @@ class FFmpegPipeStreamManager:
 
     def _start_audio_handler(self):
         """Запуск обработчика аудио очереди"""
-
         def audio_handler():
             logger.info("🎵 Запуск обработчика аудио")
 
@@ -830,7 +827,6 @@ class FFmpegPipeStreamManager:
 
     def _start_monitor_thread(self):
         """Мониторинг процесса FFmpeg"""
-
         def monitor():
             logger.info(f"👀 Начало мониторинга FFmpeg процесса (PID: {self.ffmpeg_pid})")
 
@@ -969,8 +965,7 @@ class EdgeTTSManager:
 
         logger.info("Edge TTS Manager инициализирован")
 
-    async def text_to_speech_and_stream(self, text: str, voice_id: str = 'male_ru', agent_name: str = "") -> Optional[
-        str]:
+    async def text_to_speech_and_stream(self, text: str, voice_id: str = 'male_ru', agent_name: str = "") -> Optional[str]:
         """Генерация аудио и отправка в стрим"""
         try:
             if voice_id not in self.voice_map:
@@ -1350,7 +1345,6 @@ if YOUTUBE_OAUTH_AVAILABLE:
     except Exception as e:
         print(f"❌ Ошибка инициализации YouTube OAuth: {e}")
         import traceback
-
         traceback.print_exc()
         youtube_oauth = None
 else:
@@ -1717,28 +1711,31 @@ if __name__ == '__main__':
     except:
         print("❌ Не удалось запустить FFmpeg")
 
-    # Проверяем Edge TTS
+    # Проверяем Edge TTS (исправлено - без await в этом контексте)
     try:
         import edge_tts
-
-        voices = edge_tts.list_voices()
-        ru_voices = [v for v in voices if 'ru-RU' in v['ShortName']]
-        if ru_voices:
-            print(f"✅ Edge TTS установлен (доступно {len(ru_voices)} русских голосов)")
-        else:
-            print("⚠️ Edge TTS установлен, но русские голоса не найдены")
+        print("✅ Edge TTS установлен")
+        print("   Доступные голоса (с русским):")
+        print("   • ru-RU-DmitryNeural - мужской голос")
+        print("   • ru-RU-SvetlanaNeural - женский голос")
+        print("   • ru-RU-DariyaNeural - женский мягкий")
     except ImportError:
         print("❌ Edge TTS не установлен: pip install edge-tts")
 
     # Проверяем Pygame
     try:
         import pygame
-
         pygame.mixer.init()
         pygame.mixer.quit()
         print("✅ Pygame установлен")
     except:
         print("⚠️ Pygame не установлен, локальное воспроизведение недоступно")
+
+    # Проверяем OpenAI
+    if Config.OPENAI_API_KEY:
+        print("✅ OpenAI API ключ настроен")
+    else:
+        print("⚠️ OpenAI API ключ не найден, будет использоваться демо-режим")
 
     # Запускаем цикл дискуссии в отдельном потоке
     print("\n🔄 Запуск цикла дискуссии AI агентов...")

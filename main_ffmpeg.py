@@ -1379,26 +1379,57 @@ class AIStreamManager:
 ffmpeg_manager = FFmpegStreamManager()
 stream_manager = AIStreamManager(ffmpeg_manager)
 
-# Инициализация YouTube Service Account
-if YOUTUBE_SERVICE_ACCOUNT_AVAILABLE:
+# Инициализация YouTube Service Account - ИСПРАВЛЕННАЯ ВЕРСИЯ
+youtube_service_account = None
+
+if YOUTUBE_SERVICE_ACCOUNT_AVAILABLE and SERVICE_ACCOUNT_FILE:
     try:
-        SERVICE_ACCOUNT_FILE = os.environ.get('GOOGLE_SERVICE_ACCOUNT_FILE', 'service-account.json')
-        YOUTUBE_CHANNEL_ID = os.environ.get('YOUTUBE_CHANNEL_ID')
+        print(f"\n🔧 Инициализация YouTube Service Account...")
+        print(f"📄 Файл: {SERVICE_ACCOUNT_FILE}")
+        print(f"📁 Абсолютный путь: {os.path.abspath(SERVICE_ACCOUNT_FILE)}")
 
-        youtube_service_account = YouTubeServiceAccountStream(
-            service_account_file=SERVICE_ACCOUNT_FILE,
-            channel_id=YOUTUBE_CHANNEL_ID
-        )
+        # Проверяем существование файла
+        if not os.path.exists(SERVICE_ACCOUNT_FILE):
+            print(f"❌ Файл не найден по указанному пути!")
+            # Пробуем найти в текущей директории
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            alt_path = os.path.join(current_dir, 'service-account.json')
+            if os.path.exists(alt_path):
+                SERVICE_ACCOUNT_FILE = alt_path
+                print(f"✅ Файл найден по альтернативному пути: {SERVICE_ACCOUNT_FILE}")
 
-        # Пробуем аутентифицироваться
-        if not youtube_service_account.authenticate():
-            logger.warning("❌ Не удалось аутентифицироваться через сервисный аккаунт")
-            youtube_service_account = None
+        if os.path.exists(SERVICE_ACCOUNT_FILE):
+            # Читаем содержимое файла для отладки
+            try:
+                with open(SERVICE_ACCOUNT_FILE, 'r') as f:
+                    content = json.load(f)
+                    print(f"✅ Файл валиден, email: {content.get('client_email', 'не указан')}")
+            except Exception as e:
+                print(f"⚠️ Ошибка чтения файла: {e}")
+
+            # Создаем экземпляр YouTubeServiceAccountStream
+            youtube_service_account = YouTubeServiceAccountStream(
+                service_account_file=SERVICE_ACCOUNT_FILE,
+                channel_id=None  # Можно оставить None
+            )
+
+            # Пробуем аутентифицироваться
+            if youtube_service_account.authenticate():
+                print("✅ YouTube Service Account успешно инициализирован!")
+            else:
+                print("❌ Не удалось аутентифицироваться через сервисный аккаунт")
+                youtube_service_account = None
+        else:
+            print(f"❌ Файл сервисного аккаунта не найден: {SERVICE_ACCOUNT_FILE}")
+
     except Exception as e:
-        logger.error(f"❌ Ошибка инициализации YouTube Service Account: {e}")
+        print(f"❌ Ошибка инициализации YouTube Service Account: {e}")
+        import traceback
+
+        traceback.print_exc()
         youtube_service_account = None
 else:
-    youtube_service_account = None
+    print("ℹ️ YouTube Service Account не будет использоваться")
 
 
 # ========== АСИНХРОННЫЙ ЦИКЛ ==========

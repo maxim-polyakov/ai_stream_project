@@ -25,6 +25,9 @@ from urllib.parse import urlencode
 import queue
 import tempfile
 
+discussion_loop_event_loop = None  # <-- Добавить эту строку
+discussion_thread = None
+discussion_loop_task = None
 # Проверяем импорты
 try:
     import openai
@@ -1526,7 +1529,7 @@ else:
 # ========== АСИНХРОННЫЙ ЦИКЛ ==========
 
 async def discussion_loop():
-    """Основной цикл дискуссии"""
+    """Основной цикл дискуссии с активным ожиданием"""
     await asyncio.sleep(2)  # Даем время на запуск сервера
     logger.info("🔄 Запуск цикла дискуссии AI агентов")
 
@@ -1537,18 +1540,23 @@ async def discussion_loop():
     print(f"📝 Начальная тема: {stream_manager.current_topic}")
     print("🤖 Агенты готовы к дискуссии")
 
+    # Флаг для ручного запуска
+    manual_trigger = asyncio.Event()
+
     while True:
         try:
-            # Проверяем, активна ли дискуссия
-            if not stream_manager.is_discussion_active:
-                # Ждем команду или продолжаем автоматически
-                await asyncio.sleep(5)
+            # Активно ждем флаг запуска дискуссии
+            while not stream_manager.is_discussion_active:
+                # Проверяем каждую секунду
+                await asyncio.sleep(1)
                 continue
 
-            # Запускаем раунд дискуссии
+            # Когда флаг установлен, запускаем дискуссию
+            print(f"🚀 Запуск дискуссии (раунд #{stream_manager.discussion_round + 1})")
             await stream_manager.run_discussion_round()
 
-            # Короткая пауза между раундами
+            # После завершения раунда - пауза
+            logger.info(f"⏸️  Пауза между раундами: {Config.DISCUSSION_INTERVAL} сек")
             await asyncio.sleep(Config.DISCUSSION_INTERVAL)
 
         except asyncio.CancelledError:
@@ -1556,14 +1564,29 @@ async def discussion_loop():
             break
         except Exception as e:
             logger.error(f"❌ Ошибка в цикле дискуссии: {e}", exc_info=True)
-            await asyncio.sleep(10)
+            await asyncio.sleep(5)
 
 
 def start_discussion_loop():
     """Запуск цикла в отдельном потоке"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(discussion_loop())
+    global discussion_loop_event_loop, discussion_loop_task
+
+    try:
+        # Создаем новый event loop для этого потока
+        discussion_loop_event_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(discussion_loop_event_loop)
+
+        print("🔄 Event loop дискуссии создан")
+
+        # Запускаем основной цикл
+        discussion_loop_event_loop.run_until_complete(discussion_loop())
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка в цикле дискуссии: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        print("🔚 Цикл дискуссии завершен")
 
 
 # ========== FLASK РОУТЫ ==========
@@ -1802,19 +1825,49 @@ def get_stats():
 
 @app.route('/api/start_discussion', methods=['POST'])
 def api_start_discussion():
-    """Ручной запуск дискуссии"""
-    if not stream_manager.is_discussion_active:
-        stream_manager.is_discussion_active = True
-        topic = stream_manager.select_topic()
-        return jsonify({'success': True, 'topic': topic, 'message': 'Дискуссия начата'})
-    else:
-        return jsonify({'success': False, 'message': 'Дискуссия уже активна'})
+    """Ручной запуск дискуссии с триггером в event loop"""
+    try:
+        if not stream_manager.is_discussion_active:
+            stream_manager.is_discussion_active = True
+
+            # Если есть event loop, можно триггернуть
+            if discussion_loop_event_loop and discussion_loop_event_loop.is_running():
+                # Триггерим запуск в event loop дискуссии
+                def trigger_discussion():
+                    if discussion_loop_event_loop.is_running():
+                        # Запланировать задачу в event loop
+                        asyncio.run_coroutine_threadsafe(
+                            stream_manager.run_discussion_round(),
+                            discussion_loop_event_loop
+                        )
+
+                # Запускаем в отдельном потоке для безопасности
+                threading.Thread(target=trigger_discussion, daemon=True).start()
+
+            topic = stream_manager.select_topic()
+
+            return jsonify({
+                'success': True,
+                'topic': topic,
+                'message': 'Дискуссия начата'
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'message': 'Дискуссия уже активна'
+            })
+
+    except Exception as e:
+        logger.error(f"Ошибка запуска дискуссии: {e}")
+        return jsonify({'success': False, 'error': str(e)})
 
 
 @app.route('/api/stop_discussion', methods=['POST'])
 def api_stop_discussion():
     """Остановка дискуссии"""
     stream_manager.is_discussion_active = False
+    stream_manager.active_agent = None
+    logger.info("⏸️  Дискуссия остановлена вручную")
     return jsonify({'success': True, 'message': 'Дискуссия остановлена'})
 
 
@@ -1913,6 +1966,7 @@ if __name__ == '__main__':
     print("\n🔄 Запуск цикла дискуссии AI агентов...")
     discussion_thread = threading.Thread(target=start_discussion_loop, daemon=True)
     discussion_thread.start()
+    time.sleep(2)
     print("✅ Цикл дискуссии запущен")
 
     # Статистика агентов

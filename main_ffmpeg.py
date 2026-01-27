@@ -635,18 +635,12 @@ class FFmpegPipeStreamManager:
         self.stream_key = None
         self.rtmp_url = None
         self.ffmpeg_pid = None
-        self.audio_pipe = None
-        self.audio_queue = queue.Queue()
-        self.audio_thread = None
-        self.video_thread = None
-        self.current_agent = None
         self.last_error = None
         self.stream_start_time = None
-        self.audio_counter = 0
 
         # Создаем папки для временных файлов
-        os.makedirs('temp_audio', exist_ok=True)
-        os.makedirs('temp_video', exist_ok=True)
+        os.makedirs('temp_videos', exist_ok=True)
+        os.makedirs('audio_cache', exist_ok=True)
 
     def set_stream_key(self, stream_key: str):
         """Установка ключа стрима"""
@@ -656,7 +650,7 @@ class FFmpegPipeStreamManager:
         return True
 
     def start_stream(self) -> Dict[str, Any]:
-        """Запуск FFmpeg стрима с пайпами для аудио"""
+        """Запуск FFmpeg стрима - УПРОЩЕННАЯ РАБОЧАЯ ВЕРСИЯ"""
         if not self.stream_key:
             logger.error("❌ Stream Key не установлен!")
             return {'success': False, 'error': 'Stream Key не установлен'}
@@ -664,76 +658,34 @@ class FFmpegPipeStreamManager:
         try:
             self.stream_start_time = time.time()
 
-            # Создаем именованный пайп для аудио
-            audio_pipe_path = os.path.join(tempfile.gettempdir(), f'audio_pipe_{int(time.time())}')
-
-            # Удаляем если существует
-            if os.path.exists(audio_pipe_path):
-                os.remove(audio_pipe_path)
-
-            # Создаем пайп
-            os.mkfifo(audio_pipe_path)
-            self.audio_pipe = audio_pipe_path
-            logger.info(f"🎵 Создан аудио пайп: {audio_pipe_path}")
-
-            # РАБОЧАЯ КОМАНДА FFMPEG ДЛЯ YOUTUBE
-            # Используем фильтр lavfi для видео и amovie для чтения из пайпа
+            # УПРОЩЕННАЯ КОМАНДА FFMPEG БЕЗ ПАЙПОВ
+            # Основной поток с тишиной, аудио будет добавляться отдельными процессами
             ffmpeg_cmd = [
                 'ffmpeg',
-                '-re',  # Реальное время для видео
+                '-re',  # Реальное время
                 '-f', 'lavfi',
-                '-i', "color=c=0x2d2d2d:s=1920x1080:r=30[bg];"
-                      "[bg]drawtext=text='🤖 AI Agents Live Stream':"
-                      "fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h-200)/2:"
-                      "box=1:boxcolor=black@0.5,"
-                      "drawtext=textfile=dynamic_text.txt:"
-                      "fontcolor=0x4a69ff:fontsize=36:x=(w-text_w)/2:y=(h-text_h+100)/2:"
-                      "reload=1:box=1:boxcolor=black@0.3[v]",
-
-                # Аудио из пайпа
-                '-f', 's16le',  # Формат сырого PCM аудио
-                '-acodec', 'pcm_s16le',
-                '-ar', '44100',  # Частота дискретизации
-                '-ac', '2',  # Стерео
-                '-i', audio_pipe_path,  # Читаем из пайпа
-
-                # Кодеки и настройки
-                '-map', '0:v',  # Видео из первого источника
-                '-map', '1:a',  # Аудио из второго источника
-
-                # Видео кодирование
+                '-i',
+                "color=c=black:s=1920x1080:r=30,drawtext=text='AI Live Stream':fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2:box=1:boxcolor=black@0.5",
+                '-f', 'lavfi',
+                '-i', 'anullsrc=r=44100:cl=stereo',  # Тишина
                 '-c:v', 'libx264',
                 '-preset', 'veryfast',
                 '-tune', 'zerolatency',
                 '-pix_fmt', 'yuv420p',
-                '-g', '60',  # Ключевой кадр каждые 60 кадров (2 секунды при 30fps)
-                '-b:v', '3000k',  # Битрейт видео
+                '-g', '60',
+                '-b:v', '3000k',
                 '-maxrate', '3500k',
                 '-bufsize', '6000k',
-
-                # Аудио кодирование
                 '-c:a', 'aac',
-                '-b:a', '128k',  # Битрейт аудио
+                '-b:a', '128k',
                 '-ar', '44100',
                 '-ac', '2',
-                '-strict', 'experimental',
-
-                # Формат вывода
                 '-f', 'flv',
-                '-flvflags', 'no_duration_filesize',
-
-                # RTMP выход
                 self.rtmp_url
             ]
 
-            logger.info(f"🚀 Запуск FFmpeg с пайпом для аудио")
-
-            # Создаем файл для динамического текста
-            with open('dynamic_text.txt', 'w', encoding='utf-8') as f:
-                f.write('Загрузка...')
-
-            # Логируем команду
-            logger.debug(f"FFmpeg команда: {' '.join(ffmpeg_cmd[:10])}...")
+            logger.info(f"🚀 Запуск FFmpeg стрима")
+            logger.info(f"📍 RTMP URL: {self.rtmp_url}")
 
             # Запускаем FFmpeg
             self.stream_process = subprocess.Popen(
@@ -741,32 +693,27 @@ class FFmpegPipeStreamManager:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
-                bufsize=10 ** 6,  # Большой буфер для избежания блокировки
+                bufsize=1,
                 universal_newlines=False
             )
 
             self.is_streaming = True
             self.ffmpeg_pid = self.stream_process.pid
 
-            # Запускаем тестовое аудио для проверки
-            threading.Thread(target=self._send_test_audio, daemon=True).start()
-
-            # Запускаем потоки для обработки аудио
-            self._start_audio_handler()
+            # Запускаем мониторинг
             self._start_monitor_thread()
-            self._start_text_updater()
 
             logger.info(f"🎬 FFmpeg стрим запущен (PID: {self.ffmpeg_pid})")
 
             # Даем время на запуск
-            time.sleep(3)
+            time.sleep(2)
 
             return {
                 'success': True,
                 'pid': self.ffmpeg_pid,
                 'stream_key': self.stream_key,
                 'rtmp_url': self.rtmp_url,
-                'message': 'FFmpeg стрим запущен с пайпом для аудио. Ждите 30-60 секунд для начала трансляции на YouTube.'
+                'message': 'FFmpeg стрим запущен. Ждите 30-60 секунд для начала трансляции на YouTube.'
             }
 
         except Exception as e:
@@ -926,22 +873,30 @@ class FFmpegPipeStreamManager:
         def monitor():
             logger.info(f"👀 Начало мониторинга FFmpeg процесса (PID: {self.ffmpeg_pid})")
 
+            # Читаем stderr для диагностики
             while self.is_streaming and self.stream_process:
+                try:
+                    line_bytes = self.stream_process.stderr.readline()
+                    if line_bytes:
+                        line = line_bytes.decode('utf-8', errors='ignore').strip()
+                        if line:
+                            # Логируем важные сообщения
+                            if any(keyword in line.lower() for keyword in
+                                   ['error', 'fail', 'invalid', 'unable', 'cannot']):
+                                logger.error(f"FFmpeg ERROR: {line}")
+                                self.last_error = line
+                            elif 'rtmp://' in line and 'connected' in line.lower():
+                                logger.info(f"✅ Подключение к YouTube: {line}")
+                            elif 'frame=' in line and 'fps=' in line:
+                                # Логируем статистику каждые 30 секунд
+                                pass
+                except:
+                    pass
+
                 # Проверяем, жив ли процесс
                 if self.stream_process.poll() is not None:
                     return_code = self.stream_process.returncode
                     logger.warning(f"⚠️ FFmpeg процесс завершился с кодом: {return_code}")
-
-                    # Пытаемся получить ошибку
-                    try:
-                        error_output = self.stream_process.stderr.read()
-                        if error_output:
-                            error_str = error_output.decode('utf-8', errors='ignore')[:500]
-                            logger.error(f"FFmpeg ошибка: {error_str}")
-                            self.last_error = error_str
-                    except:
-                        pass
-
                     self.is_streaming = False
                     break
 
@@ -949,11 +904,64 @@ class FFmpegPipeStreamManager:
 
             logger.info("👀 Мониторинг FFmpeg завершен")
 
-        self.video_thread = threading.Thread(target=monitor, daemon=True)
-        self.video_thread.start()
+        self.monitor_thread = threading.Thread(target=monitor, daemon=True)
+        self.monitor_thread.start()
+
+    def _create_video_with_audio(self, audio_file: str) -> Optional[str]:
+        """Создание временного видео файла с аудио и текстом"""
+        try:
+            # Создаем временный файл
+            temp_dir = 'temp_videos'
+            os.makedirs(temp_dir, exist_ok=True)
+
+            temp_video = os.path.join(temp_dir, f'video_audio_{int(time.time())}.mp4')
+
+            # Получаем имя агента из имени файла
+            filename = os.path.basename(audio_file)
+            if '_' in filename:
+                agent_name = filename.split('_')[0]
+            else:
+                agent_name = "AI Agent"
+
+            # Команда для создания видео с текстом и аудио
+            # Используем двойные кавычки для фильтра
+            cmd = [
+                'ffmpeg',
+                '-f', 'lavfi',
+                '-i',
+                f"color=c=black:s=1920x1080:r=30,drawtext=text='{agent_name} Speaking':fontcolor=white:fontsize=60:x=(w-text_w)/2:y=(h-text_h)/2",
+                '-i', audio_file,
+                '-c:v', 'libx264',
+                '-preset', 'veryfast',
+                '-tune', 'zerolatency',
+                '-pix_fmt', 'yuv420p',
+                '-c:a', 'aac',
+                '-b:a', '128k',
+                '-shortest',
+                '-y',  # Перезаписать без подтверждения
+                temp_video
+            ]
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+
+            if result.returncode == 0 and os.path.exists(temp_video):
+                logger.debug(f"✅ Видео создано: {temp_video}")
+                return temp_video
+            else:
+                logger.error(f"❌ Ошибка создания видео: {result.stderr[:200]}")
+                return None
+
+        except Exception as e:
+            logger.error(f"❌ Исключение при создании видео: {e}")
+            return None
 
     def play_audio(self, audio_file: str) -> bool:
-        """Добавление аудио файла в очередь для воспроизведения"""
+        """Воспроизведение аудио файла в стриме - ПРОСТОЙ РАБОЧИЙ МЕТОД"""
         if not os.path.exists(audio_file):
             logger.error(f"❌ Аудио файл не найден: {audio_file}")
             return False
@@ -962,19 +970,73 @@ class FFmpegPipeStreamManager:
             logger.error("❌ Стрим не запущен")
             return False
 
-        # Добавляем в очередь
-        self.audio_queue.put(audio_file)
-        logger.info(f"➕ Аудио добавлено в очередь: {os.path.basename(audio_file)}")
-
-        # Обновляем текст на видео
         try:
-            agent_name = os.path.basename(audio_file).split('_')[0]
-            with open('dynamic_text.txt', 'w', encoding='utf-8') as f:
-                f.write(f"Говорит: {agent_name}")
-        except:
-            pass
+            # Получаем длительность аудио
+            duration = self._get_audio_duration(audio_file)
+            logger.info(f"🎵 Воспроизведение аудио: {os.path.basename(audio_file)} ({duration:.1f} сек)")
 
-        return True
+            # Создаем видео с текстом агента и аудио
+            temp_video = self._create_video_with_audio(audio_file)
+            if not temp_video:
+                logger.error("❌ Не удалось создать видео с аудио")
+                return False
+
+            # Команда для отправки видео+аудио в стрим
+            cmd = [
+                'ffmpeg',
+                '-re',
+                '-i', temp_video,
+                '-c:v', 'libx264',
+                '-preset', 'veryfast',
+                '-tune', 'zerolatency',
+                '-pix_fmt', 'yuv420p',
+                '-c:a', 'aac',
+                '-b:a', '128k',
+                '-f', 'flv',
+                self.rtmp_url
+            ]
+
+            logger.info(f"📤 Отправка аудио+видео в стрим")
+
+            # Запускаем процесс в отдельном потоке
+            def send_audio():
+                try:
+                    process = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL
+                    )
+
+                    # Ждем завершения (длительность + 2 секунды)
+                    time.sleep(duration + 2)
+
+                    # Останавливаем процесс
+                    if process.poll() is None:
+                        process.terminate()
+                        time.sleep(0.5)
+                        if process.poll() is None:
+                            process.kill()
+
+                    # Удаляем временный файл
+                    try:
+                        os.remove(temp_video)
+                    except:
+                        pass
+
+                    logger.info(f"✅ Аудио отправлено в стрим")
+
+                except Exception as e:
+                    logger.error(f"❌ Ошибка отправки аудио: {e}")
+
+            # Запускаем в отдельном потоке
+            audio_thread = threading.Thread(target=send_audio, daemon=True)
+            audio_thread.start()
+
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка воспроизведения аудио: {e}", exc_info=True)
+            return False
 
     def _get_audio_duration(self, audio_file: str) -> float:
         """Получение длительности аудио"""

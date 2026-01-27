@@ -668,14 +668,47 @@ def health():
 
 
 @app.route('/api/start_stream', methods=['POST'])
+@app.route('/api/start_stream', methods=['POST'])
 def start_stream():
-    """Запуск FFmpeg стрима"""
+    """Запуск FFmpeg стрима (принимает разные форматы)"""
     try:
-        data = request.get_json()
-        stream_key = data.get('stream_key', '')
+        # Принимаем JSON разными способами
+        if request.is_json:
+            data = request.get_json()
+        elif request.content_type == 'application/x-www-form-urlencoded':
+            # Для form-data
+            data = {
+                'stream_key': request.form.get('stream_key'),
+                'video_source': request.form.get('video_source', 'black'),
+                'use_audio': request.form.get('use_audio', 'true').lower() == 'true'
+            }
+        elif request.content_type.startswith('multipart/form-data'):
+            # Для multipart
+            data = {
+                'stream_key': request.form.get('stream_key'),
+                'video_source': request.form.get('video_source', 'black'),
+                'use_audio': request.form.get('use_audio', 'true').lower() == 'true'
+            }
+        else:
+            # Пытаемся парсить raw данные
+            try:
+                data = json.loads(request.data.decode('utf-8'))
+            except:
+                return jsonify({
+                    'status': 'error',
+                    'message': 'Content-Type должен быть application/json или передайте JSON в теле запроса'
+                }), 415
 
+        # Проверяем обязательные поля
+        stream_key = data.get('stream_key', '')
         if not stream_key:
-            return jsonify({'status': 'error', 'message': 'Stream Key не указан'})
+            return jsonify({
+                'status': 'error',
+                'message': 'Stream Key обязателен'
+            }), 400
+
+        # Логируем полученные данные
+        logger.info(f"📨 Получен запрос на запуск стрима: {data}")
 
         # Устанавливаем ключ
         ffmpeg_manager.set_stream_key(stream_key)
@@ -691,14 +724,21 @@ def start_stream():
                 'status': 'started',
                 'rtmp_url': ffmpeg_manager.rtmp_url,
                 'pid': ffmpeg_manager.ffmpeg_pid,
-                'video_source': ffmpeg_manager.video_source
+                'video_source': ffmpeg_manager.video_source,
+                'message': 'YouTube стрим успешно запущен'
             })
         else:
-            return jsonify({'status': 'error', 'message': 'Не удалось запустить FFmpeg'})
+            return jsonify({
+                'status': 'error',
+                'message': 'Не удалось запустить FFmpeg процесс'
+            }), 500
 
     except Exception as e:
-        logger.error(f"Ошибка запуска стрима: {e}")
-        return jsonify({'status': 'error', 'message': str(e)})
+        logger.error(f"Ошибка запуска стрима: {e}", exc_info=True)
+        return jsonify({
+            'status': 'error',
+            'message': f'Внутренняя ошибка сервера: {str(e)}'
+        }), 500
 
 
 @app.route('/api/stop_stream', methods=['POST'])

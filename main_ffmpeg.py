@@ -48,13 +48,35 @@ except ImportError as e:
     sys.exit(1)
 
 # Попробуем импортировать YouTube API
+YOUTUBE_API_AVAILABLE = False
+youtube_api_manager = None
+
 try:
     from youtube_direct_api import YouTubeDirectStream
 
-    YOUTUBE_API_AVAILABLE = True
+    # Проверяем наличие файла client_secrets.json
+    if os.path.exists('client_secrets.json'):
+        try:
+            youtube_api_manager = YouTubeDirectStream()
+            YOUTUBE_API_AVAILABLE = True
+            print("✅ YouTube API доступен (client_secrets.json найден)")
+        except Exception as e:
+            print(f"⚠️ Ошибка инициализации YouTube API: {e}")
+            print("Используйте ручной ввод Stream Key")
+    else:
+        print("⚠️ Файл client_secrets.json не найден.")
+        print("Для автоматического создания трансляций через YouTube API:")
+        print("1. Создайте проект в Google Cloud Console")
+        print("2. Включите YouTube Data API v3")
+        print("3. Создайте OAuth 2.0 Client ID")
+        print("4. Сохраните как client_secrets.json в корне проекта")
+
 except ImportError:
-    YOUTUBE_API_AVAILABLE = False
-    print("⚠️ YouTube API недоступен. Используйте ручной ввод Stream Key")
+    print("⚠️ YouTube API модуль не найден.")
+    print("Для автоматических трансляций установите:")
+    print("pip install google-api-python-client google-auth-oauthlib google-auth-httplib2")
+except Exception as e:
+    print(f"⚠️ Неожиданная ошибка при импорте YouTube API: {e}")
 
 # Настройка логирования
 logging.basicConfig(
@@ -88,17 +110,6 @@ else:
     logger.warning("⚠️ OpenAI API ключ не найден. Будут использоваться демо-сообщения.")
     openai_client = None
 
-# Инициализация YouTube API
-youtube_api_manager = None
-if YOUTUBE_API_AVAILABLE:
-    try:
-        youtube_api_manager = YouTubeDirectStream()
-        logger.info("✅ YouTube API Manager инициализирован")
-    except Exception as e:
-        logger.error(f"❌ Ошибка инициализации YouTube API: {e}")
-        youtube_api_manager = None
-
-
 # ========== FFMPEG STREAM MANAGER ==========
 
 class FFmpegStreamManager:
@@ -113,14 +124,10 @@ class FFmpegStreamManager:
         self.video_source = "black"
         self.ffmpeg_stdin = None
         self.start_time = None
-        self.audio_queue = []  # Очередь аудио файлов для воспроизведения
+        self.audio_queue = []
         self.is_playing_audio = False
-
-        # Настройки аудио
         self.audio_sample_rate = 44100
         self.audio_channels = 2
-
-        # Флаг для определения, используем ли мы PyAudio
         self.use_pyaudio = PYTHON_AUDIO_AVAILABLE
 
     def set_stream_key(self, stream_key: str):
@@ -185,27 +192,37 @@ class FFmpegStreamManager:
             # Команда FFmpeg
             ffmpeg_cmd = [
                 'ffmpeg',
-                '-re',  # Реальное время для видео
-                *video_input,
-                *audio_input,
 
-                # Кодек видео
+                # Видео источник (реальное время)
+                '-re',
+                '-f', 'lavfi',
+                '-i', f'color=...:r=30',
+
+                # Аудио источник (реальное время + синхронизация)
+                '-re',
+                '-f', 's16le',
+                '-ar', '44100',
+                '-ac', '2',
+                '-i', 'pipe:0',
+
+                # Кодеки
                 '-c:v', 'libx264',
                 '-preset', 'veryfast',
                 '-tune', 'zerolatency',
                 '-pix_fmt', 'yuv420p',
                 '-g', '60',
                 '-b:v', '4500k',
-                '-maxrate', '4500k',
-                '-bufsize', '9000k',
 
-                # Кодек аудио
                 '-c:a', 'aac',
                 '-b:a', '128k',
                 '-ar', '44100',
                 '-ac', '2',
 
-                # Формат вывода
+                # Важно: синхронизация аудио как главного потока
+                '-async', '1',
+                '-vsync', '1',
+                '-flush_packets', '1',
+
                 '-f', 'flv',
                 self.rtmp_url
             ]
@@ -706,7 +723,6 @@ class EdgeTTSManager:
         self.cache_dir = 'audio_cache'
         os.makedirs(self.cache_dir, exist_ok=True)
         self.ffmpeg_manager = ffmpeg_manager
-
         self.voice_map = {
             'male_ru': 'ru-RU-DmitryNeural',
             'male_ru_deep': 'ru-RU-DmitryNeural',
@@ -714,7 +730,6 @@ class EdgeTTSManager:
             'female_ru_soft': 'ru-RU-DariyaNeural'
         }
 
-        # Инициализация pygame для локального воспроизведения
         try:
             pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=2048)
             self.pygame_available = True
@@ -1135,8 +1150,6 @@ async def discussion_loop():
     """Основной цикл дискуссии"""
     await asyncio.sleep(2)
     logger.info("🔄 Запуск цикла дискуссии")
-
-    # Выбираем первую тему
     stream_manager.select_topic()
 
     while True:
@@ -1166,7 +1179,8 @@ def index():
     return render_template('index.html',
                            agents=stream_manager.get_agents_state(),
                            topic=stream_manager.current_topic or "Загрузка темы...",
-                           stats=stream_manager.get_stats())
+                           stats=stream_manager.get_stats(),
+                           youtube_api_available=YOUTUBE_API_AVAILABLE)
 
 
 @app.route('/health')
@@ -1177,7 +1191,8 @@ def health():
         'time': datetime.now().isoformat(),
         'agents': len(stream_manager.agents),
         'streaming': ffmpeg_manager.is_streaming,
-        'discussion_active': stream_manager.is_discussion_active
+        'discussion_active': stream_manager.is_discussion_active,
+        'youtube_api_available': YOUTUBE_API_AVAILABLE
     })
 
 
@@ -1185,21 +1200,9 @@ def health():
 def start_stream():
     """Запуск FFmpeg стрима (принимает разные форматы)"""
     try:
-        # Принимаем JSON разными способами
+        # Принимаем данные
         if request.is_json:
             data = request.get_json()
-        elif request.content_type == 'application/x-www-form-urlencoded':
-            data = {
-                'stream_key': request.form.get('stream_key'),
-                'video_source': request.form.get('video_source', 'black'),
-                'use_audio': request.form.get('use_audio', 'true').lower() == 'true'
-            }
-        elif request.content_type.startswith('multipart/form-data'):
-            data = {
-                'stream_key': request.form.get('stream_key'),
-                'video_source': request.form.get('video_source', 'black'),
-                'use_audio': request.form.get('use_audio', 'true').lower() == 'true'
-            }
         else:
             try:
                 data = json.loads(request.data.decode('utf-8'))
@@ -1209,7 +1212,6 @@ def start_stream():
                     'message': 'Content-Type должен быть application/json'
                 }), 415
 
-        # Проверяем обязательные поля
         stream_key = data.get('stream_key', '')
         if not stream_key:
             return jsonify({
@@ -1217,8 +1219,7 @@ def start_stream():
                 'message': 'Stream Key обязателен'
             }), 400
 
-        # Логируем полученные данные
-        logger.info(f"📨 Получен запрос на запуск стрима")
+        logger.info(f"📨 Ручной запуск стрима")
 
         # Устанавливаем ключ
         ffmpeg_manager.set_stream_key(stream_key)
@@ -1261,30 +1262,26 @@ def start_youtube_stream():
                 'message': 'YouTube API не доступен. Установите зависимости и client_secrets.json'
             }), 501
 
-        # Получаем параметры из запроса
+        # Получаем параметры
         if request.is_json:
             data = request.get_json()
         else:
             data = request.form
 
         title = data.get('title', "🤖 AI Agents Live: Научные дебаты ИИ")
-        description = data.get('description',
-                               """Автономные ИИ-агенты обсуждают науку в реальном времени.
-                   
-                   Участники:
-                   • Доктор Алексей Волков - Квантовая физика
-                   • Профессор Мария Соколова - Нейробиология
-                   • Доктор Иван Петров - Климатология
-                   • Исследователь София Ковалева - ИИ и робототехника
-                   
-                   Темы: Искусственный интеллект, квантовые вычисления, изменение климата, нейроинтерфейсы.
-                   
-                   Стрим создан автоматически с помощью Python и OpenAI GPT-4.""")
+        description = data.get('description', Config.STREAM_DESCRIPTION)
 
         logger.info(f"🎬 Запуск YouTube стрима через API: {title}")
 
         # Запускаем стрим через YouTube API
-        success = youtube_api_manager.start_stream(title, description)
+        try:
+            success = youtube_api_manager.start_stream(title, description)
+        except Exception as e:
+            logger.error(f"Ошибка YouTube API: {e}")
+            return jsonify({
+                'status': 'error',
+                'message': f'Ошибка YouTube API: {str(e)}'
+            }), 500
 
         if not success:
             return jsonify({
@@ -1293,7 +1290,14 @@ def start_youtube_stream():
             }), 500
 
         # Получаем информацию о стриме
-        stream_info = youtube_api_manager.get_stream_info()
+        try:
+            stream_info = youtube_api_manager.get_stream_info()
+        except Exception as e:
+            logger.error(f"Ошибка получения stream_info: {e}")
+            return jsonify({
+                'status': 'error',
+                'message': 'Не удалось получить информацию о стриме'
+            }), 500
 
         if not stream_info or 'stream_key' not in stream_info:
             return jsonify({
@@ -1318,7 +1322,10 @@ def start_youtube_stream():
             })
         else:
             # Если FFmpeg не запустился, останавливаем YouTube трансляцию
-            youtube_api_manager.end_stream()
+            try:
+                youtube_api_manager.end_stream()
+            except:
+                pass
             return jsonify({
                 'status': 'error',
                 'message': 'Не удалось запустить FFmpeg стрим'
@@ -1337,58 +1344,137 @@ def youtube_control():
     """Управление YouTube трансляцией"""
     try:
         if not YOUTUBE_API_AVAILABLE or not youtube_api_manager:
-            return jsonify({'status': 'error', 'message': 'YouTube API не доступен'}), 501
+            return jsonify({
+                'status': 'error',
+                'message': 'YouTube API не доступен'
+            }), 501
 
-        data = request.get_json()
+        if request.is_json:
+            data = request.get_json()
+        else:
+            data = request.form
+
         action = data.get('action', '')
 
         if action == 'get_info':
-            info = youtube_api_manager.get_stream_info()
-            return jsonify({
-                'status': 'success',
-                'broadcast_id': youtube_api_manager.broadcast_id,
-                'stream_id': youtube_api_manager.stream_id,
-                'is_live': youtube_api_manager.is_live,
-                'stream_info': info
-            })
+            try:
+                info = youtube_api_manager.get_stream_info()
+                return jsonify({
+                    'status': 'success',
+                    'broadcast_id': youtube_api_manager.broadcast_id,
+                    'stream_id': youtube_api_manager.stream_id,
+                    'is_live': youtube_api_manager.is_live,
+                    'stream_info': info
+                })
+            except Exception as e:
+                return jsonify({
+                    'status': 'error',
+                    'message': f'Ошибка получения информации: {str(e)}'
+                })
 
         elif action == 'update_info':
-            title = data.get('title')
-            description = data.get('description')
-            result = youtube_api_manager.update_broadcast_info(title, description)
-            if result:
-                return jsonify({'status': 'updated'})
-            return jsonify({'status': 'error'})
+            try:
+                title = data.get('title')
+                description = data.get('description')
+                result = youtube_api_manager.update_broadcast_info(title, description)
+                if result:
+                    return jsonify({'status': 'updated'})
+                return jsonify({'status': 'error', 'message': 'Не удалось обновить'})
+            except Exception as e:
+                return jsonify({'status': 'error', 'message': str(e)})
 
         elif action == 'end_stream':
-            # Останавливаем FFmpeg
-            ffmpeg_manager.stop_stream()
-            # Завершаем YouTube трансляцию
-            result = youtube_api_manager.end_stream()
-            if result:
-                return jsonify({'status': 'ended'})
-            return jsonify({'status': 'error'})
+            try:
+                # Останавливаем FFmpeg
+                ffmpeg_manager.stop_stream()
+                # Завершаем YouTube трансляцию
+                result = youtube_api_manager.end_stream()
+                if result:
+                    return jsonify({'status': 'ended'})
+                return jsonify({'status': 'error', 'message': 'Не удалось завершить'})
+            except Exception as e:
+                return jsonify({'status': 'error', 'message': str(e)})
 
         elif action == 'get_chat_id':
-            chat_id = youtube_api_manager.get_chat_id()
-            if chat_id:
-                return jsonify({'status': 'success', 'chat_id': chat_id})
-            return jsonify({'status': 'error', 'message': 'Чат не найден'})
+            try:
+                chat_id = youtube_api_manager.get_chat_id()
+                if chat_id:
+                    return jsonify({'status': 'success', 'chat_id': chat_id})
+                return jsonify({'status': 'error', 'message': 'Чат не найден'})
+            except Exception as e:
+                return jsonify({'status': 'error', 'message': str(e)})
+
+        elif action == 'create_test_stream':
+            try:
+                title = data.get('title', 'Тестовая трансляция')
+                description = data.get('description', 'Тестовая трансляция создана через API')
+
+                # Создаем тестовую трансляцию
+                broadcast = youtube_api_manager.create_live_broadcast(title, description)
+                stream = youtube_api_manager.create_stream()
+
+                if broadcast and stream:
+                    youtube_api_manager.bind_broadcast_to_stream()
+                    return jsonify({
+                        'status': 'created',
+                        'broadcast_id': youtube_api_manager.broadcast_id,
+                        'stream_id': youtube_api_manager.stream_id
+                    })
+                return jsonify({'status': 'error', 'message': 'Не удалось создать'})
+            except Exception as e:
+                return jsonify({'status': 'error', 'message': str(e)})
 
         else:
-            return jsonify({'status': 'error', 'message': 'Неизвестное действие'})
+            return jsonify({
+                'status': 'error',
+                'message': 'Неизвестное действие',
+                'available_actions': ['get_info', 'update_info', 'end_stream', 'get_chat_id', 'create_test_stream']
+            })
 
     except Exception as e:
         logger.error(f"Ошибка управления YouTube: {e}")
         return jsonify({'status': 'error', 'message': str(e)})
 
 
+@app.route('/api/youtube_status')
+def youtube_status():
+    """Статус YouTube трансляции"""
+    try:
+        if not YOUTUBE_API_AVAILABLE or not youtube_api_manager:
+            return jsonify({
+                'available': False,
+                'message': 'YouTube API не доступен'
+            })
+
+        return jsonify({
+            'available': True,
+            'has_broadcast': youtube_api_manager.broadcast_id is not None,
+            'has_stream': youtube_api_manager.stream_id is not None,
+            'is_live': youtube_api_manager.is_live,
+            'broadcast_id': youtube_api_manager.broadcast_id,
+            'stream_id': youtube_api_manager.stream_id
+        })
+    except Exception as e:
+        return jsonify({
+            'available': False,
+            'error': str(e)
+        })
+
+
 @app.route('/api/stop_stream', methods=['POST'])
 def stop_stream():
     """Остановка стрима"""
     try:
+        # Останавливаем YouTube трансляцию если активна
+        if YOUTUBE_API_AVAILABLE and youtube_api_manager and youtube_api_manager.is_live:
+            try:
+                youtube_api_manager.end_stream()
+            except Exception as e:
+                logger.warning(f"Не удалось остановить YouTube трансляцию: {e}")
+
+        # Останавливаем FFmpeg
         if ffmpeg_manager.stop_stream():
-            return jsonify({'status': 'stopped'})
+            return jsonify({'status': 'stopped', 'message': 'Стрим остановлен'})
         return jsonify({'status': 'error', 'message': 'Стрим не был запущен'})
     except Exception as e:
         logger.error(f"Ошибка остановки стрима: {e}")
@@ -1398,7 +1484,20 @@ def stop_stream():
 @app.route('/api/stream_status')
 def stream_status():
     """Статус стрима"""
-    return jsonify(ffmpeg_manager.get_status())
+    status = ffmpeg_manager.get_status()
+
+    # Добавляем информацию о YouTube API
+    if YOUTUBE_API_AVAILABLE and youtube_api_manager:
+        status['youtube'] = {
+            'available': True,
+            'has_broadcast': youtube_api_manager.broadcast_id is not None,
+            'is_live': youtube_api_manager.is_live,
+            'broadcast_id': youtube_api_manager.broadcast_id
+        }
+    else:
+        status['youtube'] = {'available': False}
+
+    return jsonify(status)
 
 
 @app.route('/api/stream_stats')
@@ -1406,6 +1505,15 @@ def stream_stats():
     """Статистика стрима"""
     stats = stream_manager.get_stats()
     stats.update(ffmpeg_manager.get_status())
+
+    # Добавляем информацию о YouTube
+    if YOUTUBE_API_AVAILABLE and youtube_api_manager:
+        stats['youtube'] = {
+            'broadcast_id': youtube_api_manager.broadcast_id,
+            'is_live': youtube_api_manager.is_live,
+            'stream_id': youtube_api_manager.stream_id
+        }
+
     return jsonify(stats)
 
 
@@ -1442,6 +1550,12 @@ def control():
 def test_audio():
     """Тестирование звука в стриме"""
     try:
+        if not ffmpeg_manager.is_streaming:
+            return jsonify({
+                'status': 'error',
+                'message': 'Стрим не запущен. Запустите стрим сначала.'
+            }), 400
+
         data = request.get_json()
         text = data.get('text', 'Тестовое сообщение для проверки звука на стриме.')
         voice = data.get('voice', 'male_ru')
@@ -1458,7 +1572,7 @@ def test_audio():
 
         return jsonify({
             'status': 'success',
-            'message': f'Тестовое аудио запущено: "{text}"',
+            'message': f'Тестовое аудио запущено: "{text[:50]}..."',
             'voice': voice
         })
 
@@ -1467,10 +1581,27 @@ def test_audio():
         return jsonify({'status': 'error', 'message': str(e)})
 
 
+@app.route('/api/test_youtube_connection')
+def test_youtube_connection():
+    """Тест подключения к YouTube"""
+    try:
+        if not ffmpeg_manager.stream_key:
+            return jsonify({
+                'status': 'error',
+                'message': 'Stream Key не установлен'
+            })
+
+        result = ffmpeg_manager.check_stream_connection()
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)})
+
+
 @app.route('/youtube-control')
 def youtube_control_page():
     """Страница управления YouTube API"""
-    return render_template('youtube_control.html')
+    return render_template('youtube_control.html',
+                           youtube_api_available=YOUTUBE_API_AVAILABLE)
 
 
 # ========== WEBSOCKET HANDLERS ==========
@@ -1490,7 +1621,9 @@ def handle_connect():
         'stats': stream_manager.get_stats(),
         'stream_status': ffmpeg_manager.get_status(),
         'server_time': datetime.now().isoformat(),
-        'youtube_api_available': YOUTUBE_API_AVAILABLE
+        'youtube_api_available': YOUTUBE_API_AVAILABLE,
+        'youtube_broadcast_id': youtube_api_manager.broadcast_id if youtube_api_manager else None,
+        'youtube_is_live': youtube_api_manager.is_live if youtube_api_manager else False
     })
 
 
@@ -1507,7 +1640,9 @@ def handle_update_request():
         'agents': stream_manager.get_agents_state(),
         'topic': stream_manager.current_topic,
         'stats': stream_manager.get_stats(),
-        'stream_status': ffmpeg_manager.get_status()
+        'stream_status': ffmpeg_manager.get_status(),
+        'youtube_broadcast_id': youtube_api_manager.broadcast_id if youtube_api_manager else None,
+        'youtube_is_live': youtube_api_manager.is_live if youtube_api_manager else False
     })
 
 
@@ -1522,7 +1657,7 @@ def signal_handler(signum, frame):
         ffmpeg_manager.stop_stream()
 
     # Останавливаем YouTube трансляцию если активна
-    if youtube_api_manager and youtube_api_manager.is_live:
+    if YOUTUBE_API_AVAILABLE and youtube_api_manager and youtube_api_manager.is_live:
         try:
             youtube_api_manager.end_stream()
         except:

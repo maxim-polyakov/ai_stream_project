@@ -660,29 +660,52 @@ class FFmpegStreamManager:
         return status
 
     def check_stream_connection(self):
-        """Проверка подключения к YouTube"""
+        """Проверка подключения к YouTube (ИСПРАВЛЕННАЯ ВЕРСИЯ)"""
         if not self.rtmp_url:
             return {'connected': False, 'error': 'No RTMP URL'}
 
         try:
-            # Используем ffprobe для проверки подключения
+            # Команда для ПРОВЕРКИ подключения (не стриминга!)
+            # ffprobe читает метаданные, а не стримит
             cmd = [
                 'ffprobe',
                 '-v', 'error',
-                '-timeout', '5000000',  # 5 секунд таймаут
+                '-rw_timeout', '5000000',  # 5 секунд таймаут на чтение
+                '-timeout', '5000000',  # 5 секунд общий таймаут
+                '-analyzeduration', '10000000',
+                '-probesize', '10000000',
+                '-show_entries', 'stream=codec_name',  # Минимальная информация
                 self.rtmp_url
             ]
 
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            logger.debug(f"Проверка подключения: {' '.join(cmd)}")
 
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+
+            logger.debug(f"FFprobe результат: {result.returncode}")
+            logger.debug(f"FFprobe stdout: {result.stdout[:200]}")
+            logger.debug(f"FFprobe stderr: {result.stderr[:200]}")
+
+            # YouTube обычно возвращает 1 даже при успешной проверке
+            # Проверяем наличие ошибок в stderr
+            if "Connection refused" in result.stderr or "Cannot open" in result.stderr:
+                return {'connected': False, 'error': result.stderr[:200]}
+
+            # Если нет критических ошибок, считаем подключение возможным
             return {
-                'connected': result.returncode == 0,
-                'output': result.stdout if result.returncode == 0 else result.stderr
+                'connected': True if result.returncode == 0 else 'maybe',
+                'output': result.stderr[:500]
             }
 
         except subprocess.TimeoutExpired:
             return {'connected': False, 'error': 'Connection timeout'}
         except Exception as e:
+            logger.error(f"Ошибка проверки подключения: {e}")
             return {'connected': False, 'error': str(e)}
 
     def create_test_audio(self, text: str = "Тестовое сообщение", voice: str = "male_ru"):

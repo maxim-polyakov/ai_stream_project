@@ -672,13 +672,19 @@ class FFmpegStreamManager:
         try:
             self.start_time = time.time()
 
-            # Базовая команда FFmpeg для YouTube с тестовой картинкой
+            # ВАЖНО: Упрощаем фильтр, убираем сложное экранирование
+            # Используем более простой текст без кавычек внутри
+            drawtext_filter = 'color=c=black:s=1920x1080:r=30,drawtext=text=AI\ Stream:fontcolor=white:fontsize=72:x=(w-text_w)/2:y=(h-text_h)/2'
+
+            # Или еще проще вариант - без времени
+            # drawtext_filter = 'color=c=black:s=1920x1080:r=30,drawtext=text=AI_Live_Stream:fontcolor=white:fontsize=72:x=(w-text_w)/2:y=(h-text_h)/2'
+
+            # Базовая команда FFmpeg для YouTube
             ffmpeg_cmd = [
                 'ffmpeg',
                 '-re',  # Реальное время
                 '-f', 'lavfi',
-                '-i',
-                f'color=c=black:s=1920x1080:r=30:drawtext=text="AI\\\\ Stream\\\\ {datetime.now().strftime("%H:%M:%S")}":fontcolor=white:fontsize=72:x=(w-text_w)/2:y=(h-text_h)/2',
+                '-i', drawtext_filter,
                 '-f', 'lavfi',
                 '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
                 '-c:v', 'libx264',
@@ -697,7 +703,11 @@ class FFmpegStreamManager:
                 self.rtmp_url
             ]
 
-            logger.info(f"🚀 Запуск FFmpeg: {' '.join(ffmpeg_cmd[:10])}...")
+            logger.info(f"🚀 Запуск FFmpeg: {' '.join(ffmpeg_cmd)}")
+
+            # Для отладки выведем команду
+            print("🔧 Команда FFmpeg:")
+            print(" ".join(ffmpeg_cmd))
 
             # Запускаем FFmpeg
             self.stream_process = subprocess.Popen(

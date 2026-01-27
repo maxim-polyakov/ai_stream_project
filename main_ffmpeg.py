@@ -193,27 +193,50 @@ class YouTubeServiceAccountStream:
         try:
             if not os.path.exists(self.service_account_file):
                 logger.error(f"❌ Файл сервисного аккаунта не найден: {self.service_account_file}")
+                print(f"❌ Файл сервисного аккаунта не найден: {self.service_account_file}")
                 return False
 
-            # Загружаем сервисный аккаунт
+            # Детальная отладка
+            print(f"📄 Проверяю файл: {os.path.abspath(self.service_account_file)}")
+            print(f"📊 Размер файла: {os.path.getsize(self.service_account_file)} байт")
+
+            # Проверяем содержимое файла
+            with open(self.service_account_file, 'r') as f:
+                content = f.read()
+                if 'BEGIN PRIVATE KEY' not in content:
+                    print("❌ Не найден приватный ключ в файле!")
+                    return False
+                if '"type": "service_account"' not in content:
+                    print("❌ Файл не является сервисным аккаунтом!")
+                    return False
+
+            print("✅ Файл сервисного аккаунта проверен")
+
+            # Загружаем сервисный аккаунт с дополнительными параметрами
             self.credentials = service_account.Credentials.from_service_account_file(
                 self.service_account_file,
                 scopes=self.SCOPES
             )
 
-            # Создаем YouTube API клиент
+            # Создаем YouTube API клиент с timeout
             self.youtube = build(
                 'youtube',
                 'v3',
-                credentials=self.credentials
+                credentials=self.credentials,
+                cache_discovery=False,  # Ускоряет подключение
+                num_retries=3  # Повторные попытки
             )
 
-            logger.info("✅ Аутентификация через сервисный аккаунт успешна")
+            print("✅ Аутентификация через сервисный аккаунт успешна")
+            print(f"🔑 Client Email: {self.credentials.service_account_email}")
 
-            # Проверяем доступ к API
-            return self.test_api_access()
+            # Упрощенная проверка доступа к API
+            return self.test_api_access_simple()
 
         except Exception as e:
+            import traceback
+            print(f"❌ Ошибка аутентификации: {e}")
+            traceback.print_exc()
             logger.error(f"❌ Ошибка аутентификации: {e}")
             self.metrics['errors'].append(str(e))
             return False

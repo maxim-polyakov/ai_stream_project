@@ -106,6 +106,62 @@ class YouTubeDirectStream:
             logger.error(f"❌ Ошибка создания трансляции: {e}")
             return None
 
+    def start_stream_with_ffmpeg(self, title: str = None, description: str = None,
+                                 ffmpeg_manager=None):
+        """Запуск стрима с автоматическим запуском FFmpeg"""
+        # 1. Создаем YouTube трансляцию
+        if not self.start_stream(title, description):
+            logger.error("❌ Не удалось создать YouTube трансляцию")
+            return False
+
+        # 2. Получаем stream key
+        stream_info = self.get_stream_info()
+        if not stream_info or 'stream_key' not in stream_info:
+            logger.error("❌ Не удалось получить stream key")
+            return False
+
+        stream_key = stream_info['stream_key']
+        rtmp_url = stream_info['rtmp_url']
+
+        print(f"\n🔑 Получен Stream Key: {stream_key}")
+        print(f"📍 RTMP URL: {rtmp_url}")
+
+        # 3. Запускаем FFmpeg (если передан менеджер)
+        if ffmpeg_manager:
+            try:
+                # Устанавливаем stream key
+                ffmpeg_manager.set_stream_key(stream_key)
+
+                # Запускаем стрим
+                if ffmpeg_manager.start_stream():
+                    print("✅ FFmpeg стрим запущен!")
+                    return True
+                else:
+                    print("❌ Не удалось запустить FFmpeg")
+                    # Отменяем YouTube трансляцию
+                    self.end_stream()
+                    return False
+
+            except Exception as e:
+                logger.error(f"❌ Ошибка запуска FFmpeg: {e}")
+                self.end_stream()
+                return False
+
+        # 4. Если менеджер не передан, возвращаем данные для ручного запуска
+        else:
+            print("\n⚠️  FFmpeg не запущен автоматически")
+            print("Запустите FFmpeg вручную:")
+            print(
+                f"ffmpeg -f lavfi -i color=c=black:s=1920x1080:r=30 -f lavfi -i anullsrc -c:v libx264 -c:a aac -f flv {rtmp_url}")
+
+            return {
+                'broadcast_id': self.broadcast_id,
+                'stream_id': self.stream_id,
+                'stream_key': stream_key,
+                'rtmp_url': rtmp_url,
+                'watch_url': f"https://youtube.com/watch?v={self.broadcast_id}"
+            }
+
     def create_stream(self):
         """Создание потока"""
         try:

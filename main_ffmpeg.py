@@ -44,6 +44,15 @@ except ImportError as e:
     print("pip install edge-tts>=6.1.9 pygame>=2.5.0 python-dotenv>=1.0.0")
     sys.exit(1)
 
+PYTHON_AUDIO_AVAILABLE = False
+try:
+    import pyaudio
+    PYTHON_AUDIO_AVAILABLE = True
+    print("✅ PyAudio доступен для аудио захвата")
+except ImportError:
+    print("⚠️ PyAudio не установлен. Аудио захват будет ограничен.")
+    print("📦 Для захвата аудио установите: pip install pyaudio")
+
 # Импорты для YouTube OAuth
 YOUTUBE_OAUTH_AVAILABLE = False
 try:

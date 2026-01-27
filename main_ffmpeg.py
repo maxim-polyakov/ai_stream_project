@@ -2038,7 +2038,7 @@ if __name__ == '__main__':
     print(f"   Edge TTS: >=6.1.9")
     print(f"   FFmpeg: системный")
 
-    if YOUTUBE_API_AVAILABLE:
+    if YOUTUBE_OAUTH_AVAILABLE:
         print(f"   YouTube API: Доступен ✅")
     else:
         print(f"   YouTube API: Не доступен (используйте ручной Stream Key)")

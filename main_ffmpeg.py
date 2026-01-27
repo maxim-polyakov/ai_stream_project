@@ -1566,15 +1566,10 @@ if __name__ == '__main__':
 
     # Статистика агентов
     print(f"👥 Загружено {len(stream_manager.agents)} AI агентов:")
-    for agent in stream_manager.agents:
-        print(f"   • {agent.name} - {agent.expertise} ({agent.voice})")
 
     print("\n" + "=" * 70)
     print("🌐 Веб-интерфейс доступен по адресу: http://localhost:5000")
     print("🔗 Тестирование аудио агентов:")
-    for agent in stream_manager.agents:
-        print(f"   • {agent.name}: http://localhost:5000/api/test_audio/{agent.id}")
-    print("=" * 70)
 
     # Создаем UI если его нет
     ui_dir = "stream_ui"

@@ -642,6 +642,7 @@ class FFmpegPipeStreamManager:
         self.current_agent = None
         self.last_error = None
         self.stream_start_time = None
+        self.audio_counter = 0
 
         # Создаем папки для временных файлов
         os.makedirs('temp_audio', exist_ok=True)
@@ -675,34 +676,64 @@ class FFmpegPipeStreamManager:
             self.audio_pipe = audio_pipe_path
             logger.info(f"🎵 Создан аудио пайп: {audio_pipe_path}")
 
-            # КОМАНДА FFMPEG С ПАЙПАМИ - РАБОЧАЯ ВЕРСИЯ
-            # Используем amovie для загрузки аудио из пайпа
+            # РАБОЧАЯ КОМАНДА FFMPEG ДЛЯ YOUTUBE
+            # Используем фильтр lavfi для видео и amovie для чтения из пайпа
             ffmpeg_cmd = [
                 'ffmpeg',
-                '-re',  # Реальное время
+                '-re',  # Реальное время для видео
                 '-f', 'lavfi',
-                '-i', "color=c=black:s=1920x1080:r=30,drawtext=text='AI Live Stream':fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2:box=1:boxcolor=black@0.5",
-                '-f', 's16le',  # Формат сырого аудио
+                '-i', "color=c=0x2d2d2d:s=1920x1080:r=30[bg];"
+                      "[bg]drawtext=text='🤖 AI Agents Live Stream':"
+                      "fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h-200)/2:"
+                      "box=1:boxcolor=black@0.5,"
+                      "drawtext=textfile=dynamic_text.txt:"
+                      "fontcolor=0x4a69ff:fontsize=36:x=(w-text_w)/2:y=(h-text_h+100)/2:"
+                      "reload=1:box=1:boxcolor=black@0.3[v]",
+
+                # Аудио из пайпа
+                '-f', 's16le',  # Формат сырого PCM аудио
+                '-acodec', 'pcm_s16le',
                 '-ar', '44100',  # Частота дискретизации
-                '-ac', '2',      # Стерео
-                '-i', audio_pipe_path,  # Аудио из пайпа
+                '-ac', '2',  # Стерео
+                '-i', audio_pipe_path,  # Читаем из пайпа
+
+                # Кодеки и настройки
+                '-map', '0:v',  # Видео из первого источника
+                '-map', '1:a',  # Аудио из второго источника
+
+                # Видео кодирование
                 '-c:v', 'libx264',
                 '-preset', 'veryfast',
                 '-tune', 'zerolatency',
                 '-pix_fmt', 'yuv420p',
-                '-g', '60',
-                '-b:v', '3000k',
+                '-g', '60',  # Ключевой кадр каждые 60 кадров (2 секунды при 30fps)
+                '-b:v', '3000k',  # Битрейт видео
                 '-maxrate', '3500k',
                 '-bufsize', '6000k',
+
+                # Аудио кодирование
                 '-c:a', 'aac',
-                '-b:a', '128k',
+                '-b:a', '128k',  # Битрейт аудио
                 '-ar', '44100',
                 '-ac', '2',
+                '-strict', 'experimental',
+
+                # Формат вывода
                 '-f', 'flv',
+                '-flvflags', 'no_duration_filesize',
+
+                # RTMP выход
                 self.rtmp_url
             ]
 
             logger.info(f"🚀 Запуск FFmpeg с пайпом для аудио")
+
+            # Создаем файл для динамического текста
+            with open('dynamic_text.txt', 'w', encoding='utf-8') as f:
+                f.write('Загрузка...')
+
+            # Логируем команду
+            logger.debug(f"FFmpeg команда: {' '.join(ffmpeg_cmd[:10])}...")
 
             # Запускаем FFmpeg
             self.stream_process = subprocess.Popen(
@@ -710,21 +741,25 @@ class FFmpegPipeStreamManager:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
-                bufsize=1,
+                bufsize=10 ** 6,  # Большой буфер для избежания блокировки
                 universal_newlines=False
             )
 
             self.is_streaming = True
             self.ffmpeg_pid = self.stream_process.pid
 
+            # Запускаем тестовое аудио для проверки
+            threading.Thread(target=self._send_test_audio, daemon=True).start()
+
             # Запускаем потоки для обработки аудио
             self._start_audio_handler()
             self._start_monitor_thread()
+            self._start_text_updater()
 
             logger.info(f"🎬 FFmpeg стрим запущен (PID: {self.ffmpeg_pid})")
 
             # Даем время на запуск
-            time.sleep(2)
+            time.sleep(3)
 
             return {
                 'success': True,
@@ -738,31 +773,97 @@ class FFmpegPipeStreamManager:
             logger.error(f"❌ Ошибка запуска FFmpeg: {e}", exc_info=True)
             return {'success': False, 'error': str(e)}
 
+    def _send_test_audio(self):
+        """Отправка тестового аудио для проверки"""
+        try:
+            # Ждем запуска FFmpeg
+            time.sleep(5)
+
+            # Генерируем простое тестовое аудио
+            test_text = "Тестовое аудио для проверки стрима. Звук должен быть слышен на трансляции."
+
+            # Создаем временный файл с тестовым аудио
+            temp_audio = os.path.join('temp_audio', f'test_{int(time.time())}.mp3')
+
+            # Создаем тестовое аудио с помощью edge-tts
+            import edge_tts
+            communicate = edge_tts.Communicate(
+                text=test_text,
+                voice='ru-RU-DmitryNeural'
+            )
+
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(communicate.save(temp_audio))
+
+            # Отправляем в очередь
+            if os.path.exists(temp_audio):
+                self.play_audio(temp_audio)
+                logger.info("🔊 Тестовое аудио отправлено")
+
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось отправить тестовое аудио: {e}")
+
+    def _start_text_updater(self):
+        """Обновление текста на видео"""
+
+        def updater():
+            while self.is_streaming:
+                try:
+                    current_time = datetime.now().strftime("%H:%M:%S")
+                    status = "Трансляция активна" if self.is_streaming else "Пауза"
+
+                    # Обновляем файл с текстом
+                    with open('dynamic_text.txt', 'w', encoding='utf-8') as f:
+                        f.write(f"Время: {current_time} | {status}")
+
+                    time.sleep(1)
+                except:
+                    time.sleep(5)
+
+        thread = threading.Thread(target=updater, daemon=True)
+        thread.start()
+
     def _start_audio_handler(self):
         """Запуск обработчика аудио очереди"""
+
         def audio_handler():
             logger.info("🎵 Запуск обработчика аудио")
 
             # Открываем пайп для записи
             try:
-                while self.is_streaming:
-                    try:
-                        # Ждем аудио файл в очереди
-                        audio_file = self.audio_queue.get(timeout=1)
-                        if audio_file:
-                            logger.info(f"🎵 Отправка аудио в пайп: {os.path.basename(audio_file)}")
-                            self._send_audio_to_pipe(audio_file)
-                    except queue.Empty:
-                        continue
-                    except Exception as e:
-                        logger.error(f"❌ Ошибка обработки аудио: {e}")
+                with open(self.audio_pipe, 'wb') as pipe_fd:
+                    logger.info("✅ Аудио пайп открыт для записи")
+
+                    # Сначала отправляем тишину для инициализации
+                    silence_samples = int(44100 * 1.0 * 2 * 2)  # 1 сек тишины
+                    silence_data = bytes(silence_samples)
+                    pipe_fd.write(silence_data)
+                    pipe_fd.flush()
+
+                    while self.is_streaming:
+                        try:
+                            # Ждем аудио файл в очереди
+                            audio_file = self.audio_queue.get(timeout=1)
+                            if audio_file and os.path.exists(audio_file):
+                                logger.info(f"🎵 Отправка аудио в пайп: {os.path.basename(audio_file)}")
+                                self._send_audio_to_pipe(pipe_fd, audio_file)
+                        except queue.Empty:
+                            # Если очередь пуста, отправляем тишину
+                            silence_samples = int(44100 * 0.1 * 2 * 2)  # 100 мс тишины
+                            silence_data = bytes(silence_samples)
+                            pipe_fd.write(silence_data)
+                            pipe_fd.flush()
+                            continue
+                        except Exception as e:
+                            logger.error(f"❌ Ошибка обработки аудио: {e}")
             except Exception as e:
                 logger.error(f"❌ Ошибка в обработчике аудио: {e}")
 
         self.audio_thread = threading.Thread(target=audio_handler, daemon=True)
         self.audio_thread.start()
 
-    def _send_audio_to_pipe(self, audio_file: str):
+    def _send_audio_to_pipe(self, pipe_fd, audio_file: str):
         """Отправка аудио файла в пайп FFmpeg"""
         try:
             if not os.path.exists(audio_file):
@@ -779,9 +880,10 @@ class FFmpegPipeStreamManager:
             cmd = [
                 'ffmpeg',
                 '-i', audio_file,
-                '-f', 's16le',  # Сырой PCM
+                '-f', 's16le',
                 '-ar', '44100',
                 '-ac', '2',
+                '-acodec', 'pcm_s16le',
                 raw_audio_file
             ]
 
@@ -792,25 +894,19 @@ class FFmpegPipeStreamManager:
                 return False
 
             # Отправляем сырое аудио в пайп
-            with open(self.audio_pipe, 'wb') as pipe_fd:
-                with open(raw_audio_file, 'rb') as audio_fd:
-                    # Читаем и отправляем данные
-                    chunk_size = 4096
-                    while True:
-                        chunk = audio_fd.read(chunk_size)
-                        if not chunk:
-                            break
-                        pipe_fd.write(chunk)
-                        pipe_fd.flush()
+            with open(raw_audio_file, 'rb') as audio_fd:
+                # Читаем и отправляем данные
+                chunk_size = 4096
+                bytes_sent = 0
+                while True:
+                    chunk = audio_fd.read(chunk_size)
+                    if not chunk:
+                        break
+                    pipe_fd.write(chunk)
+                    pipe_fd.flush()
+                    bytes_sent += len(chunk)
 
-            # Отправляем тишину после аудио (1 секунда)
-            silence_duration = 1.0
-            silence_samples = int(44100 * silence_duration * 2 * 2)  # 44100Hz * seconds * 2 channels * 2 bytes
-
-            with open(self.audio_pipe, 'wb') as pipe_fd:
-                silence_data = bytes(silence_samples)  # Тишина (нули)
-                pipe_fd.write(silence_data)
-                pipe_fd.flush()
+            logger.info(f"✅ Аудио отправлено в пайп ({bytes_sent} байт)")
 
             # Удаляем временный файл
             try:
@@ -818,7 +914,6 @@ class FFmpegPipeStreamManager:
             except:
                 pass
 
-            logger.info(f"✅ Аудио отправлено в пайп")
             return True
 
         except Exception as e:
@@ -827,6 +922,7 @@ class FFmpegPipeStreamManager:
 
     def _start_monitor_thread(self):
         """Мониторинг процесса FFmpeg"""
+
         def monitor():
             logger.info(f"👀 Начало мониторинга FFmpeg процесса (PID: {self.ffmpeg_pid})")
 
@@ -835,20 +931,19 @@ class FFmpegPipeStreamManager:
                 if self.stream_process.poll() is not None:
                     return_code = self.stream_process.returncode
                     logger.warning(f"⚠️ FFmpeg процесс завершился с кодом: {return_code}")
+
+                    # Пытаемся получить ошибку
+                    try:
+                        error_output = self.stream_process.stderr.read()
+                        if error_output:
+                            error_str = error_output.decode('utf-8', errors='ignore')[:500]
+                            logger.error(f"FFmpeg ошибка: {error_str}")
+                            self.last_error = error_str
+                    except:
+                        pass
+
                     self.is_streaming = False
                     break
-
-                # Читаем stderr для логов
-                try:
-                    line_bytes = self.stream_process.stderr.readline()
-                    if line_bytes:
-                        line = line_bytes.decode('utf-8', errors='ignore').strip()
-                        if line and any(keyword in line.lower() for keyword in ['error', 'fail', 'invalid']):
-                            logger.error(f"FFmpeg: {line}")
-                            self.last_error = line
-                            socketio.emit('stream_error', {'message': line})
-                except:
-                    pass
 
                 time.sleep(0.1)
 
@@ -870,6 +965,15 @@ class FFmpegPipeStreamManager:
         # Добавляем в очередь
         self.audio_queue.put(audio_file)
         logger.info(f"➕ Аудио добавлено в очередь: {os.path.basename(audio_file)}")
+
+        # Обновляем текст на видео
+        try:
+            agent_name = os.path.basename(audio_file).split('_')[0]
+            with open('dynamic_text.txt', 'w', encoding='utf-8') as f:
+                f.write(f"Говорит: {agent_name}")
+        except:
+            pass
+
         return True
 
     def _get_audio_duration(self, audio_file: str) -> float:
@@ -921,6 +1025,13 @@ class FFmpegPipeStreamManager:
                 except:
                     pass
 
+            # Удаляем текстовый файл
+            if os.path.exists('dynamic_text.txt'):
+                try:
+                    os.remove('dynamic_text.txt')
+                except:
+                    pass
+
             return True
 
         except Exception as e:
@@ -938,7 +1049,6 @@ class FFmpegPipeStreamManager:
             'last_error': self.last_error,
             'uptime': time.time() - self.stream_start_time if self.stream_start_time else 0
         }
-
 
 # ========== EDGE TTS MANAGER ==========
 

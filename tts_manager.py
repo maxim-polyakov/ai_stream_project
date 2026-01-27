@@ -1,184 +1,556 @@
 #!/usr/bin/env python3
 """
-Edge TTS Manager - РАБОЧИЕ мужские голоса Microsoft
+YouTube Live Streaming API - Сервисный аккаунт версия
+Позволяет создавать и управлять трансляциями без ручного OAuth
 """
 
 import os
-import asyncio
-import tempfile
-import hashlib
+import json
+import time
 import logging
-from typing import Optional
-import edge_tts
-import pygame
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+import google.auth.transport.requests
 
 logger = logging.getLogger(__name__)
 
 
-class EdgeTTSManager:
-    """Менеджер TTS с Edge TTS от Microsoft (есть мужские голоса!)"""
+class YouTubeServiceAccountStream:
+    """Управление YouTube трансляциями через сервисный аккаунт"""
 
-    def __init__(self):
-        # Инициализация pygame для воспроизведения
-        pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=2048)
+    # Скоупы для YouTube API
+    SCOPES = [
+        'https://www.googleapis.com/auth/youtube',
+        'https://www.googleapis.com/auth/youtube.force-ssl',
+        'https://www.googleapis.com/auth/youtube.readonly'
+    ]
 
-        # Настройки голосов Edge TTS
-        self.voices_config = {
-            # РУССКИЕ МУЖСКИЕ ГОЛОСА (работают!)
-            'male_ru': {
-                'voice': 'ru-RU-DmitryNeural',
-                'rate': '+0%',
-                'pitch': '+0Hz',
-                'volume': '+0%'
-            },
-            'male_ru_deep': {
-                'voice': 'ru-RU-DmitryNeural',
-                'rate': '-10%',
-                'pitch': '-20Hz',
-                'volume': '+0%'
-            },
-            # РУССКИЕ ЖЕНСКИЕ ГОЛОСА
-            'female_ru': {
-                'voice': 'ru-RU-SvetlanaNeural',
-                'rate': '+0%',
-                'pitch': '+0Hz',
-                'volume': '+0%'
-            },
-            'female_ru_soft': {
-                'voice': 'ru-RU-DariyaNeural',
-                'rate': '-5%',
-                'pitch': '+10Hz',
-                'volume': '-5%'
-            }
+    def __init__(self, service_account_file: str, channel_id: Optional[str] = None):
+        """
+        Инициализация с сервисным аккаунтом
+
+        Args:
+            service_account_file: Путь к JSON файлу сервисного аккаунта
+            channel_id: ID YouTube канала (необязательно)
+        """
+        self.service_account_file = service_account_file
+        self.channel_id = channel_id
+        self.youtube = None
+        self.broadcast_id = None
+        self.stream_id = None
+        self.is_live = False
+        self.credentials = None
+
+        # Статистика и метрики
+        self.metrics = {
+            'streams_created': 0,
+            'broadcasts_created': 0,
+            'errors': []
         }
 
-        # Создаем директорию для кэша
-        self.cache_dir = 'audio_cache'
-        os.makedirs(self.cache_dir, exist_ok=True)
+        logger.info(f"Инициализация YouTube API с сервисным аккаунтом: {service_account_file}")
 
-        logger.info("Edge TTS Manager инициализирован")
-        logger.info(f"Доступные голоса: {list(self.voices_config.keys())}")
-
-    def _get_cache_path(self, text: str, voice_id: str) -> str:
-        """Получение пути к кэшированному файлу"""
-        text_hash = hashlib.md5(f"{text}_{voice_id}".encode('utf-8')).hexdigest()
-        return os.path.join(self.cache_dir, f"{text_hash}.mp3")
-
-    async def text_to_speech(self, text: str, voice_id: str = 'male_ru') -> Optional[str]:
-        """
-        Преобразование текста в речь через Edge TTS
-
-        Args:
-            text: Текст для озвучки
-            voice_id: ID голоса из конфига
-
-        Returns:
-            Путь к аудио файлу
-        """
+    def authenticate(self) -> bool:
+        """Аутентификация через сервисный аккаунт"""
         try:
-            # Проверяем голос
-            if voice_id not in self.voices_config:
-                logger.warning(f"Голос {voice_id} не найден, использую male_ru")
-                voice_id = 'male_ru'
-
-            voice_config = self.voices_config[voice_id]
-
-            # Проверяем кэш
-            cache_path = self._get_cache_path(text, voice_id)
-
-            if os.path.exists(cache_path):
-                logger.debug(f"Используем кэш: {cache_path}")
-                return cache_path
-
-            # Формируем параметры для Edge TTS
-            communicate = edge_tts.Communicate(
-                text=text,
-                voice=voice_config['voice'],
-                rate=voice_config['rate'],
-                pitch=voice_config['pitch'],
-                volume=voice_config['volume']
-            )
-
-            logger.info(f"Генерируем Edge TTS: голос={voice_config['voice']}")
-
-            # Сохраняем аудио во временный файл
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as tmp_file:
-                temp_path = tmp_file.name
-
-            # Сохраняем аудио
-            await communicate.save(temp_path)
-
-            # Переносим в кэш
-            import shutil
-            shutil.move(temp_path, cache_path)
-
-            logger.info(f"Аудио сохранено: {cache_path} ({os.path.getsize(cache_path)} bytes)")
-            return cache_path
-
-        except Exception as e:
-            logger.error(f"Ошибка Edge TTS: {e}")
-            return None
-
-    async def speak(self, text: str, voice_id: str = 'male_ru') -> bool:
-        """
-        Озвучивание текста
-
-        Args:
-            text: Текст для озвучки
-            voice_id: ID голоса
-
-        Returns:
-            True если успешно
-        """
-        try:
-            logger.info(f"Озвучиваем: {text[:50]}... голос={voice_id}")
-
-            audio_file = await self.text_to_speech(text, voice_id)
-
-            if not audio_file:
-                logger.error("Не удалось получить аудио файл")
+            if not os.path.exists(self.service_account_file):
+                logger.error(f"❌ Файл сервисного аккаунта не найден: {self.service_account_file}")
                 return False
 
-            # Загружаем и воспроизводим
-            pygame.mixer.music.load(audio_file)
-            pygame.mixer.music.play()
+            # Загружаем сервисный аккаунт
+            self.credentials = service_account.Credentials.from_service_account_file(
+                self.service_account_file,
+                scopes=self.SCOPES
+            )
 
-            # Ждем окончания воспроизведения
-            while pygame.mixer.music.get_busy():
-                await asyncio.sleep(0.1)
+            # Создаем делегированные права (если нужно)
+            # Для работы с YouTube API сервисному аккаунту нужен доступ к каналу
+            if self.channel_id:
+                from google.auth import impersonated_credentials
+                # Здесь нужно настроить делегирование прав
+                pass
+
+            # Создаем YouTube API клиент
+            self.youtube = build(
+                'youtube',
+                'v3',
+                credentials=self.credentials
+            )
+
+            logger.info("✅ Аутентификация через сервисный аккаунт успешна")
+
+            # Проверяем доступ к API
+            return self.test_api_access()
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка аутентификации: {e}")
+            self.metrics['errors'].append(str(e))
+            return False
+
+    def test_api_access(self) -> bool:
+        """Проверка доступа к YouTube API"""
+        try:
+            # Простой запрос для проверки доступа
+            request = self.youtube.channels().list(
+                part="snippet",
+                mine=True
+            )
+            response = request.execute()
+
+            if 'items' in response:
+                channel_info = response['items'][0]['snippet']
+                logger.info(f"📺 Канал: {channel_info['title']}")
+                logger.info(f"📝 Описание: {channel_info.get('description', 'Нет описания')[:100]}...")
+                return True
+
+            return False
+
+        except HttpError as e:
+            if e.resp.status == 403:
+                logger.error("❌ Нет доступа к YouTube API. Проверьте:")
+                logger.error("1. Активирован ли YouTube Data API v3 в Google Cloud")
+                logger.error("2. Добавлен ли сервисный аккаунт в Google Workspace")
+                logger.error("3. Есть ли у сервисного аккаунта доступ к каналу")
+            else:
+                logger.error(f"❌ Ошибка API: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"❌ Ошибка проверки доступа: {e}")
+            return False
+
+    def create_live_broadcast(
+            self,
+            title: str,
+            description: str = "",
+            privacy_status: str = "unlisted",
+            scheduled_time: Optional[datetime] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Создание трансляции
+
+        Args:
+            title: Заголовок трансляции
+            description: Описание
+            privacy_status: public/unlisted/private
+            scheduled_time: Время начала (если None - начать сейчас)
+        """
+        try:
+            if not scheduled_time:
+                scheduled_time = datetime.now() + timedelta(minutes=2)
+
+            broadcast_body = {
+                'snippet': {
+                    'title': title,
+                    'description': description,
+                    'scheduledStartTime': scheduled_time.isoformat()
+                },
+                'status': {
+                    'privacyStatus': privacy_status,
+                    'selfDeclaredMadeForKids': False
+                },
+                'contentDetails': {
+                    'enableAutoStart': True,
+                    'enableAutoStop': True,
+                    'enableEmbed': True,
+                    'recordFromStart': True,
+                    'enableDvr': True,
+                    'enableContentEncryption': False,
+                    'enableLowLatency': True,
+                    'projection': 'rectangular',
+                    'stereoLayout': 'mono'
+                }
+            }
+
+            request = self.youtube.liveBroadcasts().insert(
+                part='snippet,status,contentDetails',
+                body=broadcast_body
+            )
+
+            response = request.execute()
+            self.broadcast_id = response['id']
+
+            logger.info(f"📡 Трансляция создана: {self.broadcast_id}")
+            logger.info(f"📺 Заголовок: {title}")
+            logger.info(f"🔒 Статус: {privacy_status}")
+            logger.info(f"⏰ Время начала: {scheduled_time}")
+
+            self.metrics['broadcasts_created'] += 1
+
+            return response
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка создания трансляции: {e}")
+            self.metrics['errors'].append(str(e))
+            return None
+
+    def create_stream(
+            self,
+            title: str = "AI Live Stream",
+            resolution: str = "1080p",
+            frame_rate: str = "30fps"
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Создание потока для трансляции
+
+        Args:
+            title: Название потока
+            resolution: Разрешение (240p/360p/480p/720p/1080p)
+            frame_rate: Частота кадров
+        """
+        try:
+            stream_body = {
+                'snippet': {
+                    'title': title
+                },
+                'cdn': {
+                    'frameRate': frame_rate,
+                    'ingestionType': 'rtmp',
+                    'resolution': resolution,
+                    'format': ''
+                }
+            }
+
+            request = self.youtube.liveStreams().insert(
+                part='snippet,cdn',
+                body=stream_body
+            )
+
+            response = request.execute()
+            self.stream_id = response['id']
+
+            # Получаем данные для стрима
+            stream_key = response['cdn']['ingestionInfo']['streamName']
+            ingestion_address = response['cdn']['ingestionInfo']['ingestionAddress']
+
+            logger.info(f"🌊 Поток создан: {self.stream_id}")
+            logger.info(f"🔑 Stream Key: {stream_key}")
+            logger.info(f"📍 RTMP URL: rtmp://a.rtmp.youtube.com/live2/{stream_key}")
+
+            self.metrics['streams_created'] += 1
+
+            return {
+                'stream_id': self.stream_id,
+                'stream_key': stream_key,
+                'ingestion_address': ingestion_address,
+                'rtmp_url': f"rtmp://a.rtmp.youtube.com/live2/{stream_key}",
+                'full_response': response
+            }
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка создания потока: {e}")
+            self.metrics['errors'].append(str(e))
+            return None
+
+    def bind_broadcast_to_stream(self) -> bool:
+        """Привязка трансляции к потоку"""
+        try:
+            if not self.broadcast_id or not self.stream_id:
+                logger.error("❌ Нет broadcast_id или stream_id")
+                return False
+
+            request = self.youtube.liveBroadcasts().bind(
+                part='id,contentDetails',
+                id=self.broadcast_id,
+                streamId=self.stream_id
+            )
+
+            response = request.execute()
+            logger.info("🔗 Трансляция привязана к потоку")
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка привязки: {e}")
+            self.metrics['errors'].append(str(e))
+            return False
+
+    def start_broadcast(self) -> bool:
+        """Начало трансляции (перевод в статус 'live')"""
+        try:
+            if not self.broadcast_id:
+                logger.error("❌ Нет активной трансляции")
+                return False
+
+            request = self.youtube.liveBroadcasts().transition(
+                broadcastStatus='live',
+                id=self.broadcast_id,
+                part='status'
+            )
+
+            response = request.execute()
+            self.is_live = True
+
+            logger.info("🎬 ТРАНСЛЯЦИЯ НАЧАЛАСЬ!")
+            logger.info(f"📺 Ссылка: https://youtube.com/watch?v={self.broadcast_id}")
 
             return True
 
         except Exception as e:
-            logger.error(f"Ошибка воспроизведения: {e}")
+            logger.error(f"❌ Ошибка начала трансляции: {e}")
+            self.metrics['errors'].append(str(e))
             return False
 
-    async def test_all_voices(self):
-        """Тестирование всех голосов"""
-        test_text = "Здравствуйте! Это тест мужского и женского голосов."
+    def complete_broadcast(self) -> bool:
+        """Завершение трансляции"""
+        try:
+            if not self.broadcast_id:
+                return True
 
-        print("\n🔊 ТЕСТ ГОЛОСОВ EDGE TTS")
-        print("=" * 50)
+            request = self.youtube.liveBroadcasts().transition(
+                broadcastStatus='complete',
+                id=self.broadcast_id,
+                part='status'
+            )
 
-        for voice_id, config in self.voices_config.items():
-            print(f"\n🎤 Тест голоса: {voice_id}")
-            print(f"⚙️  Конфиг: {config}")
+            response = request.execute()
+            self.is_live = False
 
-            try:
-                success = await self.speak(test_text, voice_id)
-                if success:
-                    print("✅ УСПЕХ!")
-                else:
-                    print("❌ ОШИБКА")
-            except Exception as e:
-                print(f"❌ КРИТИЧЕСКАЯ ОШИБКА: {e}")
+            logger.info("🛑 Трансляция завершена")
 
-            await asyncio.sleep(1)  # Пауза между тестами
+            # Очищаем ID
+            self.broadcast_id = None
+            self.stream_id = None
 
-    def stop(self):
-        """Остановка воспроизведения"""
-        pygame.mixer.music.stop()
+            return True
 
-    def cleanup(self):
-        """Очистка ресурсов"""
-        pygame.mixer.quit()
+        except Exception as e:
+            logger.error(f"❌ Ошибка завершения: {e}")
+            self.metrics['errors'].append(str(e))
+            return False
+
+    def get_stream_key_info(self) -> Optional[Dict[str, str]]:
+        """Получение информации о stream key"""
+        try:
+            if not self.stream_id:
+                return None
+
+            request = self.youtube.liveStreams().list(
+                part='cdn',
+                id=self.stream_id
+            )
+
+            response = request.execute()
+
+            if not response.get('items'):
+                return None
+
+            cdn_info = response['items'][0]['cdn']
+            stream_key = cdn_info['ingestionInfo']['streamName']
+
+            return {
+                'stream_key': stream_key,
+                'rtmp_url': f"rtmp://a.rtmp.youtube.com/live2/{stream_key}",
+                'ingestion_address': cdn_info['ingestionInfo']['ingestionAddress'],
+                'frame_rate': cdn_info.get('frameRate', '30fps'),
+                'resolution': cdn_info.get('resolution', '1080p')
+            }
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения stream key: {e}")
+            return None
+
+    def get_chat_id(self) -> Optional[str]:
+        """Получение ID чата трансляции"""
+        try:
+            if not self.broadcast_id:
+                return None
+
+            request = self.youtube.liveBroadcasts().list(
+                part='snippet',
+                id=self.broadcast_id
+            )
+
+            response = request.execute()
+
+            if response.get('items'):
+                return response['items'][0]['snippet'].get('liveChatId')
+
+            return None
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения chat ID: {e}")
+            return None
+
+    def update_broadcast(
+            self,
+            title: Optional[str] = None,
+            description: Optional[str] = None
+    ) -> bool:
+        """Обновление информации о трансляции"""
+        try:
+            if not self.broadcast_id:
+                logger.error("❌ Нет активной трансляции для обновления")
+                return False
+
+            # Получаем текущие данные
+            request = self.youtube.liveBroadcasts().list(
+                part='snippet',
+                id=self.broadcast_id
+            )
+
+            response = request.execute()
+            snippet = response['items'][0]['snippet']
+
+            # Обновляем поля
+            if title:
+                snippet['title'] = title
+            if description:
+                snippet['description'] = description
+
+            # Отправляем обновление
+            update_request = self.youtube.liveBroadcasts().update(
+                part='snippet',
+                body={
+                    'id': self.broadcast_id,
+                    'snippet': snippet
+                }
+            )
+
+            update_response = update_request.execute()
+            logger.info("📝 Информация о трансляции обновлена")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка обновления: {e}")
+            return False
+
+    def list_broadcasts(
+            self,
+            status: str = "all",  # all, active, completed, upcoming
+            max_results: int = 10
+    ) -> List[Dict[str, Any]]:
+        """Список трансляций"""
+        try:
+            broadcast_status = None
+            if status == "active":
+                broadcast_status = "active"
+            elif status == "completed":
+                broadcast_status = "completed"
+            elif status == "upcoming":
+                broadcast_status = "upcoming"
+
+            request = self.youtube.liveBroadcasts().list(
+                part='snippet,status,contentDetails',
+                broadcastStatus=broadcast_status,
+                maxResults=max_results
+            )
+
+            response = request.execute()
+            broadcasts = []
+
+            for item in response.get('items', []):
+                broadcast = {
+                    'id': item['id'],
+                    'title': item['snippet']['title'],
+                    'description': item['snippet'].get('description', ''),
+                    'status': item['status']['lifeCycleStatus'],
+                    'privacy': item['status']['privacyStatus'],
+                    'url': f"https://youtube.com/watch?v={item['id']}",
+                    'scheduled_start': item['snippet'].get('scheduledStartTime'),
+                    'actual_start': item['snippet'].get('actualStartTime'),
+                    'actual_end': item['snippet'].get('actualEndTime'),
+                    'chat_id': item['snippet'].get('liveChatId'),
+                    'is_default_broadcast': item['status'].get('isDefaultBroadcast', False)
+                }
+                broadcasts.append(broadcast)
+
+            logger.info(f"📋 Найдено {len(broadcasts)} трансляций")
+            return broadcasts
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения списка трансляций: {e}")
+            return []
+
+    def start_full_stream(
+            self,
+            title: str,
+            description: str = "",
+            privacy_status: str = "unlisted",
+            resolution: str = "1080p"
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Полный процесс запуска трансляции
+
+        Args:
+            title: Заголовок трансляции
+            description: Описание
+            privacy_status: Статус приватности
+            resolution: Разрешение видео
+        """
+        try:
+            # 1. Аутентификация
+            if not self.authenticate():
+                return None
+
+            # 2. Создание трансляции
+            broadcast = self.create_live_broadcast(
+                title=title,
+                description=description,
+                privacy_status=privacy_status
+            )
+
+            if not broadcast:
+                return None
+
+            # 3. Создание потока
+            stream_info = self.create_stream(
+                title=f"Stream for: {title[:50]}",
+                resolution=resolution
+            )
+
+            if not stream_info:
+                return None
+
+            # 4. Привязка
+            if not self.bind_broadcast_to_stream():
+                return None
+
+            # 5. Получаем финальную информацию
+            stream_key_info = self.get_stream_key_info()
+
+            result = {
+                'success': True,
+                'broadcast_id': self.broadcast_id,
+                'stream_id': self.stream_id,
+                'watch_url': f"https://youtube.com/watch?v={self.broadcast_id}",
+                'stream_key': stream_info['stream_key'],
+                'rtmp_url': stream_info['rtmp_url'],
+                'chat_id': self.get_chat_id(),
+                'stream_info': stream_key_info,
+                'message': "Трансляция создана, запустите FFmpeg для начала стрима"
+            }
+
+            print("\n" + "=" * 70)
+            print("🎬 YOUTUBE ТРАНСЛЯЦИЯ ГОТОВА К ЗАПУСКУ!")
+            print("=" * 70)
+            print(f"📺 Ссылка: {result['watch_url']}")
+            print(f"🔑 Stream Key: {result['stream_key']}")
+            print(f"📍 RTMP URL: {result['rtmp_url']}")
+            print("=" * 70)
+            print("\n⚠️  Запустите FFmpeg для начала стрима:")
+            print(f"ffmpeg -f lavfi -i color=c=black:s=1920x1080:r=30 \\")
+            print(f"       -f lavfi -i anullsrc \\")
+            print(f"       -c:v libx264 -preset veryfast \\")
+            print(f"       -c:a aac \\")
+            print(f"       -f flv {result['rtmp_url']}")
+            print("=" * 70)
+
+            return result
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка запуска трансляции: {e}")
+            self.metrics['errors'].append(str(e))
+            return None
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """Получение метрик работы"""
+        return {
+            **self.metrics,
+            'timestamp': datetime.now().isoformat(),
+            'is_live': self.is_live,
+            'current_broadcast': self.broadcast_id,
+            'current_stream': self.stream_id
+        }

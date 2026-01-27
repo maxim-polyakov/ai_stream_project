@@ -668,7 +668,6 @@ def health():
 
 
 @app.route('/api/start_stream', methods=['POST'])
-@app.route('/api/start_stream', methods=['POST'])
 def start_stream():
     """Запуск FFmpeg стрима (принимает разные форматы)"""
     try:

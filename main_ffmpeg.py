@@ -1413,6 +1413,7 @@ def start_youtube_oauth_stream():
         if not youtube_oauth.youtube:
             # Если не аутентифицирован, возвращаем URL для авторизации
             auth_url = youtube_oauth.get_auth_url()
+            print(auth_url)
             if auth_url:
                 return jsonify({
                     'status': 'auth_required',

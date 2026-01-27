@@ -55,9 +55,12 @@ app = Flask(__name__, static_folder='stream_ui', template_folder='stream_ui')
 app.config['SECRET_KEY'] = 'ai_stream_secret_key_2024'
 socketio = SocketIO(app,
                    cors_allowed_origins="*",
-                   async_mode='gevent',
-                   logger=False,
-                   engineio_logger=False)
+                   async_mode='threading',  # ← ИЗМЕНИЛИ
+                   logger=True,
+                   engineio_logger=False,
+                   ping_timeout=300,
+                   ping_interval=60,
+                   max_http_buffer_size=1e8)
 
 # Инициализация OpenAI (версия >=1.3.0)
 if Config.OPENAI_API_KEY:

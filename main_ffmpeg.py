@@ -55,27 +55,73 @@ try:
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
 
-    # Проверяем наличие файла сервисного аккаунта
-    SERVICE_ACCOUNT_FILE = os.environ.get('GOOGLE_SERVICE_ACCOUNT_FILE', 'service-account.json')
-    YOUTUBE_CHANNEL_ID = os.environ.get('YOUTUBE_CHANNEL_ID')
 
-    if os.path.exists(SERVICE_ACCOUNT_FILE):
-        print("✅ Файл сервисного аккаунта найден")
+    # Ищем файл сервисного аккаунта в текущей директории
+    def find_service_account_file():
+        # Список возможных имен файлов
+        possible_filenames = [
+            'service-account.json',
+            'service_account.json',
+            'google-service-account.json',
+            'google_service_account.json',
+            'youtube-service-account.json',
+            'youtube_service_account.json'
+        ]
+
+        # Проверяем каждый файл
+        for filename in possible_filenames:
+            if os.path.exists(filename):
+                print(f"✅ Файл сервисного аккаунта найден: {filename}")
+                return filename
+
+        # Проверяем все JSON файлы в текущей директории
+        for file in os.listdir('.'):
+            if file.endswith('.json'):
+                try:
+                    with open(file, 'r') as f:
+                        content = json.load(f)
+                        # Проверяем, что это файл сервисного аккаунта
+                        if 'type' in content and content['type'] == 'service_account':
+                            print(f"✅ Найден файл сервисного аккаунта: {file}")
+                            return file
+                except:
+                    continue
+
+        print("⚠️ Файл сервисного аккаунта не найден в текущей директории.")
+        print("📁 Содержимое текущей директории:")
+        for item in os.listdir('.'):
+            print(f"  - {item}")
+
+        return None
+
+
+    # Ищем файл
+    SERVICE_ACCOUNT_FILE = find_service_account_file()
+
+    if SERVICE_ACCOUNT_FILE:
         YOUTUBE_SERVICE_ACCOUNT_AVAILABLE = True
+        print(f"🎯 Будет использован файл: {SERVICE_ACCOUNT_FILE}")
     else:
-        print("⚠️ Файл сервисного аккаунта не найден.")
-        print("Для автоматического создания трансляций через YouTube API:")
+        YOUTUBE_SERVICE_ACCOUNT_AVAILABLE = False
+        print("❌ Файл сервисного аккаунта не найден.")
+        print("\n📋 Как получить файл:")
         print("1. Создайте проект в Google Cloud Console")
         print("2. Включите YouTube Data API v3")
         print("3. Создайте сервисный аккаунт")
-        print("4. Скачайте JSON ключ как service-account.json")
+        print("4. Скачайте JSON ключ")
+        print("5. Сохраните как 'service-account.json' в текущей папке")
+
+    # ID канала можно оставить None, если не нужен
+    YOUTUBE_CHANNEL_ID = None
 
 except ImportError:
     print("⚠️ Google API модуль не найден.")
     print("Для автоматических трансляций установите:")
-    print("pip install google-api-python-client google-auth-oauthlib google-auth-httplib2")
+    print("pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib")
+    YOUTUBE_SERVICE_ACCOUNT_AVAILABLE = False
 except Exception as e:
     print(f"⚠️ Неожиданная ошибка при импорте Google API: {e}")
+    YOUTUBE_SERVICE_ACCOUNT_AVAILABLE = False
 
 # Настройка логирования
 logging.basicConfig(

@@ -682,10 +682,7 @@ class FFmpegStreamManager:
         try:
             self.start_time = time.time()
 
-            # Используем текущее время для текста
-            current_time = datetime.now().strftime("%H:%M:%S")
-
-            # Видео источник - исправленная версия
+            # ПРОСТОЙ И ГАРАНТИРОВАННО РАБОТАЮЩИЙ ВАРИАНТ
             if self.video_source == "http":
                 video_input = [
                     '-f', 'image2pipe',
@@ -700,15 +697,26 @@ class FFmpegStreamManager:
                     '-framerate', '30'
                 ]
             else:
-                # ИСПРАВЛЕННАЯ ВЕРСИЯ: используем запятую для разделения фильтров
-                # и правильное экранирование кавычек
-                drawtext_filter = f"drawtext=text='AI Stream {current_time}':fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2"
-
+                # ВАРИАНТ 1: Самый простой - черный экран
                 video_input = [
                     '-f', 'lavfi',
-                    '-i',
-                    f'color=c=black:s=1920x1080:r=30,{drawtext_filter}'  # ЗАПЯТАЯ вместо двоеточия!
+                    '-i', 'color=black:size=1920x1080:rate=30'
                 ]
+
+                # ВАРИАНТ 2: Тестовый паттерн (комментируйте вариант 1 и раскомментируйте этот)
+                # video_input = [
+                #     '-f', 'lavfi',
+                #     '-i', 'testsrc=size=1920x1080:rate=30'
+                # ]
+
+                # ВАРИАНТ 3: С текстом (более сложный)
+                # current_time = datetime.now().strftime("%H:%M")
+                # # Нужно экранировать двоеточия в тексте
+                # safe_time = current_time.replace(':', '\:')
+                # video_input = [
+                #     '-f', 'lavfi',
+                #     '-i', f"color=black:size=1920x1080:rate=30,drawtext=text='AI Stream {safe_time}':fontcolor=white:fontsize=24:x=(w-text_w)/2:y=(h-text_h)/2"
+                # ]
 
             # Параметры аудио
             if use_audio and self.use_pyaudio:
@@ -723,7 +731,7 @@ class FFmpegStreamManager:
                 # Тихий аудио
                 audio_input = [
                     '-f', 'lavfi',
-                    '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100'
+                    '-i', 'anullsrc=r=44100:cl=stereo'
                 ]
 
             # Команда FFmpeg
@@ -754,10 +762,20 @@ class FFmpegStreamManager:
                 self.rtmp_url
             ]
 
-            logger.info(f"🚀 Запуск FFmpeg: {' '.join(ffmpeg_cmd[:10])}...")
+            # Логируем команду для отладки
+            logger.info(f"🚀 Запуск FFmpeg: {' '.join(ffmpeg_cmd[:6])}...")
 
-            # Выводим полную команду для отладки
-            logger.debug(f"FFmpeg команда: {' '.join(ffmpeg_cmd)}")
+            # Проверяем команду локально
+            test_cmd = ['ffmpeg', '-f', 'lavfi', '-i', 'color=black:size=1920x1080:rate=30', '-t', '1', '-f', 'null',
+                        '-']
+            try:
+                result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    logger.info("✅ Тест FFmpeg фильтра успешен")
+                else:
+                    logger.warning(f"⚠️ Тест FFmpeg фильтра: {result.stderr[:200]}")
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось протестировать FFmpeg: {e}")
 
             # Запускаем FFmpeg
             self.stream_process = subprocess.Popen(

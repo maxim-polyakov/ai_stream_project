@@ -680,56 +680,94 @@ class FFmpegStreamManager:
             return False
 
         try:
-            # Конвертируем MP3 в PCM сырые данные и отправляем через stdin
+            # ВАЖНО: Используем -re для реального времени
             ffmpeg_convert_cmd = [
                 'ffmpeg',
+                '-re',  # Реальное время - важно!
                 '-i', audio_file,  # Входной MP3 файл
                 '-f', 's16le',  # Формат выхода
                 '-ar', '44100',  # Частота дискретизации
                 '-ac', '2',  # Стерео
                 '-acodec', 'pcm_s16le',  # Кодек PCM
+                '-bufsize', '64k',  # Маленький буфер для реального времени
                 '-'  # Вывод в stdout
             ]
 
             logger.info(f"🎵 Отправка аудио в стрим: {os.path.basename(audio_file)}")
 
-            # Запускаем конвертер
+            # Запускаем конвертер с буферизацией в 0
             converter = subprocess.Popen(
                 ffmpeg_convert_cmd,
-                stdout=subprocess.PIPE,  # Читаем его stdout
+                stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                bufsize=10 ** 8
+                bufsize=0,  # НЕ буферизируем!
+                text=False
             )
 
-            # Читаем данные и отправляем в основной FFmpeg
+            # Запускаем чтение stderr в отдельном потоке (чтобы избежать deadlock)
+            stderr_data = []
+
+            def read_stderr():
+                while True:
+                    line = converter.stderr.readline()
+                    if not line:
+                        break
+                    stderr_data.append(line.decode('utf-8', errors='ignore'))
+
+            stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+            stderr_thread.start()
+
+            # Читаем данные порциями и отправляем
             chunk_size = 88200  # 0.5 секунды аудио (44100 * 2 * 2)
             total_sent = 0
 
-            while True:
-                audio_data = converter.stdout.read(chunk_size)
-                if not audio_data:
-                    break
+            try:
+                while True:
+                    # Читаем с таймаутом
+                    audio_data = converter.stdout.read(chunk_size)
+                    if not audio_data:
+                        break  # Конец данных
 
-                try:
-                    self.ffmpeg_stdin.write(audio_data)
-                    self.ffmpeg_stdin.flush()
-                    total_sent += len(audio_data)
-                except BrokenPipeError:
-                    logger.error("❌ Broken pipe: основной FFmpeg процесс завершился")
-                    break
-                except Exception as e:
-                    logger.error(f"❌ Ошибка записи аудио: {e}")
-                    break
+                    # Проверяем, жив ли основной процесс
+                    if not self.is_streaming or self.stream_process.poll() is not None:
+                        logger.error("❌ Основной FFmpeg процесс завершился")
+                        converter.terminate()
+                        return False
 
-            # Ждем завершения конвертера
-            converter.wait()
+                    # Отправляем данные
+                    try:
+                        self.ffmpeg_stdin.write(audio_data)
+                        self.ffmpeg_stdin.flush()
+                        total_sent += len(audio_data)
+                    except BrokenPipeError:
+                        logger.error("❌ Broken pipe: основной FFmpeg процесс завершился")
+                        converter.terminate()
+                        return False
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка записи аудио: {e}")
+                        converter.terminate()
+                        return False
 
-            if converter.returncode == 0:
+            except Exception as e:
+                logger.error(f"❌ Ошибка чтения данных: {e}")
+                converter.terminate()
+                return False
+            finally:
+                # Завершаем процесс конвертера
+                converter.terminate()
+                converter.wait(timeout=5)
+
+                if converter.poll() is None:
+                    converter.kill()
+
+            # Проверяем результат
+            return_code = converter.poll()
+            if return_code == 0 or return_code == 255:  # 255 это нормальный выход для ffmpeg при SIGTERM
                 logger.info(f"✅ Аудио успешно отправлено ({total_sent} байт)")
                 return True
             else:
-                error = converter.stderr.read().decode('utf-8', errors='ignore')
-                logger.error(f"❌ Ошибка конвертации аудио: {error}")
+                error_output = ''.join(stderr_data[-5:]) if stderr_data else "Нет информации об ошибке"
+                logger.error(f"❌ Ошибка конвертации аудио (код: {return_code}): {error_output}")
                 return False
 
         except Exception as e:

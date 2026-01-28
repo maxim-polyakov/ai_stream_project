@@ -673,7 +673,7 @@ class FFmpegStreamManager:
         self.video_param = source_param
         logger.info(f"📹 Источник видео: {source_type}")
 
-    def stream_audio_pipe_safe(self, audio_file: str) -> bool:
+    def stream_audio_pipe(self, audio_file: str) -> bool:
         """Более надежный метод отправки аудио через конвертацию в WAV"""
         if not self.is_streaming or not self.ffmpeg_stdin:
             logger.error("❌ Стрим не активен или stdin недоступен")

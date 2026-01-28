@@ -530,78 +530,15 @@ class YouTubeOAuthStream:
             self.metrics['errors'].append(str(e))
             return False
 
-    def get_broadcast_info(self, broadcast_id: str) -> Optional[Dict[str, Any]]:
-        """Получение информации о трансляции"""
-        try:
-            request = self.youtube.liveBroadcasts().list(
-                part="id,snippet,status,contentDetails",
-                id=broadcast_id,
-                maxResults=1
-            )
-            response = request.execute()
-
-            if response.get('items'):
-                return response['items'][0]
-            return None
-        except Exception as e:
-            logger.error(f"❌ Ошибка получения информации о трансляции: {e}")
-            return None
-
-    def cleanup_old_broadcasts(self, max_age_hours: int = 24) -> int:
-        """
-        Удаление старых трансляций для освобождения лимитов
-        Возвращает количество удаленных трансляций
-        """
-        try:
-            # Получаем все трансляции
-            request = self.youtube.liveBroadcasts().list(
-                part="id,snippet,status",
-                mine=True,
-                maxResults=50
-            )
-            response = request.execute()
-
-            deleted_count = 0
-            now = datetime.now()
-
-            for broadcast in response.get('items', []):
-                created_str = broadcast['snippet']['publishedAt']
-                created = datetime.fromisoformat(created_str.replace('Z', '+00:00'))
-
-                # Проверяем возраст трансляции
-                age_hours = (now - created).total_seconds() / 3600
-
-                if age_hours > max_age_hours:
-                    # Удаляем старую трансляцию
-                    delete_request = self.youtube.liveBroadcasts().delete(
-                        id=broadcast['id']
-                    )
-                    delete_request.execute()
-                    deleted_count += 1
-                    logger.info(f"🗑️ Удалена старая трансляция: {broadcast['id']}")
-
-                    # Задержка между удалениями
-                    time.sleep(1)
-
-            if deleted_count > 0:
-                logger.info(f"✅ Удалено {deleted_count} старых трансляций")
-
-            return deleted_count
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка очистки старых трансляций: {e}")
-            return 0
-        
     def start_full_stream(
             self,
             title: str,
             description: str = "",
             privacy_status: str = "unlisted",
-            resolution: str = "1080p",
-            delay_between_steps: bool = True
+            resolution: str = "1080p"
     ) -> Optional[Dict[str, Any]]:
         """
-        Полный процесс запуска трансляции через OAuth с защитой от rate limits
+        Полный процесс запуска трансляции через OAuth
         """
         try:
             print("\n" + "=" * 70)
@@ -617,10 +554,6 @@ class YouTubeOAuthStream:
                     return None
             print("✅ Аутентификация успешна")
 
-            # Задержка перед следующей операцией
-            if delay_between_steps:
-                time.sleep(2)
-
             # 2. Создание трансляции
             print("🔧 Шаг 2: Создание трансляции...")
             broadcast = self.create_live_broadcast(
@@ -634,11 +567,6 @@ class YouTubeOAuthStream:
                 return None
             print(f"✅ Трансляция создана: {self.broadcast_id}")
 
-            # Критически важная задержка! YouTube не любит быстрые последовательные запросы
-            if delay_between_steps:
-                print("⏳ Ждем 5 секунд перед созданием потока...")
-                time.sleep(5)
-
             # 3. Создание потока
             print("🔧 Шаг 3: Создание потока...")
             stream_info = self.create_stream(
@@ -651,11 +579,6 @@ class YouTubeOAuthStream:
                 return None
             print(f"✅ Поток создан: {self.stream_id}")
 
-            # Еще одна задержка перед привязкой
-            if delay_between_steps:
-                print("⏳ Ждем 3 секунды перед привязкой...")
-                time.sleep(3)
-
             # 4. Привязка
             print("🔧 Шаг 4: Привязка трансляции к потоку...")
             if not self.bind_broadcast_to_stream():
@@ -663,20 +586,10 @@ class YouTubeOAuthStream:
                 return None
             print("✅ Трансляция привязана к потоку")
 
-            # 5. Получаем полную информацию о трансляции
-            print("🔧 Шаг 5: Получение информации о трансляции...")
-            if delay_between_steps:
-                time.sleep(2)
-
-            broadcast_info = self.get_broadcast_info(self.broadcast_id)
-
-            # 6. Проверяем статус и ждем, если нужно
-            if broadcast_info and broadcast_info.get('status', {}).get('lifeCycleStatus') == 'ready':
-                print("✅ Трансляция в статусе 'ready' - можно начинать стриминг")
-            else:
-                print("⚠️  Трансляция создана, но статус не 'ready'")
-                print("⏳ Ждем 10 секунд для инициализации...")
-                time.sleep(10)
+            # 5. ПЕРЕДАЕМ УПРАВЛЕНИЕ FFMPEG
+            print("🔧 Шаг 5: Запуск FFmpeg стрима...")
+            # Здесь мы НЕ запускаем трансляцию через API
+            # Ждем, пока FFmpeg подключится к YouTube
 
             result = {
                 'success': True,
@@ -685,44 +598,19 @@ class YouTubeOAuthStream:
                 'watch_url': f"https://youtube.com/watch?v={self.broadcast_id}",
                 'stream_key': stream_info['stream_key'],
                 'rtmp_url': stream_info['rtmp_url'],
-                'ingestion_info': {
-                    'rtmp_url': stream_info['rtmp_url'],
-                    'stream_name': stream_info['stream_key']
-                },
-                'message': "Трансляция создана, запустите FFmpeg для начала стрима. Трансляция автоматически начнется когда YouTube получит поток.",
-                'broadcast_info': broadcast_info
+                'message': "Трансляция создана, запустите FFmpeg для начала стрима. Трансляция автоматически начнется когда YouTube получит поток."
             }
 
             print("\n" + "=" * 70)
             print("🎬 YOUTUBE ТРАНСЛЯЦИЯ ГОТОВА К ЗАПУСКУ!")
             print("=" * 70)
-            print(f"📺 Ссылка для просмотра: {result['watch_url']}")
+            print(f"📺 Ссылка: {result['watch_url']}")
             print(f"🔑 Stream Key: {result['stream_key']}")
             print(f"📍 RTMP URL: {result['rtmp_url']}")
-
-            # Дополнительная информация о лимитах
-            print("\n" + "=" * 70)
-            print("⚠️  ВАЖНАЯ ИНФОРМАЦИЯ О ЛИМИТАХ YOUTUBE:")
+            print("\n⚠️  Важно: Трансляция автоматически начнется")
+            print("когда YouTube получит видеопоток от FFmpeg.")
+            print("Обычно это занимает 30-60 секунд.")
             print("=" * 70)
-            print("1. YouTube API имеет строгие лимиты на частоту запросов")
-            print("2. Не создавайте больше 1 трансляции в 2 минуты")
-            print("3. При ошибке 'rate limit' ждите 5-10 минут")
-            print("4. Максимум 50 активных/запланированных трансляций на канал")
-            print("5. Новые каналы имеют более строгие лимиты")
-
-            # Добавляем подсказку для пользователя
-            print("\n💡 СОВЕТ: Если получаете ошибку 'rate limit':")
-            print("   - Подождите 10-15 минут")
-            print("   - Удалите ненужные запланированные трансляции")
-            print("   - Используйте 'unlisted' вместо 'public' для тестов")
-            print("   - Создавайте трансляции заранее (1-2 раза в день)")
-            print("=" * 70)
-
-            # Логируем метрики
-            logger.info(f"📊 Трансляция создана успешно. Всего создано: {self.metrics['broadcasts_created']}")
-
-            # Очищаем счетчик ошибок rate limit после успешного создания
-            self.rate_limit_errors = 0
 
             return result
 
@@ -785,6 +673,87 @@ class FFmpegStreamManager:
         self.video_param = source_param
         logger.info(f"📹 Источник видео: {source_type}")
 
+    def stream_audio_pipe(self, audio_file: str) -> bool:
+        """Более надежный метод отправки аудио через конвертацию в WAV"""
+        if not self.is_streaming or not self.ffmpeg_stdin:
+            logger.error("❌ Стрим не активен или stdin недоступен")
+            return False
+
+        try:
+            # Сначала конвертируем MP3 в WAV файл
+            temp_wav = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+            temp_wav.close()
+
+            # Конвертация MP3 -> WAV
+            convert_cmd = [
+                'ffmpeg',
+                '-i', audio_file,
+                '-acodec', 'pcm_s16le',
+                '-ar', '44100',
+                '-ac', '2',
+                '-y',  # Перезаписать
+                temp_wav.name
+            ]
+
+            logger.info(f"🔄 Конвертация MP3 в WAV: {os.path.basename(audio_file)}")
+
+            result = subprocess.run(convert_cmd, capture_output=True, text=True, timeout=10)
+
+            if result.returncode != 0:
+                logger.error(f"❌ Ошибка конвертации в WAV: {result.stderr[:200]}")
+                os.unlink(temp_wav.name)
+                return False
+
+            # Теперь читаем WAV файл и отправляем сырые PCM данные
+            wav_file_size = os.path.getsize(temp_wav.name)
+
+            # В WAV файле первые 44 байта - заголовок
+            header_size = 44
+
+            logger.info(f"📤 Отправка WAV аудио: {os.path.basename(audio_file)} ({wav_file_size} байт)")
+
+            with open(temp_wav.name, 'rb') as wav_file:
+                # Пропускаем заголовок WAV
+                wav_file.seek(header_size)
+
+                chunk_size = 88200  # 0.5 секунды аудио
+                total_sent = 0
+
+                while True:
+                    # Читаем PCM данные
+                    audio_data = wav_file.read(chunk_size)
+                    if not audio_data:
+                        break
+
+                    # Проверяем статус основного процесса
+                    if not self.is_streaming:
+                        logger.warning("⚠️ Стрим остановлен во время отправки аудио")
+                        break
+
+                    # Отправляем данные
+                    try:
+                        self.ffmpeg_stdin.write(audio_data)
+                        self.ffmpeg_stdin.flush()
+                        total_sent += len(audio_data)
+                    except BrokenPipeError:
+                        logger.error("❌ Broken pipe: основной FFmpeg процесс завершился")
+                        break
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка записи аудио: {e}")
+                        break
+
+            # Очистка
+            try:
+                os.unlink(temp_wav.name)
+            except:
+                pass
+
+            logger.info(f"✅ Аудио отправлено ({total_sent} байт PCM данных)")
+            return total_sent > 0
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка stream_audio_pipe_safe: {e}", exc_info=True)
+            return False
 
 
 
@@ -805,100 +774,6 @@ class FFmpegStreamManager:
         logger.info(f"📊 Размер очереди: {len(self.audio_queue)} файлов")
 
         return True
-
-    def stream_audio_separate(self, audio_file: str) -> bool:
-        """Отправка аудио через отдельный FFmpeg процесс"""
-        if not self.is_streaming or not self.rtmp_url:
-            logger.error("❌ Стрим не активен")
-            return False
-
-        try:
-            # Получаем длительность аудио
-            duration = self._get_audio_duration(audio_file)
-
-            # Команда для отправки только аудио
-            # Ключевой момент: используем -shortest для остановки после аудио
-            # и -re для реального времени
-            ffmpeg_cmd = [
-                'ffmpeg',
-                '-re',  # Реальное время!
-                '-i', audio_file,  # Аудио файл
-
-                # Видео источник - тот же что и у основного стрима
-                '-f', 'lavfi',
-                '-i', 'color=size=1920x1080:rate=30',
-
-                # Выбираем только аудио из первого входа
-                '-map', '0:a',
-                '-map', '1:v',  # Видео остается таким же
-
-                # Аудио кодек
-                '-c:a', 'aac',
-                '-b:a', '128k',
-                '-ar', '44100',
-                '-ac', '2',
-
-                # Видео кодек (копируем из основного)
-                '-c:v', 'libx264',
-                '-preset', 'veryfast',
-                '-pix_fmt', 'yuv420p',
-                '-g', '60',
-                '-b:v', '4500k',
-                '-maxrate', '4500k',
-                '-bufsize', '9000k',
-
-                # Ограничиваем длительность аудио файлом
-                '-t', str(duration + 1),  # +1 секунда буфер
-
-                # Вывод
-                '-f', 'flv',
-                '-flvflags', 'no_duration_filesize',
-                self.rtmp_url
-            ]
-
-            logger.info(f"🎵 Отправка аудио: {os.path.basename(audio_file)} ({duration:.1f} сек)")
-
-            # Запускаем отдельный процесс
-            process = subprocess.Popen(
-                ffmpeg_cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-
-            # Мониторим вывод
-            def monitor_audio():
-                for line in process.stderr:
-                    line = line.strip()
-                    if 'error' in line.lower():
-                        logger.error(f"Аудио FFmpeg: {line}")
-                    elif 'time=' in line:
-                        # Логируем прогресс
-                        pass
-
-            # Запускаем мониторинг в отдельном потоке
-            monitor_thread = threading.Thread(target=monitor_audio, daemon=True)
-            monitor_thread.start()
-
-            # Ждем завершения (с таймаутом)
-            timeout = duration + 5  # +5 секунд запас
-            try:
-                process.wait(timeout=timeout)
-                if process.returncode == 0:
-                    logger.info(f"✅ Аудио успешно отправлено")
-                    return True
-                else:
-                    logger.error(f"❌ Аудио процесс завершился с кодом {process.returncode}")
-                    return False
-            except subprocess.TimeoutExpired:
-                logger.warning(f"⚠️ Таймаут отправки аудио, завершаю процесс...")
-                process.terminate()
-                process.wait(timeout=2)
-                return False
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка отправки аудио: {e}", exc_info=True)
-            return False
 
     def start_stream(self, use_audio: bool = True):
         """Запуск FFmpeg стрима БЕЗ аудио входа через stdin"""
@@ -1035,7 +910,7 @@ class FFmpegStreamManager:
         logger.info(f"📊 Очередь аудио: {len(self.audio_queue)} файлов")
         return True
 
-
+    
     def play_audio_file(self, audio_file: str) -> bool:
         """Воспроизведение аудио файла (MP3) и отправка в стрим"""
         if not os.path.exists(audio_file):

@@ -95,15 +95,24 @@ class FFmpegStreamManager:
         self.video_source = "black"
         self.ffmpeg_stdin = None
         self.start_time = None
-        self.audio_queue = []  # Очередь аудио файлов для воспроизведения
-        self.is_playing_audio = False
 
-        # Настройки аудио
+        # Очередь и управление аудио
+        self.audio_queue = []
+        self.current_audio = None
+        self.is_playing_audio = False
+        self.audio_processor_thread = None
+        self.silence_generator = None
+
+        # Конфигурация
         self.audio_sample_rate = 44100
         self.audio_channels = 2
+        self.audio_format = 's16le'
+        self.bytes_per_sample = 2
 
-        # Флаг для определения, используем ли мы PyAudio
-        self.use_pyaudio = PYTHON_AUDIO_AVAILABLE
+        # Для генерации тишины
+        self.silence_chunk_duration = 0.1  # 100ms
+        self.silence_chunk_size = int(self.audio_sample_rate * self.audio_channels *
+                                      self.bytes_per_sample * self.silence_chunk_duration)
 
         logger.info("FFmpeg Stream Manager инициализирован")
 
@@ -112,177 +121,179 @@ class FFmpegStreamManager:
         self.stream_key = stream_key
         self.rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
         logger.info(f"🔑 Stream Key установлен: {stream_key[:10]}...")
-        logger.info(f"📍 RTMP URL: {self.rtmp_url}")
         return True
 
-    def stream_audio_pipe(self, audio_file: str) -> bool:
-        """Более надежный метод отправки аудио через конвертацию в WAV"""
-        if not self.is_streaming or not self.ffmpeg_stdin:
-            logger.error("❌ Стрим не активен или stdin недоступен")
-            return False
+    def _generate_silence_chunk(self) -> bytes:
+        """Генерация чанка тишины (нулевые байты)"""
+        # Для формата s16le: 16-bit signed little-endian, значение 0 = тишина
+        return b'\x00' * self.silence_chunk_size
 
-        temp_wav = None
+    def _read_audio_chunk(self, audio_file: str, position: int = 0, chunk_size: int = 65536) -> tuple:
+        """Чтение чанка аудио из файла"""
+        try:
+            with open(audio_file, 'rb') as f:
+                # Пропускаем WAV заголовок (44 байта) если это WAV файл
+                if audio_file.endswith('.wav'):
+                    f.seek(44 + position)
+                else:
+                    f.seek(position)
+
+                data = f.read(chunk_size)
+                return data, len(data)
+        except Exception as e:
+            logger.error(f"Ошибка чтения аудио файла: {e}")
+            return None, 0
+
+    def _prepare_audio_file(self, audio_file: str) -> str:
+        """Подготовка аудио файла (конвертация в сырой PCM)"""
+        if not os.path.exists(audio_file):
+            logger.error(f"Аудио файл не найден: {audio_file}")
+            return None
+
+        # Если уже PCM файл, возвращаем как есть
+        if audio_file.endswith('.pcm') or audio_file.endswith('.raw'):
+            return audio_file
+
+        # Создаем временный PCM файл
+        temp_pcm = tempfile.NamedTemporaryFile(suffix='.pcm', delete=False)
+        temp_pcm.close()
 
         try:
-            # 1. Сначала конвертируем MP3 в WAV файл
-            temp_wav = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
-            temp_wav.close()
-
-            # Конвертация MP3 -> WAV
+            # Конвертируем в сырой PCM формат
             convert_cmd = [
                 'ffmpeg',
                 '-i', audio_file,
+                '-f', 's16le',  # Формат вывода
+                '-ar', str(self.audio_sample_rate),
+                '-ac', str(self.audio_channels),
                 '-acodec', 'pcm_s16le',
-                '-ar', '44100',
-                '-ac', '2',
                 '-y',
-                temp_wav.name
+                temp_pcm.name
             ]
 
-            logger.info(f"🔄 Конвертация MP3 в WAV: {os.path.basename(audio_file)}")
+            logger.debug(f"Конвертация {audio_file} в PCM формат")
 
-            result = subprocess.run(convert_cmd, capture_output=True, text=True, timeout=30)
+            result = subprocess.run(
+                convert_cmd,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
 
             if result.returncode != 0:
-                logger.error(f"❌ Ошибка конвертации в WAV: {result.stderr[:500]}")
-                if os.path.exists(temp_wav.name):
-                    os.unlink(temp_wav.name)
-                return False
+                logger.error(f"Ошибка конвертации: {result.stderr[:500]}")
+                os.unlink(temp_pcm.name)
+                return None
 
-            # 2. Проверяем созданный WAV файл
-            if not os.path.exists(temp_wav.name) or os.path.getsize(temp_wav.name) < 100:
-                logger.error(f"❌ WAV файл не создан или слишком маленький")
-                if os.path.exists(temp_wav.name):
-                    os.unlink(temp_wav.name)
-                return False
+            # Проверяем размер файла
+            if os.path.getsize(temp_pcm.name) < 100:
+                logger.error("PCM файл слишком маленький")
+                os.unlink(temp_pcm.name)
+                return None
 
-            # 3. Подготавливаем PCM данные для отправки
-            wav_file_size = os.path.getsize(temp_wav.name)
-
-            # Определяем реальный размер заголовка WAV
-            with open(temp_wav.name, 'rb') as f:
-                # Читаем первые 44 байта для анализа
-                header = f.read(44)
-                if len(header) < 44:
-                    logger.error("❌ WAV файл поврежден, заголовок слишком короткий")
-                    return False
-
-                # Проверяем сигнатуру WAV файла
-                if header[0:4] != b'RIFF' or header[8:12] != b'WAVE':
-                    logger.error("❌ Неверный формат WAV файла")
-                    return False
-
-            # 4. Отправляем данные с правильным форматом
-            # ВАЖНО: FFmpeg должен быть запущен с правильными параметрами для приема PCM
-            logger.info(f"📤 Отправка PCM аудио: {os.path.basename(audio_file)} ({wav_file_size} байт)")
-
-            # Отправляем WAV файл целиком (включая заголовок)
-            # FFmpeg сам разберет формат, если он правильно настроен
-            chunk_size = 65536  # 64KB чанки для лучшей производительности
-            total_sent = 0
-            bytes_per_second = 44100 * 2 * 2  # 44100 Hz * 2 channels * 2 bytes per sample
-            chunk_duration_ms = (chunk_size / bytes_per_second) * 1000
-
-            logger.debug(f"Настройки: {chunk_size} байт/чанк, ~{chunk_duration_ms:.0f} мс")
-
-            with open(temp_wav.name, 'rb') as wav_file:
-                while True:
-                    # Читаем данные
-                    audio_data = wav_file.read(chunk_size)
-                    if not audio_data:
-                        break
-
-                    # Проверяем статус основного процесса
-                    if not self.is_streaming:
-                        logger.warning("⚠️ Стрим остановлен во время отправки аудио")
-                        break
-
-                    # Отправляем данные
-                    try:
-                        self.ffmpeg_stdin.write(audio_data)
-                        self.ffmpeg_stdin.flush()
-                        total_sent += len(audio_data)
-
-                        # Небольшая задержка для синхронизации с реальным временем
-                        # Это предотвращает переполнение буфера FFmpeg
-                        if len(audio_data) >= chunk_size:
-                            time.sleep(chunk_duration_ms / 1000 * 0.9)  # 90% от реального времени
-
-                    except BrokenPipeError:
-                        logger.error("❌ Broken pipe: основной FFmpeg процесс завершился")
-                        self.is_streaming = False
-                        break
-                    except OSError as e:
-                        logger.error(f"❌ Ошибка записи аудио (OSError): {e}")
-                        self.is_streaming = False
-                        break
-                    except Exception as e:
-                        logger.error(f"❌ Ошибка записи аудио: {e}")
-                        break
-
-            logger.info(f"✅ Аудио отправлено ({total_sent} байт из {wav_file_size})")
-
-            # 5. После отправки всех данных, отправляем сигнал завершения если нужно
-            if self.is_streaming and total_sent > 0:
-                try:
-                    # Немного ждем перед закрытием
-                    time.sleep(0.5)
-
-                    # Проверяем, жив ли еще процесс
-                    if hasattr(self, 'ffmpeg_process') and self.ffmpeg_process:
-                        if self.ffmpeg_process.poll() is None:
-                            # Процесс еще работает, можно отправить flush
-                            self.ffmpeg_stdin.flush()
-                except:
-                    pass
-
-            return total_sent > 0
-
-        except subprocess.TimeoutExpired:
-            logger.error("❌ Таймаут конвертации аудио")
-            return False
+            return temp_pcm.name
 
         except Exception as e:
-            logger.error(f"❌ Ошибка stream_audio_pipe: {e}", exc_info=True)
-            return False
+            logger.error(f"Ошибка подготовки аудио: {e}")
+            if os.path.exists(temp_pcm.name):
+                os.unlink(temp_pcm.name)
+            return None
 
-        finally:
-            # Всегда очищаем временный файл
-            if temp_wav and os.path.exists(temp_wav.name):
-                try:
-                    os.unlink(temp_wav.name)
-                    logger.debug("🧹 Временный WAV файл удален")
-                except Exception as e:
-                    logger.warning(f"⚠️ Не удалось удалить временный файл: {e}")
+    def _continuous_audio_processor(self):
+        """Непрерывный процессор аудио, всегда отправляющий данные"""
+        logger.info("🚀 Запуск непрерывного аудио процессора")
 
-    def _audio_queue_processor(self):
-        """Обработчик очереди аудио файлов"""
-        while self.is_streaming:
+        while self.is_streaming and self.ffmpeg_stdin:
             try:
+                # Если есть аудио в очереди - воспроизводим его
                 if self.audio_queue:
-                    # Берем следующий файл из очереди
+                    self.is_playing_audio = True
                     audio_file = self.audio_queue.pop(0)
-                    logger.info(f"🎵 Воспроизведение аудио из очереди: {os.path.basename(audio_file)}")
+                    logger.info(f"🎵 Начинаем воспроизведение: {os.path.basename(audio_file)}")
 
-                    # Отправляем аудио
-                    success = self.stream_audio_pipe(audio_file)
+                    # Подготавливаем файл (конвертируем в PCM если нужно)
+                    prepared_file = self._prepare_audio_file(audio_file)
 
-                    if not success:
-                        logger.warning(f"⚠️ Не удалось воспроизвести аудио, пропускаем")
+                    if prepared_file and self.ffmpeg_stdin:
+                        # Отправляем аудио по чанкам
+                        chunk_size = 65536  # 64KB
+                        position = 0
+                        total_bytes = os.path.getsize(prepared_file)
 
-                    # Удаляем временный файл если он был создан TTS
-                    if audio_file.startswith(tempfile.gettempdir()):
-                        try:
-                            os.unlink(audio_file)
-                        except:
-                            pass
+                        # Вычисляем время для каждого чанка
+                        bytes_per_second = self.audio_sample_rate * self.audio_channels * self.bytes_per_sample
+                        chunk_duration = chunk_size / bytes_per_second
+
+                        logger.debug(
+                            f"Отправка {total_bytes} байт аудио, чанк: {chunk_size} байт, {chunk_duration:.3f} с")
+
+                        while position < total_bytes and self.is_streaming:
+                            # Читаем чанк
+                            chunk, bytes_read = self._read_audio_chunk(prepared_file, position, chunk_size)
+
+                            if chunk and bytes_read > 0:
+                                try:
+                                    # Отправляем в FFmpeg
+                                    self.ffmpeg_stdin.write(chunk)
+                                    self.ffmpeg_stdin.flush()
+                                    position += bytes_read
+
+                                    # Задержка для реального времени
+                                    if bytes_read >= chunk_size:
+                                        time.sleep(chunk_duration * 0.95)  # 95% от реального времени
+
+                                except BrokenPipeError:
+                                    logger.error("❌ Broken pipe: FFmpeg процесс завершился")
+                                    self.is_streaming = False
+                                    break
+                                except Exception as e:
+                                    logger.error(f"Ошибка отправки аудио: {e}")
+                                    break
+                            else:
+                                break
+
+                        logger.info(f"✅ Аудио воспроизведено: {position} байт")
+
+                        # Очищаем временный файл
+                        if prepared_file != audio_file and os.path.exists(prepared_file):
+                            os.unlink(prepared_file)
+
+                        # Удаляем исходный файл если он временный
+                        if audio_file.startswith(tempfile.gettempdir()):
+                            try:
+                                os.unlink(audio_file)
+                            except:
+                                pass
+
+                    self.is_playing_audio = False
+
                 else:
-                    # Если очередь пуста, ждем
-                    time.sleep(0.1)
+                    # Если очередь пуста - отправляем тишину
+                    # Это критически важно для непрерывного стрима!
+                    if self.ffmpeg_stdin:
+                        try:
+                            silence_chunk = self._generate_silence_chunk()
+                            self.ffmpeg_stdin.write(silence_chunk)
+                            self.ffmpeg_stdin.flush()
+
+                            # Пауза между чанками тишины
+                            time.sleep(self.silence_chunk_duration * 0.9)
+
+                        except BrokenPipeError:
+                            logger.error("❌ Broken pipe во время отправки тишины")
+                            self.is_streaming = False
+                            break
+                        except Exception as e:
+                            logger.error(f"Ошибка отправки тишины: {e}")
+                            time.sleep(0.1)
+                    else:
+                        time.sleep(0.1)
 
             except Exception as e:
-                logger.error(f"❌ Ошибка в обработчике аудио: {e}")
+                logger.error(f"❌ Критическая ошибка в аудио процессоре: {e}")
                 time.sleep(0.1)
+
+        logger.info("🛑 Аудио процессор остановлен")
 
     def add_audio_to_queue(self, audio_file: str) -> bool:
         """Добавление аудио файла в очередь на воспроизведение"""
@@ -304,28 +315,28 @@ class FFmpegStreamManager:
         try:
             self.start_time = time.time()
 
-            # Инициализируем переменные для аудио
-            self.audio_queue = []  # Очередь аудио файлов
-            self.current_audio = None
-            self.ffmpeg_stdin = None
+            # Инициализируем переменные
+            self.audio_queue = []
+            self.is_playing_audio = False
 
-            # Команда FFmpeg с поддержкой аудио через stdin
+            # Команда FFmpeg с непрерывным аудио
             ffmpeg_cmd = [
                 'ffmpeg',
-                '-re',
+                '-re',  # Реальное время для видео
+                '-fflags', '+genpts',  # Генерация временных меток
 
-                # Видео источник
+                # Видео источник (непрерывный)
                 '-f', 'lavfi',
                 '-i', 'color=size=1920x1080:rate=30:color=black',
 
-                # Аудио источник через stdin (сырые PCM данные)
-                '-f', 's16le',  # Формат: 16-bit signed little-endian PCM
-                '-ar', '44100',  # Частота дискретизации: 44.1 kHz
-                '-ac', '2',  # Стерео
+                # Аудио источник через stdin
+                '-f', 's16le',
+                '-ar', str(self.audio_sample_rate),
+                '-ac', str(self.audio_channels),
                 '-channel_layout', 'stereo',
-                '-i', 'pipe:0',  # Читать из stdin
+                '-i', 'pipe:0',
 
-                # Видео кодек
+                # Видео настройки
                 '-c:v', 'libx264',
                 '-preset', 'veryfast',
                 '-tune', 'zerolatency',
@@ -334,9 +345,10 @@ class FFmpegStreamManager:
                 '-b:v', '4500k',
                 '-maxrate', '4500k',
                 '-bufsize', '9000k',
-                '-r', '30',  # Частота кадров
+                '-r', '30',
+                '-x264-params', 'keyint=60:min-keyint=60:scenecut=0',
 
-                # Аудио кодек
+                # Аудио настройки
                 '-c:a', 'aac',
                 '-b:a', '128k',
                 '-ar', '44100',
@@ -349,43 +361,48 @@ class FFmpegStreamManager:
                 self.rtmp_url
             ]
 
-            logger.info(f"🚀 Запуск FFmpeg стрима на YouTube")
-            logger.info(f"🔑 Stream Key: {self.stream_key[:10]}...")
-            logger.info(f"📍 RTMP URL: {self.rtmp_url}")
+            logger.info(f"🚀 Запуск FFmpeg стрима")
+            logger.debug(f"Команда FFmpeg: {' '.join(ffmpeg_cmd)}")
 
             # Запускаем FFmpeg
             self.stream_process = subprocess.Popen(
                 ffmpeg_cmd,
-                stdin=subprocess.PIPE,  # КРИТИЧЕСКИ ВАЖНО!
+                stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
-                bufsize=0,  # Небуферизованный ввод/вывод
-                text=False  # Бинарный режим
+                bufsize=0,
+                text=False
             )
 
             self.is_streaming = True
             self.ffmpeg_pid = self.stream_process.pid
-            self.ffmpeg_stdin = self.stream_process.stdin  # ВАЖНО: сохраняем stdin
+            self.ffmpeg_stdin = self.stream_process.stdin
 
             logger.info(f"✅ FFmpeg запущен (PID: {self.ffmpeg_pid})")
 
             # Запускаем мониторинг
             threading.Thread(target=self._monitor_ffmpeg, daemon=True).start()
 
-            # Запускаем обработчик аудио очереди
-            threading.Thread(target=self._audio_queue_processor, daemon=True).start()
+            # Запускаем непрерывный аудио процессор
+            self.audio_processor_thread = threading.Thread(
+                target=self._continuous_audio_processor,
+                daemon=True
+            )
+            self.audio_processor_thread.start()
 
-            logger.info(f"🎬 FFmpeg стрим запущен (PID: {self.ffmpeg_pid})")
+            # Начинаем отправку тишины сразу
+            logger.info("🔇 Начинаем отправку непрерывного аудио потока")
+
             socketio.emit('stream_started', {
                 'pid': self.ffmpeg_pid,
-                'rtmp_url': self.rtmp_url,
-                'stream_key': self.stream_key[:10] + '...'
+                'rtmp_url': self.rtmp_url
             })
 
-            return {'success': True, 'pid': self.ffmpeg_pid, 'message': 'Стрим запущен'}
+            return {'success': True, 'pid': self.ffmpeg_pid}
 
         except Exception as e:
             logger.error(f"❌ Ошибка запуска FFmpeg: {e}", exc_info=True)
+            self.is_streaming = False
             return {'success': False, 'error': str(e)}
 
     def _monitor_ffmpeg(self):
@@ -396,69 +413,74 @@ class FFmpegStreamManager:
             for line in iter(self.stream_process.stderr.readline, b''):
                 line = line.decode('utf-8', errors='ignore').strip()
 
-                # Проверяем подключение
-                if 'rtmp://' in line and ('connected' in line.lower() or 'connected to' in line.lower()):
+                # Отладочная информация
+                if 'frame=' in line and 'fps=' in line:
+                    # Логируем статистику каждые 5 секунд
+                    current_time = time.time()
+                    if hasattr(self, '_last_stats_log') and current_time - self._last_stats_log < 5:
+                        continue
+                    self._last_stats_log = current_time
+                    logger.debug(f"📊 FFmpeg stats: {line}")
+
+                # Подключение к YouTube
+                elif 'rtmp://' in line and any(x in line.lower() for x in ['connected', 'publish', 'live']):
                     if not stream_connected:
                         stream_connected = True
-                        logger.info("✅ Успешное подключение к YouTube RTMP серверу")
+                        logger.info("✅ Успешное подключение к YouTube")
                         socketio.emit('stream_connected', {'status': 'connected'})
 
-                # Логируем статистику
-                if 'frame=' in line and 'fps=' in line:
-                    logger.debug(f"FFmpeg: {line}")
-                elif 'error' in line.lower() or 'failed' in line.lower():
-                    logger.error(f"FFmpeg error: {line}")
-                    socketio.emit('stream_error', {'message': line})
+                # Ошибки
+                elif any(x in line.lower() for x in ['error', 'failed', 'invalid']):
+                    logger.error(f"⚠️ FFmpeg error: {line}")
+                    socketio.emit('stream_warning', {'message': line})
 
-            # Ждем завершения процесса
-            self.stream_process.wait()
+            # Процесс завершен
+            return_code = self.stream_process.wait()
+            logger.info(f"FFmpeg завершился с кодом: {return_code}")
 
         except Exception as e:
             logger.error(f"Ошибка мониторинга FFmpeg: {e}")
         finally:
             self.is_streaming = False
-            if self.ffmpeg_stdin:
-                try:
-                    self.ffmpeg_stdin.close()
-                except:
-                    pass
             socketio.emit('stream_stopped', {'time': datetime.now().isoformat()})
 
     def stop_stream(self):
-        """Остановка стрима"""
-        if self.stream_process:
-            logger.info("🛑 Остановка FFmpeg стрима...")
-            self.is_streaming = False
+        """Корректная остановка стрима"""
+        logger.info("🛑 Остановка FFmpeg стрима...")
 
-            try:
-                # Очищаем очередь аудио
-                self.audio_queue.clear()
+        self.is_streaming = False
 
-                # Закрываем stdin
-                if self.ffmpeg_stdin:
-                    self.ffmpeg_stdin.close()
+        # Очищаем очередь
+        self.audio_queue.clear()
 
-                # Отправляем SIGTERM
+        # Даем время аудио процессору завершиться
+        if self.audio_processor_thread and self.audio_processor_thread.is_alive():
+            self.audio_processor_thread.join(timeout=2.0)
+
+        try:
+            # Закрываем stdin
+            if self.ffmpeg_stdin:
+                self.ffmpeg_stdin.close()
+
+            # Graceful shutdown
+            if self.stream_process and self.stream_process.poll() is None:
                 self.stream_process.terminate()
 
-                # Ждем завершения
-                for _ in range(20):
+                # Ждем корректного завершения
+                for i in range(10):
                     if self.stream_process.poll() is not None:
                         break
                     time.sleep(0.5)
 
-                # Если все еще жив - SIGKILL
+                # Принудительное завершение если нужно
                 if self.stream_process.poll() is None:
                     self.stream_process.kill()
                     self.stream_process.wait()
 
-                logger.info("✅ FFmpeg стрим остановлен")
-                return True
+        except Exception as e:
+            logger.error(f"Ошибка при остановке: {e}")
 
-            except Exception as e:
-                logger.error(f"❌ Ошибка остановки FFmpeg: {e}")
-                return False
-
+        logger.info("✅ FFmpeg стрим остановлен")
         return True
 
     def get_status(self):
@@ -469,26 +491,9 @@ class FFmpegStreamManager:
             'rtmp_url': self.rtmp_url,
             'pid': self.ffmpeg_pid,
             'audio_queue_size': len(self.audio_queue),
-            'is_playing_audio': self.is_playing_audio
+            'is_playing_audio': self.is_playing_audio,
+            'uptime': time.time() - self.start_time if self.start_time else 0
         }
-
-    def get_stream_health(self):
-        """Проверка здоровья стрима"""
-        status = self.get_status()
-
-        # Проверяем, жив ли процесс
-        if self.stream_process:
-            status['process_alive'] = (self.stream_process.poll() is None)
-            if not status['process_alive']:
-                status['exit_code'] = self.stream_process.poll()
-        else:
-            status['process_alive'] = False
-
-        # Проверяем время работы
-        if self.start_time:
-            status['uptime'] = time.time() - self.start_time
-
-        return status
 
 
 # ========== EDGE TTS MANAGER ==========

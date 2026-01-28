@@ -2909,7 +2909,8 @@ def start_youtube_oauth_stream():
         result = youtube_oauth.start_stream(
             title=title,
             description=description,
-            privacy_status=privacy_status
+            privacy_status=privacy_status,
+            use_api = True
         )
 
         if result and result.get('success'):

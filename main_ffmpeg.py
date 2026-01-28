@@ -682,7 +682,10 @@ class FFmpegStreamManager:
         try:
             self.start_time = time.time()
 
-            # Видео источник
+            # Используем текущее время для текста
+            current_time = datetime.now().strftime("%H:%M:%S")
+
+            # Видео источник - исправленная версия с правильным экранированием
             if self.video_source == "http":
                 video_input = [
                     '-f', 'image2pipe',
@@ -697,10 +700,19 @@ class FFmpegStreamManager:
                     '-framerate', '30'
                 ]
             else:
+                # КОРРЕКТНАЯ команда с правильным экранированием
+                # ВАЖНО: текст без двойных кавычек внутри
+                text_content = f"AI Stream {current_time}"
+                # Альтернативные варианты:
+                # 1. Используем одинарные кавычки внутри drawtext
+                drawtext_filter = f"drawtext=text='{text_content}':fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2"
+                # 2. Или используем drawtext без пробелов
+                # drawtext_filter = f"drawtext=text=AI_Stream_{current_time.replace(':', '-')}:fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2"
+
                 video_input = [
                     '-f', 'lavfi',
                     '-i',
-                    f'color=c=black:s=1920x1080:r=30:drawtext=text="AI\\\\ Stream\\\\ {datetime.now().strftime("%H:%M")}":fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2'
+                    f'color=c=black:s=1920x1080:r=30:{drawtext_filter}'
                 ]
 
             # Параметры аудио
@@ -748,6 +760,9 @@ class FFmpegStreamManager:
             ]
 
             logger.info(f"🚀 Запуск FFmpeg: {' '.join(ffmpeg_cmd[:10])}...")
+
+            # Выводим полную команду для отладки
+            logger.debug(f"FFmpeg команда: {' '.join(ffmpeg_cmd)}")
 
             # Запускаем FFmpeg
             self.stream_process = subprocess.Popen(

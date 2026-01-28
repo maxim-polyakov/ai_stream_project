@@ -117,35 +117,31 @@ class FFmpegStreamManager:
 
     def stream_audio_pipe(self, audio_file: str) -> bool:
         """Более надежный метод отправки аудио через конвертацию в WAV"""
-        if not self.is_streaming:
-            logger.error("❌ Стрим не активен")
+        if not self.is_streaming or not self.ffmpeg_stdin:
+            logger.error("❌ Стрим не активен или stdin недоступен")
             return False
 
         temp_wav = None
 
         try:
-            # 1. Конвертируем MP3 в WAV
+            # 1. Сначала конвертируем MP3 в WAV файл
             temp_wav = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
             temp_wav.close()
 
+            # Конвертация MP3 -> WAV
             convert_cmd = [
                 'ffmpeg',
                 '-i', audio_file,
-                '-acodec', 'pcm_s16le',  # PCM 16-bit little-endian
-                '-ar', '44100',  # Sample rate
-                '-ac', '2',  # Stereo
-                '-y',  # Overwrite
+                '-acodec', 'pcm_s16le',
+                '-ar', '44100',
+                '-ac', '2',
+                '-y',
                 temp_wav.name
             ]
 
-            logger.info(f"🔄 Конвертация в WAV: {os.path.basename(audio_file)}")
+            logger.info(f"🔄 Конвертация MP3 в WAV: {os.path.basename(audio_file)}")
 
-            result = subprocess.run(
-                convert_cmd,
-                capture_output=True,
-                text=True,
-                timeout=30  # Увеличиваем таймаут
-            )
+            result = subprocess.run(convert_cmd, capture_output=True, text=True, timeout=30)
 
             if result.returncode != 0:
                 logger.error(f"❌ Ошибка конвертации в WAV: {result.stderr[:500]}")
@@ -153,121 +149,111 @@ class FFmpegStreamManager:
                     os.unlink(temp_wav.name)
                 return False
 
-            # 2. Проверяем WAV файл
-            if not os.path.exists(temp_wav.name) or os.path.getsize(temp_wav.name) == 0:
-                logger.error(f"❌ WAV файл не создан или пустой")
+            # 2. Проверяем созданный WAV файл
+            if not os.path.exists(temp_wav.name) or os.path.getsize(temp_wav.name) < 100:
+                logger.error(f"❌ WAV файл не создан или слишком маленький")
+                if os.path.exists(temp_wav.name):
+                    os.unlink(temp_wav.name)
                 return False
 
+            # 3. Подготавливаем PCM данные для отправки
             wav_file_size = os.path.getsize(temp_wav.name)
-            logger.info(f"✅ WAV создан: {wav_file_size} байт")
 
-            # 3. Запускаем отдельный FFmpeg для чтения WAV и отправки в поток
-            # Ключевое: правильная команда для чтения WAV и отправки через pipe
-            stream_cmd = [
-                'ffmpeg',
-                '-re',  # Реальное время (важно для синхронизации)
-                '-i', temp_wav.name,  # Входной WAV файл
-                '-c:a', 'aac',  # Кодируем в AAC (обязательно для FLV)
-                '-b:a', '128k',  # Битрейт
-                '-f', 'flv',  # Формат FLV
-                '-flvflags', 'no_duration_filesize',
-                self.stream_url  # URL потока (RTMP или другой)
-            ]
-
-            logger.info(f"📤 Начинаем стриминг WAV аудио")
-
-            # Запускаем FFmpeg процесс
-            ffmpeg_process = subprocess.Popen(
-                stream_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True
-            )
-
-            # 4. Мониторим процесс
-            stdout_lines = []
-            stderr_lines = []
-
-            # Создаем потоки для чтения вывода
-            def read_output(pipe, lines):
-                for line in pipe:
-                    lines.append(line.strip())
-                    # Логируем важные сообщения
-                    if "error" in line.lower():
-                        logger.error(f"FFmpeg: {line.strip()}")
-                    elif "frame=" in line:
-                        logger.debug(f"FFmpeg: {line.strip()}")
-
-            import threading
-            stdout_thread = threading.Thread(
-                target=read_output,
-                args=(ffmpeg_process.stdout, stdout_lines)
-            )
-            stderr_thread = threading.Thread(
-                target=read_output,
-                args=(ffmpeg_process.stderr, stderr_lines)
-            )
-
-            stdout_thread.start()
-            stderr_thread.start()
-
-            # 5. Ждем завершения с таймаутом (длина файла + 10 секунд)
-            audio_duration = self.get_audio_duration(audio_file)
-            timeout = audio_duration + 10 if audio_duration else 300
-
-            try:
-                return_code = ffmpeg_process.wait(timeout=timeout)
-
-                # Ждем завершения потоков чтения
-                stdout_thread.join(timeout=5)
-                stderr_thread.join(timeout=5)
-
-                if return_code == 0:
-                    logger.info(f"✅ Стриминг завершен успешно")
-                    return True
-                else:
-                    error_msg = "\n".join(stderr_lines[-10:]) if stderr_lines else "Unknown error"
-                    logger.error(f"❌ FFmpeg завершился с кодом {return_code}: {error_msg}")
+            # Определяем реальный размер заголовка WAV
+            with open(temp_wav.name, 'rb') as f:
+                # Читаем первые 44 байта для анализа
+                header = f.read(44)
+                if len(header) < 44:
+                    logger.error("❌ WAV файл поврежден, заголовок слишком короткий")
                     return False
 
-            except subprocess.TimeoutExpired:
-                logger.error(f"❌ Таймаут стриминга ({timeout} сек)")
-                ffmpeg_process.kill()
-                return False
+                # Проверяем сигнатуру WAV файла
+                if header[0:4] != b'RIFF' or header[8:12] != b'WAVE':
+                    logger.error("❌ Неверный формат WAV файла")
+                    return False
+
+            # 4. Отправляем данные с правильным форматом
+            # ВАЖНО: FFmpeg должен быть запущен с правильными параметрами для приема PCM
+            logger.info(f"📤 Отправка PCM аудио: {os.path.basename(audio_file)} ({wav_file_size} байт)")
+
+            # Отправляем WAV файл целиком (включая заголовок)
+            # FFmpeg сам разберет формат, если он правильно настроен
+            chunk_size = 65536  # 64KB чанки для лучшей производительности
+            total_sent = 0
+            bytes_per_second = 44100 * 2 * 2  # 44100 Hz * 2 channels * 2 bytes per sample
+            chunk_duration_ms = (chunk_size / bytes_per_second) * 1000
+
+            logger.debug(f"Настройки: {chunk_size} байт/чанк, ~{chunk_duration_ms:.0f} мс")
+
+            with open(temp_wav.name, 'rb') as wav_file:
+                while True:
+                    # Читаем данные
+                    audio_data = wav_file.read(chunk_size)
+                    if not audio_data:
+                        break
+
+                    # Проверяем статус основного процесса
+                    if not self.is_streaming:
+                        logger.warning("⚠️ Стрим остановлен во время отправки аудио")
+                        break
+
+                    # Отправляем данные
+                    try:
+                        self.ffmpeg_stdin.write(audio_data)
+                        self.ffmpeg_stdin.flush()
+                        total_sent += len(audio_data)
+
+                        # Небольшая задержка для синхронизации с реальным временем
+                        # Это предотвращает переполнение буфера FFmpeg
+                        if len(audio_data) >= chunk_size:
+                            time.sleep(chunk_duration_ms / 1000 * 0.9)  # 90% от реального времени
+
+                    except BrokenPipeError:
+                        logger.error("❌ Broken pipe: основной FFmpeg процесс завершился")
+                        self.is_streaming = False
+                        break
+                    except OSError as e:
+                        logger.error(f"❌ Ошибка записи аудио (OSError): {e}")
+                        self.is_streaming = False
+                        break
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка записи аудио: {e}")
+                        break
+
+            logger.info(f"✅ Аудио отправлено ({total_sent} байт из {wav_file_size})")
+
+            # 5. После отправки всех данных, отправляем сигнал завершения если нужно
+            if self.is_streaming and total_sent > 0:
+                try:
+                    # Немного ждем перед закрытием
+                    time.sleep(0.5)
+
+                    # Проверяем, жив ли еще процесс
+                    if hasattr(self, 'ffmpeg_process') and self.ffmpeg_process:
+                        if self.ffmpeg_process.poll() is None:
+                            # Процесс еще работает, можно отправить flush
+                            self.ffmpeg_stdin.flush()
+                except:
+                    pass
+
+            return total_sent > 0
+
+        except subprocess.TimeoutExpired:
+            logger.error("❌ Таймаут конвертации аудио")
+            return False
 
         except Exception as e:
-            logger.error(f"❌ Ошибка в stream_audio_pipe: {e}", exc_info=True)
+            logger.error(f"❌ Ошибка stream_audio_pipe: {e}", exc_info=True)
             return False
 
         finally:
-            # 6. Всегда очищаем временный файл
+            # Всегда очищаем временный файл
             if temp_wav and os.path.exists(temp_wav.name):
                 try:
                     os.unlink(temp_wav.name)
                     logger.debug("🧹 Временный WAV файл удален")
                 except Exception as e:
                     logger.warning(f"⚠️ Не удалось удалить временный файл: {e}")
-
-    def get_audio_duration(self, audio_file: str) -> float:
-        """Получить длительность аудиофайла"""
-        try:
-            cmd = [
-                'ffprobe',
-                '-v', 'error',
-                '-show_entries', 'format=duration',
-                '-of', 'default=noprint_wrappers=1:nokey=1',
-                audio_file
-            ]
-
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode == 0:
-                duration = float(result.stdout.strip())
-                logger.info(f"⏱️ Длительность аудио: {duration:.1f} сек")
-                return duration
-        except Exception as e:
-            logger.warning(f"⚠️ Не удалось определить длительность: {e}")
-
-        return 0.0
 
     def _audio_queue_processor(self):
         """Обработчик очереди аудио файлов"""

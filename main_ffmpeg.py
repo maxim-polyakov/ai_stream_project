@@ -2003,12 +2003,281 @@ def api_stop_discussion():
     return jsonify({'success': True, 'message': 'Дискуссия остановлена'})
 
 
+@app.route('/api/youtube_control', methods=['POST'])
+def api_youtube_control():
+    """Управление YouTube трансляцией"""
+    try:
+        data = request.get_json() if request.is_json else request.form
+        action = data.get('action', 'get_info')
+
+        if not youtube_oauth:
+            return jsonify({
+                'status': 'error',
+                'message': 'YouTube OAuth не настроен'
+            })
+
+        if action == 'get_info':
+            metrics = youtube_oauth.get_metrics()
+            return jsonify({
+                'status': 'success',
+                'authenticated': youtube_oauth.youtube is not None,
+                'has_broadcast': youtube_oauth.broadcast_id is not None,
+                'is_live': youtube_oauth.is_live,
+                'broadcast_id': youtube_oauth.broadcast_id,
+                'stream_id': youtube_oauth.stream_id,
+                'stream_info': {
+                    'stream_key': youtube_oauth.stream_key,
+                    'rtmp_url': youtube_oauth.rtmp_url
+                },
+                'metrics': metrics
+            })
+
+        elif action == 'start_stream':
+            title = data.get('title', "🤖 AI Agents Live Stream")
+            description = data.get('description', Config.STREAM_DESCRIPTION)
+
+            result = youtube_oauth.start_full_stream(
+                title=title,
+                description=description
+            )
+
+            if result and result.get('success'):
+                return jsonify({
+                    'status': 'started',
+                    **result
+                })
+            else:
+                return jsonify({
+                    'status': 'error',
+                    'message': 'Не удалось создать трансляцию'
+                }), 500
+
+        else:
+            return jsonify({
+                'status': 'error',
+                'message': f'Неизвестное действие: {action}'
+            }), 400
+
+    except Exception as e:
+        logger.error(f"Ошибка YouTube контроля: {e}")
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+
+@app.route('/api/test_audio', methods=['POST'])
+def api_test_audio():
+    """Тестирование аудио"""
+    try:
+        data = request.get_json() if request.is_json else request.form
+        text = data.get('text', 'Тестовое сообщение для проверки звука')
+        voice = data.get('voice', 'male_ru')
+
+        # Запускаем в отдельном потоке
+        def run_test():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+            audio_file = loop.run_until_complete(
+                stream_manager.tts_manager.text_to_speech_and_stream(
+                    text=text,
+                    voice_id=voice,
+                    agent_name="Тест"
+                )
+            )
+            return audio_file
+
+        thread = threading.Thread(target=run_test)
+        thread.start()
+
+        return jsonify({
+            'success': True,
+            'message': 'Тестовое аудио запущено'
+        })
+
+    except Exception as e:
+        logger.error(f"Ошибка теста аудио: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        })
+
+
+@app.route('/api/control', methods=['POST'])
+def api_control():
+    """Общий endpoint для управления"""
+    try:
+        data = request.get_json() if request.is_json else request.form
+        action = data.get('action')
+
+        if action == 'start_discussion':
+            stream_manager.is_discussion_active = True
+            return jsonify({
+                'status': 'started',
+                'message': 'Дискуссия начата'
+            })
+
+        elif action == 'stop_discussion':
+            stream_manager.is_discussion_active = False
+            stream_manager.active_agent = None
+            return jsonify({
+                'status': 'stopped',
+                'message': 'Дискуссия остановлена'
+            })
+
+        elif action == 'change_topic':
+            topic = stream_manager.select_topic()
+            return jsonify({
+                'status': 'changed',
+                'topic': topic,
+                'message': 'Тема изменена'
+            })
+
+        else:
+            return jsonify({
+                'status': 'error',
+                'message': f'Неизвестное действие: {action}'
+            }), 400
+
+    except Exception as e:
+        logger.error(f"Ошибка управления: {e}")
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+
+@app.route('/api/stop_stream', methods=['POST'])
+def api_stop_stream():
+    """Остановка стрима"""
+    try:
+        ffmpeg_manager.stop_stream()
+
+        socketio.emit('stream_stopped', {
+            'time': datetime.now().isoformat()
+        })
+
+        return jsonify({
+            'status': 'stopped',
+            'message': 'Стрим остановлен'
+        })
+
+    except Exception as e:
+        logger.error(f"Ошибка остановки стрима: {e}")
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+
+@app.route('/api/start_stream', methods=['POST'])
+def api_start_stream():
+    """Ручной запуск стрима с Stream Key"""
+    try:
+        data = request.get_json() if request.is_json else request.form
+        stream_key = data.get('stream_key')
+
+        if not stream_key:
+            return jsonify({
+                'success': False,
+                'error': 'Stream Key не указан'
+            }), 400
+
+        # Устанавливаем ключ
+        ffmpeg_manager.set_stream_key(stream_key)
+
+        # Запускаем стрим
+        result = ffmpeg_manager.start_stream()
+
+        if result.get('success'):
+            # Уведомляем всех клиентов
+            socketio.emit('stream_started', {
+                'pid': result['pid'],
+                'rtmp_url': ffmpeg_manager.rtmp_url
+            })
+
+            return jsonify({
+                'status': 'started',
+                'pid': result['pid'],
+                'rtmp_url': ffmpeg_manager.rtmp_url,
+                'message': 'Стрим запущен'
+            })
+        else:
+            return jsonify({
+                'status': 'error',
+                'message': result.get('error', 'Неизвестная ошибка')
+            }), 500
+
+    except Exception as e:
+        logger.error(f"Ошибка запуска стрима: {e}")
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+@app.route('/api/stream_status')
+def get_stream_status():
+    """Получение статуса стрима"""
+    return jsonify(ffmpeg_manager.get_status())
+
+
+@app.route('/api/stream_health')
+def get_stream_health():
+    """Получение здоровья стрима"""
+    return jsonify(ffmpeg_manager.get_stream_health())
+
 @app.route('/api/change_topic', methods=['POST'])
 def api_change_topic():
     """Смена темы"""
     topic = stream_manager.select_topic()
     return jsonify({'success': True, 'topic': topic})
 
+@app.route('/youtube-control')
+def youtube_control():
+    """Страница управления YouTube API"""
+    return render_template('youtube_control.html')
+
+
+@app.route('/api/youtube_auth_status')
+def youtube_auth_status():
+    """Проверка статуса аутентификации YouTube"""
+    if youtube_oauth and youtube_oauth.youtube:
+        return jsonify({'authenticated': True})
+    else:
+        return jsonify({'authenticated': False})
+
+
+# ========== SOCKET.IO HANDLERS ==========
+
+@socketio.on('connect')
+def handle_connect():
+    """Обработчик подключения клиента"""
+    logger.info(f"📡 Клиент подключен: {request.sid}")
+
+    emit('connected', {
+        'agents': stream_manager.get_agents_state(),
+        'topic': stream_manager.current_topic or "Не выбрана",
+        'stats': stream_manager.get_stats(),
+        'stream_status': ffmpeg_manager.get_status(),
+        'time': datetime.now().isoformat()
+    })
+
+
+@socketio.on('request_update')
+def handle_request_update():
+    """Запрос обновления состояния"""
+    emit('update', {
+        'agents': stream_manager.get_agents_state(),
+        'topic': stream_manager.current_topic or "Не выбрана",
+        'stats': stream_manager.get_stats(),
+        'stream_status': ffmpeg_manager.get_status()
+    })
+
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    logger.info(f"📡 Клиент отключен: {request.sid}")
 
 def signal_handler(signum, frame):
     """Обработчик сигналов"""
@@ -2022,6 +2291,9 @@ def signal_handler(signum, frame):
 
 
 if __name__ == '__main__':
+    # Инициализируем event loop для дискуссий
+    discussion_loop_event_loop = asyncio.new_event_loop()
+
     # Регистрируем обработчики сигналов
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -2593,23 +2865,15 @@ if __name__ == '__main__':
 
     # Запускаем поток дискуссии
     print("🔄 Запуск цикла дискуссии...")
-    discussion_thread = threading.Thread(target=start_discussion_loop, daemon=True)
+    discussion_thread = threading.Thread(
+        target=lambda: discussion_loop_event_loop.run_until_complete(discussion_loop()),
+        daemon=True
+    )
     discussion_thread.start()
 
     print("🚀 Запуск веб-сервера...")
     print("🌐 Основной интерфейс: http://localhost:5000")
     print("🎬 YouTube API интерфейс: http://localhost:5000/youtube-control")
-    print("🔧 API Endpoints:")
-    print("   GET  /health                     - Проверка здоровья")
-    print("   POST /api/start_stream           - Ручной запуск стрима")
-    print("   POST /api/start_youtube_stream   - Автоматический запуск через YouTube API")
-    print("   POST /api/youtube_control        - Управление YouTube трансляцией")
-    print("   GET  /api/stream_status          - Статус стрима")
-    print("   POST /api/test_audio             - Тест звука")
-    print("")
-    print("📝 Доступные методы запуска стрима:")
-    print("   1. Ручной: Ввести Stream Key в основном интерфейсе")
-    print("   2. Автоматический: Использовать YouTube API (требуется client_secrets.json)")
     print("=" * 70)
 
     try:

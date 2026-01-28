@@ -756,7 +756,7 @@ class FFmpegStreamManager:
             return False
 
     def start_stream(self, use_audio: bool = True):
-        """Запуск FFmpeg стрима с передачей аудио"""
+        """Запуск FFmpeg стрима с динамическим добавлением аудио"""
         if not self.stream_key:
             logger.error("❌ Stream Key не установлен!")
             return {'success': False, 'error': 'Stream Key не установлен'}
@@ -764,26 +764,26 @@ class FFmpegStreamManager:
         try:
             self.start_time = time.time()
 
-            # Входные потоки
-            video_input = [
-                '-f', 'lavfi',
-                '-i', 'color=size=1920x1080:rate=30'
-            ]
+            # Создаем директорию для аудио файлов
+            self.audio_queue_dir = 'audio_queue'
+            os.makedirs(self.audio_queue_dir, exist_ok=True)
+            self.current_audio_file = None
 
-            # ВМЕСТО отдельного аудио источника, мы будем использовать фильтр amix
-            # для микширования аудио из pipe с тишиной
-            audio_input = [
-                '-f', 'lavfi',
-                '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
-                '-filter_complex', '[1:a]volume=0.5[a1]'  # Основной аудио источник (тишина)
-            ]
-
-            # Команда FFmpeg с поддержкой добавления аудио через фильтры
+            # Команда FFmpeg с возможностью динамической загрузки аудио
             ffmpeg_cmd = [
                 'ffmpeg',
                 '-re',
-                *video_input,
-                *audio_input,
+
+                # Видео источник
+                '-f', 'lavfi',
+                '-i', 'color=size=1920x1080:rate=30',
+
+                # Комплексный фильтр для динамического аудио
+                '-filter_complex', """
+                    anullsrc=channel_layout=stereo:sample_rate=44100[base];
+                    [base]aloop=loop=-1:size=2e9[bg_audio];
+                    [bg_audio]volume=0.1[main_audio]
+                """,
 
                 # Видео кодек
                 '-map', '0:v',
@@ -796,8 +796,8 @@ class FFmpegStreamManager:
                 '-maxrate', '4500k',
                 '-bufsize', '9000k',
 
-                # Аудио кодек
-                '-map', '[a1]',
+                # Аудио кодек (используем фильтрованный аудио)
+                '-map', '[main_audio]',
                 '-c:a', 'aac',
                 '-b:a', '128k',
                 '-ar', '44100',
@@ -808,21 +808,20 @@ class FFmpegStreamManager:
                 self.rtmp_url
             ]
 
-            logger.info(f"🚀 Запуск FFmpeg: {' '.join(ffmpeg_cmd[:10])}...")
+            logger.info(f"🚀 Запуск FFmpeg стрима...")
 
             # Запускаем FFmpeg
             self.stream_process = subprocess.Popen(
                 ffmpeg_cmd,
-                stdin=subprocess.PIPE,  # ВСЕГДА создаем stdin для отправки аудио
+                stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 text=False,
                 bufsize=0
             )
-            FFmpegStreamManager
+
             self.is_streaming = True
             self.ffmpeg_pid = self.stream_process.pid
-            self.ffmpeg_stdin = self.stream_process.stdin
 
             # Запуск мониторинга
             threading.Thread(target=self._monitor_ffmpeg, daemon=True).start()

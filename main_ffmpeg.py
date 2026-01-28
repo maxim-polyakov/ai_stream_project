@@ -20,9 +20,6 @@ from typing import List, Dict, Any, Optional
 from flask import Flask, render_template, request, jsonify, redirect, url_for
 from flask_socketio import SocketIO, emit
 import signal
-import subprocess
-import json
-import requests
 import shutil
 from urllib.parse import urlencode
 import queue
@@ -106,32 +103,20 @@ else:
     openai_client = None
 
 
+# ========== YOUTUBE OAUTH API ==========
+
 class YouTubeOAuthStream:
-    """
-    Управление YouTube трансляциями через OAuth 2.0
-    Поддерживает два режима:
-    1. Полный API режим (создание трансляций через API)
-    2. Ручной режим (использование заранее полученного stream key)
-    """
+    """Управление YouTube трансляциями через OAuth 2.0"""
 
-    def __init__(self, mode: str = 'auto'):
-        """
-        Инициализация YouTube стримера
-
-        Args:
-            mode: 'api' - использовать только YouTube API
-                  'manual' - использовать только ручной stream key
-                  'auto' - автоматически переключаться между режимами
-        """
+    def __init__(self):
         self.youtube = None
         self.broadcast_id = None
         self.stream_id = None
         self.is_live = False
         self.credentials = None
         self.stream_key = None
-        self.rtmp_url = "rtmp://a.rtmp.youtube.com/live2"
+        self.rtmp_url = None
         self.token_file = 'youtube_token.json'
-        self.mode = mode
 
         # Скоупы для YouTube API
         self.SCOPES = [
@@ -148,22 +133,10 @@ class YouTubeOAuthStream:
         self.metrics = {
             'streams_created': 0,
             'broadcasts_created': 0,
-            'api_errors': [],
-            'manual_streams': 0,
-            'ffmpeg_errors': [],
-            'last_stream_time': None
+            'errors': []
         }
 
-        # FFmpeg процесс
-        self.ffmpeg_process = None
-        self.ffmpeg_monitor_thread = None
-
-        logger.info(f"Инициализация YouTube API с OAuth 2.0 (режим: {mode})")
-
-    def set_mode(self, mode: str):
-        """Установка режима работы"""
-        self.mode = mode
-        logger.info(f"Режим изменен на: {mode}")
+        logger.info("Инициализация YouTube API с OAuth 2.0")
 
     def get_auth_url(self) -> Optional[str]:
         """Получение URL для аутентификации через OAuth"""
@@ -188,7 +161,7 @@ class YouTubeOAuthStream:
             auth_url, _ = flow.authorization_url(
                 access_type='offline',
                 include_granted_scopes='true',
-                prompt='consent'
+                prompt='consent'  # Всегда запрашиваем согласие
             )
 
             return auth_url
@@ -255,8 +228,8 @@ class YouTubeOAuthStream:
             # Сохраняем обновленные токены
             self._save_credentials(credentials)
 
-            logger.info("✅ YouTube API инициализирован")
-            return True
+            # Проверяем доступ
+            return self.test_api_access()
 
         except Exception as e:
             logger.error(f"❌ Ошибка инициализации YouTube API: {e}")
@@ -277,7 +250,7 @@ class YouTubeOAuthStream:
             with open(self.token_file, 'w') as f:
                 json.dump(token_data, f)
 
-            logger.debug("✅ Токены сохранены")
+            logger.info("✅ Токены сохранены")
 
         except Exception as e:
             logger.error(f"❌ Ошибка сохранения токенов: {e}")
@@ -285,10 +258,6 @@ class YouTubeOAuthStream:
     def test_api_access(self) -> bool:
         """Проверка доступа к YouTube API"""
         try:
-            if not self.youtube:
-                logger.error("❌ YouTube API не инициализирован")
-                return False
-
             # Простой запрос для проверки доступа
             request = self.youtube.channels().list(
                 part="snippet",
@@ -307,12 +276,22 @@ class YouTubeOAuthStream:
         except HttpError as e:
             error_details = json.loads(e.content.decode('utf-8'))
             logger.error(f"❌ Ошибка YouTube API: {error_details}")
+
+            if e.resp.status == 403:
+                error_message = error_details.get('error', {}).get('message', '')
+                if 'liveStreamingNotEnabled' in error_message:
+                    logger.error("❌ YouTube Live Streaming не включен для этого аккаунта!")
+                    logger.error("📋 Решение:")
+                    logger.error("1. Войдите в YouTube Studio")
+                    logger.error("2. Перейдите в 'Контент' → 'Трансляции'")
+                    logger.error("3. Активируйте функцию live streaming")
+                    logger.error("4. Подтвердите номер телефона")
+                    logger.error("5. Подождите 24 часа")
+
             return False
         except Exception as e:
             logger.error(f"❌ Ошибка проверки доступа: {e}")
             return False
-
-    # ==================== API РЕЖИМ ====================
 
     def create_live_broadcast(
             self,
@@ -321,7 +300,7 @@ class YouTubeOAuthStream:
             privacy_status: str = "unlisted",
             scheduled_time: Optional[datetime] = None
     ) -> Optional[Dict[str, Any]]:
-        """Создание трансляции через YouTube API"""
+        """Создание трансляции"""
         try:
             if not self.youtube:
                 logger.error("❌ YouTube API не инициализирован")
@@ -353,9 +332,6 @@ class YouTubeOAuthStream:
                 }
             }
 
-            # Добавляем задержку для избежания rate limit
-            time.sleep(2)
-
             request = self.youtube.liveBroadcasts().insert(
                 part='snippet,status,contentDetails',
                 body=broadcast_body
@@ -375,15 +351,20 @@ class YouTubeOAuthStream:
         except HttpError as e:
             error_details = json.loads(e.content.decode('utf-8'))
             logger.error(f"❌ Ошибка создания трансляции: {error_details}")
-            self.metrics['api_errors'].append(str(error_details))
+            self.metrics['errors'].append(str(error_details))
             return None
         except Exception as e:
             logger.error(f"❌ Ошибка создания трансляции: {e}")
-            self.metrics['api_errors'].append(str(e))
+            self.metrics['errors'].append(str(e))
             return None
 
-    def create_stream_api(self, title: str, resolution: str = "1080p") -> Optional[Dict[str, Any]]:
-        """Создание потока через YouTube API"""
+    def create_stream(
+            self,
+            title: str = "AI Live Stream",
+            resolution: str = "1080p",
+            frame_rate: str = "30fps"
+    ) -> Optional[Dict[str, Any]]:
+        """Создание потока для трансляции"""
         try:
             if not self.youtube:
                 logger.error("❌ YouTube API не инициализирован")
@@ -391,19 +372,15 @@ class YouTubeOAuthStream:
 
             stream_body = {
                 'snippet': {
-                    'title': title,
-                    'description': f"Stream for: {title}"
+                    'title': title
                 },
                 'cdn': {
-                    'format': resolution,
+                    'frameRate': frame_rate,
                     'ingestionType': 'rtmp',
-                    'frameRate': '60fps' if resolution in ['1080p', '1440p', '2160p'] else '30fps',
-                    'resolution': resolution
+                    'resolution': resolution,
+                    'format': ''
                 }
             }
-
-            # Добавляем задержку для избежания rate limit
-            time.sleep(2)
 
             request = self.youtube.liveStreams().insert(
                 part='snippet,cdn',
@@ -413,42 +390,42 @@ class YouTubeOAuthStream:
             response = request.execute()
             self.stream_id = response['id']
 
-            # Сохраняем stream_key и rtmp_url из ответа API
-            ingestion_info = response['cdn']['ingestionInfo']
-            self.stream_key = ingestion_info['streamName']
+            # Получаем данные для стрима
+            stream_key = response['cdn']['ingestionInfo']['streamName']
+            ingestion_address = response['cdn']['ingestionInfo']['ingestionAddress']
+            self.stream_key = stream_key
+            self.rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
 
-            logger.info(f"📡 Поток создан: {self.stream_id}")
-            logger.info(f"🔑 Stream Key: {self.stream_key}")
+            logger.info(f"🌊 Поток создан: {self.stream_id}")
+            logger.info(f"🔑 Stream Key: {stream_key}")
             logger.info(f"📍 RTMP URL: {self.rtmp_url}")
 
             self.metrics['streams_created'] += 1
 
             return {
                 'stream_id': self.stream_id,
-                'stream_key': self.stream_key,
+                'stream_key': stream_key,
+                'ingestion_address': ingestion_address,
                 'rtmp_url': self.rtmp_url,
-                'ingestion_info': ingestion_info
+                'full_response': response
             }
 
         except HttpError as e:
             error_details = json.loads(e.content.decode('utf-8'))
             logger.error(f"❌ Ошибка создания потока: {error_details}")
-            self.metrics['api_errors'].append(str(error_details))
+            self.metrics['errors'].append(str(error_details))
             return None
         except Exception as e:
             logger.error(f"❌ Ошибка создания потока: {e}")
-            self.metrics['api_errors'].append(str(e))
+            self.metrics['errors'].append(str(e))
             return None
 
     def bind_broadcast_to_stream(self) -> bool:
-        """Привязка трансляции к потоку (API режим)"""
+        """Привязка трансляции к потоку"""
         try:
             if not self.broadcast_id or not self.stream_id:
                 logger.error("❌ Нет broadcast_id или stream_id")
                 return False
-
-            # Добавляем задержку
-            time.sleep(1)
 
             request = self.youtube.liveBroadcasts().bind(
                 part='id,contentDetails',
@@ -462,11 +439,11 @@ class YouTubeOAuthStream:
 
         except Exception as e:
             logger.error(f"❌ Ошибка привязки: {e}")
-            self.metrics['api_errors'].append(str(e))
+            self.metrics['errors'].append(str(e))
             return False
 
-    def start_broadcast_api(self) -> bool:
-        """Начало трансляции через API"""
+    def start_broadcast(self) -> bool:
+        """Начало трансляции"""
         try:
             if not self.broadcast_id:
                 logger.error("❌ Нет активной трансляции")
@@ -492,7 +469,7 @@ class YouTubeOAuthStream:
                 logger.info("ℹ️ Ожидайте 1-2 минуты после создания трансляции")
                 return False
 
-            # Переводим в live
+            # Теперь переводим в live
             request = self.youtube.liveBroadcasts().transition(
                 broadcastStatus='live',
                 id=self.broadcast_id,
@@ -510,256 +487,74 @@ class YouTubeOAuthStream:
         except HttpError as e:
             error_details = json.loads(e.content.decode('utf-8'))
             logger.error(f"❌ Ошибка начала трансляции: {error_details}")
-            self.metrics['api_errors'].append(str(error_details))
+
+            if 'invalidTransition' in str(error_details):
+                logger.info("📋 Возможные причины:")
+                logger.info("1. Трансляция уже идет (status: live)")
+                logger.info("2. Трансляция еще не готова (status: created)")
+                logger.info("3. Не прошло достаточно времени после создания")
+                logger.info("4. Не привязан stream или stream не активен")
+
             return False
         except Exception as e:
             logger.error(f"❌ Ошибка начала трансляции: {e}")
-            self.metrics['api_errors'].append(str(e))
             return False
 
-    # ==================== РУЧНОЙ РЕЖИМ ====================
-
-    def set_manual_stream_key(self, stream_key: str):
-        """
-        Установка ручного stream key
-        Stream key можно получить из YouTube Studio:
-        Творческая студия → Настройки → Настройки трансляции
-        """
-        self.stream_key = stream_key.strip()
-        self.mode = 'manual'
-        logger.info(f"🔑 Установлен ручной Stream Key: {self.stream_key[:10]}...")
-
-    def get_manual_stream_key_input(self) -> str:
-        """Запрос stream key у пользователя"""
-        print("\n" + "=" * 60)
-        print("🔑 РУЧНОЙ РЕЖИМ: Требуется Stream Key")
-        print("=" * 60)
-        print("Получите Stream Key в YouTube Studio:")
-        print("1. Откройте YouTube Studio")
-        print("2. Перейдите в 'Настройки' → 'Настройки трансляции'")
-        print("3. Скопируйте 'Ключ потока'")
-        print("=" * 60)
-
-        stream_key = input("Введите ваш Stream Key: ").strip()
-        return stream_key
-
-    # ==================== FFMPEG ====================
-
-    def start_ffmpeg_stream(
-            self,
-            input_source: str = "input.mp4",
-            video_bitrate: str = "3000k",
-            audio_bitrate: str = "160k",
-            framerate: str = "30",
-            resolution: str = "1920x1080"
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Запуск ffmpeg стрима
-
-        Args:
-            input_source: источник видео (файл, устройство, URL)
-            video_bitrate: битрейт видео
-            audio_bitrate: битрейт аудио
-            framerate: частота кадров
-            resolution: разрешение (ширинаxвысота)
-        """
-        if not self.stream_key:
-            if self.mode == 'manual':
-                # Запрашиваем stream key
-                self.stream_key = self.get_manual_stream_key_input()
-            else:
-                logger.error("❌ Нет stream_key для стрима")
-                return None
-
-        full_rtmp_url = f"{self.rtmp_url}/{self.stream_key}"
-
-        # Построение команды ffmpeg
-        ffmpeg_cmd = [
-            'ffmpeg',
-            '-re',  # Читать с исходной скоростью
-            '-i', input_source,
-            '-c:v', 'libx264',
-            '-preset', 'veryfast',
-            '-b:v', video_bitrate,
-            '-maxrate', video_bitrate,
-            '-bufsize', str(int(int(video_bitrate[:-1]) * 2)) + video_bitrate[-1],
-            '-pix_fmt', 'yuv420p',
-            '-g', str(int(framerate) * 2),  # GOP size
-            '-c:a', 'aac',
-            '-b:a', audio_bitrate,
-            '-ac', '2',
-            '-ar', '44100',
-            '-f', 'flv',
-            full_rtmp_url
-        ]
-
-        # Добавляем разрешение если нужно
-        if resolution:
-            ffmpeg_cmd.insert(4, '-s')
-            ffmpeg_cmd.insert(5, resolution)
-
-        # Добавляем framerate если нужно
-        if framerate:
-            ffmpeg_cmd.insert(4, '-r')
-            ffmpeg_cmd.insert(5, framerate)
-
-        logger.info(f"🚀 Запуск ffmpeg: {' '.join(ffmpeg_cmd)}")
-        print(f"\n🔧 Команда ffmpeg: {' '.join(ffmpeg_cmd[:10])}...")
-
+    def complete_broadcast(self) -> bool:
+        """Завершение трансляции"""
         try:
-            # Запускаем процесс
-            self.ffmpeg_process = subprocess.Popen(
-                ffmpeg_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-                universal_newlines=True
-            )
-
-            # Запускаем мониторинг
-            self.ffmpeg_monitor_thread = threading.Thread(
-                target=self._monitor_ffmpeg,
-                args=(self.ffmpeg_process,),
-                daemon=True
-            )
-            self.ffmpeg_monitor_thread.start()
-
-            self.is_live = True
-            self.metrics['last_stream_time'] = datetime.now().isoformat()
-
-            result = {
-                'success': True,
-                'process_id': self.ffmpeg_process.pid,
-                'rtmp_url': full_rtmp_url,
-                'stream_key': self.stream_key,
-                'mode': self.mode,
-                'message': f"FFmpeg запущен (PID: {self.ffmpeg_process.pid})"
-            }
-
-            if self.broadcast_id:
-                result['broadcast_id'] = self.broadcast_id
-                result['watch_url'] = f"https://youtube.com/watch?v={self.broadcast_id}"
-
-            logger.info(f"✅ FFmpeg запущен успешно (PID: {self.ffmpeg_process.pid})")
-            return result
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка запуска ffmpeg: {e}")
-            self.metrics['ffmpeg_errors'].append(str(e))
-            return None
-
-    def _monitor_ffmpeg(self, process):
-        """Мониторинг процесса ffmpeg"""
-        try:
-            # Читаем stderr (там основная информация ffmpeg)
-            for line in iter(process.stderr.readline, ''):
-                if line:
-                    # Логируем важные сообщения
-                    if 'error' in line.lower():
-                        logger.error(f"FFmpeg: {line.strip()}")
-                    elif 'frame=' in line:
-                        # Периодически логируем статистику
-                        if 'frame=' in line and 'fps=' in line:
-                            # Логируем каждые 100 кадров
-                            if 'frame=' in line:
-                                try:
-                                    frame_num = int(line.split('frame=')[1].split()[0])
-                                    if frame_num % 100 == 0:
-                                        logger.info(f"FFmpeg: {line.strip()}")
-                                except:
-                                    pass
-
-            # Ждем завершения процесса
-            process.wait()
-            logger.info(f"FFmpeg процесс завершен с кодом: {process.returncode}")
-
-            if process.returncode != 0:
-                logger.error("FFmpeg завершился с ошибкой")
-                self.is_live = False
-
-        except Exception as e:
-            logger.error(f"Ошибка мониторинга ffmpeg: {e}")
-
-    def stop_ffmpeg(self):
-        """Остановка ffmpeg процесса"""
-        if self.ffmpeg_process:
-            try:
-                self.ffmpeg_process.terminate()
-                self.ffmpeg_process.wait(timeout=5)
-                logger.info("FFmpeg процесс остановлен")
-                self.is_live = False
+            if not self.broadcast_id:
                 return True
-            except Exception as e:
-                logger.error(f"Ошибка остановки ffmpeg: {e}")
-                try:
-                    self.ffmpeg_process.kill()
-                    logger.info("FFmpeg процесс принудительно завершен")
-                    self.is_live = False
-                    return True
-                except:
-                    logger.error("Не удалось завершить ffmpeg процесс")
-                    return False
-        return True
 
-    # ==================== УНИВЕРСАЛЬНЫЙ МЕТОД ====================
+            request = self.youtube.liveBroadcasts().transition(
+                broadcastStatus='complete',
+                id=self.broadcast_id,
+                part='status'
+            )
 
-    def start_stream(
+            response = request.execute()
+            self.is_live = False
+
+            logger.info("🛑 Трансляция завершена")
+
+            # Очищаем ID
+            self.broadcast_id = None
+            self.stream_id = None
+            self.stream_key = None
+            self.rtmp_url = None
+
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка завершения: {e}")
+            self.metrics['errors'].append(str(e))
+            return False
+
+    def start_full_stream(
             self,
             title: str,
             description: str = "",
             privacy_status: str = "unlisted",
-            input_source: str = "input.mp4",
-            use_api: Optional[bool] = None
+            resolution: str = "1080p"
     ) -> Optional[Dict[str, Any]]:
         """
-        Универсальный метод запуска стрима
-
-        Args:
-            title: заголовок трансляции
-            description: описание
-            privacy_status: приватность (public, unlisted, private)
-            input_source: источник для ffmpeg
-            use_api: использовать API (None - автоопределение)
+        Полный процесс запуска трансляции через OAuth
         """
-        print("\n" + "=" * 70)
-        print("🎬 ЗАПУСК YOUTUBE ТРАНСЛЯЦИИ")
-        print("=" * 70)
-
-        # Определяем режим
-        if use_api is None:
-            if self.mode == 'auto':
-                # Пытаемся использовать API если доступен
-                if self.youtube and self.test_api_access():
-                    use_api = True
-                else:
-                    use_api = False
-            else:
-                use_api = (self.mode == 'api')
-
-        if use_api:
-            print("🔧 Режим: YouTube API")
-            return self._start_stream_api(title, description, privacy_status, input_source)
-        else:
-            print("🔧 Режим: Ручной (Stream Key)")
-            return self._start_stream_manual(title, input_source)
-
-    def _start_stream_api(
-            self,
-            title: str,
-            description: str,
-            privacy_status: str,
-            input_source: str
-    ) -> Optional[Dict[str, Any]]:
-        """Запуск стрима через API"""
         try:
+            print("\n" + "=" * 70)
+            print("🎬 ЗАПУСК YOUTUBE ТРАНСЛЯЦИИ ЧЕРЕЗ OAUTH")
+            print("=" * 70)
+
+            # 1. Проверяем аутентификацию
             print("🔧 Шаг 1: Проверка аутентификации...")
             if not self.youtube:
                 if not self.load_credentials():
-                    print("❌ API не доступен, переключаюсь в ручной режим")
-                    return self._start_stream_manual(title, input_source)
+                    print("❌ Не аутентифицирован. Требуется OAuth авторизация")
+                    print("ℹ️ Используйте ручной Stream Key или пройдите OAuth авторизацию")
+                    return None
             print("✅ Аутентификация успешна")
 
+            # 2. Создание трансляции
             print("🔧 Шаг 2: Создание трансляции...")
             broadcast = self.create_live_broadcast(
                 title=title,
@@ -768,207 +563,77 @@ class YouTubeOAuthStream:
             )
 
             if not broadcast:
-                print("❌ Не удалось создать трансляцию через API")
-                print("🔄 Переключаюсь в ручной режим...")
-                return self._start_stream_manual(title, input_source)
-
+                print("❌ Не удалось создать трансляцию")
+                return None
             print(f"✅ Трансляция создана: {self.broadcast_id}")
 
+            # 3. Создание потока
             print("🔧 Шаг 3: Создание потока...")
-            stream_info = self.create_stream_api(
+            stream_info = self.create_stream(
                 title=f"Stream for: {title[:50]}",
-                resolution="1080p"
+                resolution=resolution
             )
 
             if not stream_info:
-                print("❌ Не удалось создать поток через API")
-                print("🔄 Переключаюсь в ручной режим...")
-                return self._start_stream_manual(title, input_source)
-
+                print("❌ Не удалось создать поток")
+                return None
             print(f"✅ Поток создан: {self.stream_id}")
-            print(f"🔑 Stream Key: {self.stream_key}")
 
+            # 4. Привязка
             print("🔧 Шаг 4: Привязка трансляции к потоку...")
             if not self.bind_broadcast_to_stream():
-                print("⚠️  Не удалось привязать, но продолжаем...")
-
-            print("🔧 Шаг 5: Запуск ffmpeg стрима...")
-            ffmpeg_result = self.start_ffmpeg_stream(input_source=input_source)
-
-            if not ffmpeg_result:
-                print("❌ Ошибка запуска ffmpeg")
+                print("❌ Не удалось привязать")
                 return None
+            print("✅ Трансляция привязана к потоку")
 
-            # Ждем немного перед запуском трансляции
-            print("⏳ Ожидание подключения потока... (10 секунд)")
-            time.sleep(10)
-
-            print("🔧 Шаг 6: Запуск трансляции...")
-            if not self.start_broadcast_api():
-                print("⚠️  Не удалось запустить через API, но стрим идет")
-                print("ℹ️  Трансляция может запуститься автоматически")
+            # 5. ПЕРЕДАЕМ УПРАВЛЕНИЕ FFMPEG
+            print("🔧 Шаг 5: Запуск FFmpeg стрима...")
+            # Здесь мы НЕ запускаем трансляцию через API
+            # Ждем, пока FFmpeg подключится к YouTube
 
             result = {
                 'success': True,
-                'mode': 'api',
                 'broadcast_id': self.broadcast_id,
                 'stream_id': self.stream_id,
                 'watch_url': f"https://youtube.com/watch?v={self.broadcast_id}",
-                'stream_key': self.stream_key,
-                'rtmp_url': f"{self.rtmp_url}/{self.stream_key}",
-                'ffmpeg_pid': ffmpeg_result.get('process_id'),
-                'message': "Трансляция запущена через YouTube API"
+                'stream_key': stream_info['stream_key'],
+                'rtmp_url': stream_info['rtmp_url'],
+                'message': "Трансляция создана, запустите FFmpeg для начала стрима. Трансляция автоматически начнется когда YouTube получит поток."
             }
 
             print("\n" + "=" * 70)
-            print("🎬 YOUTUBE ТРАНСЛЯЦИЯ ЗАПУЩЕНА!")
+            print("🎬 YOUTUBE ТРАНСЛЯЦИЯ ГОТОВА К ЗАПУСКУ!")
             print("=" * 70)
             print(f"📺 Ссылка: {result['watch_url']}")
             print(f"🔑 Stream Key: {result['stream_key']}")
             print(f"📍 RTMP URL: {result['rtmp_url']}")
+            print("\n⚠️  Важно: Трансляция автоматически начнется")
+            print("когда YouTube получит видеопоток от FFmpeg.")
+            print("Обычно это занимает 30-60 секунд.")
             print("=" * 70)
 
             return result
 
         except Exception as e:
-            logger.error(f"❌ Ошибка запуска API стрима: {e}")
-            print(f"❌ Ошибка: {e}")
-            print("🔄 Переключаюсь в ручной режим...")
-            return self._start_stream_manual(title, input_source)
-
-    def _start_stream_manual(self, title: str, input_source: str) -> Optional[Dict[str, Any]]:
-        """Запуск стрима в ручном режиме"""
-        try:
-            print("🔧 Шаг 1: Получение Stream Key...")
-            if not self.stream_key:
-                self.stream_key = self.get_manual_stream_key_input()
-
-            print(f"✅ Stream Key получен: {self.stream_key[:10]}...")
-
-            print("🔧 Шаг 2: Запуск ffmpeg стрима...")
-            ffmpeg_result = self.start_ffmpeg_stream(input_source=input_source)
-
-            if not ffmpeg_result:
-                print("❌ Ошибка запуска ffmpeg")
-                return None
-
-            result = {
-                'success': True,
-                'mode': 'manual',
-                'stream_key': self.stream_key,
-                'rtmp_url': f"{self.rtmp_url}/{self.stream_key}",
-                'ffmpeg_pid': ffmpeg_result.get('process_id'),
-                'message': "Стрим запущен в ручном режиме. "
-                           "Трансляция создается автоматически при подключении потока."
-            }
-
-            print("\n" + "=" * 70)
-            print("🎬 РУЧНОЙ СТРИМ ЗАПУЩЕН!")
-            print("=" * 70)
-            print("⚠️  Трансляция будет создана автоматически")
-            print("   когда YouTube получит видеопоток")
-            print(f"🔑 Stream Key: {result['stream_key']}")
-            print(f"📍 RTMP URL: {result['rtmp_url']}")
-            print("\n📋 Проверьте YouTube Studio:")
-            print("1. Откройте YouTube Studio")
-            print("2. Перейдите в 'Контент' → 'Трансляции'")
-            print("3. Найдите вашу трансляцию")
-            print("=" * 70)
-
-            self.metrics['manual_streams'] += 1
-
-            return result
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка запуска ручного стрима: {e}")
-            print(f"❌ Ошибка: {e}")
+            import traceback
+            print(f"❌ Ошибка запуска трансляции: {e}")
+            traceback.print_exc()
+            logger.error(f"❌ Ошибка запуска трансляции: {e}")
+            self.metrics['errors'].append(str(e))
             return None
-
-    # ==================== УПРАВЛЕНИЕ ====================
-
-    def stop_stream(self) -> bool:
-        """Остановка стрима"""
-        try:
-            print("\n" + "=" * 70)
-            print("🛑 ОСТАНОВКА ТРАНСЛЯЦИИ")
-            print("=" * 70)
-
-            # Останавливаем ffmpeg
-            if self.ffmpeg_process:
-                print("🔧 Остановка ffmpeg...")
-                if self.stop_ffmpeg():
-                    print("✅ FFmpeg остановлен")
-                else:
-                    print("❌ Не удалось остановить ffmpeg")
-
-            # Завершаем трансляцию через API если нужно
-            if self.youtube and self.broadcast_id and self.mode != 'manual':
-                print("🔧 Завершение трансляции через API...")
-                try:
-                    request = self.youtube.liveBroadcasts().transition(
-                        broadcastStatus='complete',
-                        id=self.broadcast_id,
-                        part='status'
-                    )
-                    request.execute()
-                    print("✅ Трансляция завершена через API")
-                except Exception as e:
-                    print(f"⚠️  Не удалось завершить через API: {e}")
-
-            # Сбрасываем состояние
-            self.is_live = False
-            self.broadcast_id = None
-            self.stream_id = None
-
-            print("🎬 Трансляция остановлена")
-            print("=" * 70)
-
-            return True
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка остановки стрима: {e}")
-            return False
-
-    def get_stream_status(self) -> Dict[str, Any]:
-        """Получение статуса стрима"""
-        status = {
-            'is_live': self.is_live,
-            'mode': self.mode,
-            'broadcast_id': self.broadcast_id,
-            'stream_id': self.stream_id,
-            'stream_key': self.stream_key[:10] + '...' if self.stream_key and len(
-                self.stream_key) > 10 else self.stream_key,
-            'rtmp_url': f"{self.rtmp_url}/{self.stream_key}" if self.stream_key else None,
-            'api_connected': self.youtube is not None,
-            'ffmpeg_running': self.ffmpeg_process is not None and self.ffmpeg_process.poll() is None,
-            'timestamp': datetime.now().isoformat()
-        }
-
-        if self.broadcast_id:
-            status['watch_url'] = f"https://youtube.com/watch?v={self.broadcast_id}"
-
-        return status
 
     def get_metrics(self) -> Dict[str, Any]:
         """Получение метрик работы"""
         return {
             **self.metrics,
             'timestamp': datetime.now().isoformat(),
-            'current_status': self.get_stream_status()
+            'is_live': self.is_live,
+            'current_broadcast': self.broadcast_id,
+            'current_stream': self.stream_id,
+            'stream_key': self.stream_key,
+            'rtmp_url': self.rtmp_url,
+            'authenticated': self.youtube is not None
         }
-
-    def cleanup(self):
-        """Очистка ресурсов"""
-        try:
-            self.stop_stream()
-            if self.ffmpeg_monitor_thread and self.ffmpeg_monitor_thread.is_alive():
-                self.ffmpeg_monitor_thread.join(timeout=2)
-        except Exception as e:
-            logger.error(f"Ошибка при cleanup: {e}")
-
-    def __del__(self):
-        """Деструктор"""
-        self.cleanup()
 
 
 # ========== FFMPEG STREAM MANAGER с ПАЙПАМИ ==========
@@ -2507,36 +2172,21 @@ youtube_oauth = None
 if YOUTUBE_OAUTH_AVAILABLE:
     try:
         print(f"\n🔧 Инициализация YouTube OAuth...")
-        youtube_oauth = None  # Инициализируем переменную
-
-        # Создаем экземпляр класса
-        youtube_oauth = YouTubeOAuthStream(mode='auto')
+        youtube_oauth = YouTubeOAuthStream()
 
         # Пробуем загрузить сохраненные токены
         if youtube_oauth.load_credentials():
             print("✅ YouTube OAuth: Токены загружены, аутентифицирован")
-            # Проверяем доступ к API
-            if youtube_oauth.test_api_access():
-                print("✅ YouTube API доступен")
-            else:
-                print("⚠️ YouTube API недоступен, будет использован ручной режим")
         else:
             print("ℹ️ YouTube OAuth: Требуется авторизация")
-            print("📋 Для авторизации используйте:")
-            print("1. Получить URL: auth_url = youtube_oauth.get_auth_url()")
-            print("2. Открыть URL в браузере")
-            print("3. Получить код из redirect URL")
-            print("4. Аутентифицироваться: youtube_oauth.authenticate_with_code(code)")
 
     except Exception as e:
         print(f"❌ Ошибка инициализации YouTube OAuth: {e}")
         import traceback
-
         traceback.print_exc()
-        youtube_oauth = None  # Убедитесь, что переменная установлена в None при ошибке
+        youtube_oauth = None
 else:
     print("ℹ️ YouTube OAuth не будет использоваться")
-    youtube_oauth = None  # Явно устанавливаем None
 
 
 # ========== АСИНХРОННЫЙ ЦИКЛ ==========
@@ -2650,222 +2300,6 @@ def oauth_callback():
         """
 
 
-
-
-
-@app.route('/api/set_youtube_stream_key', methods=['POST'])
-def set_youtube_stream_key():
-    """Установка ручного stream key для YouTube"""
-    try:
-        if not youtube_oauth:
-            return jsonify({
-                'status': 'error',
-                'message': 'YouTube OAuth не настроен'
-            }), 501
-
-        # Получаем параметры
-        if request.is_json:
-            data = request.get_json()
-        else:
-            data = request.form
-
-        stream_key = data.get('stream_key', '').strip()
-        if not stream_key:
-            return jsonify({
-                'status': 'error',
-                'message': 'Stream key не указан'
-            }), 400
-
-        # Устанавливаем ручной stream key
-        youtube_oauth.set_manual_stream_key(stream_key)
-
-        # Также устанавливаем в FFmpeg менеджере
-        if hasattr(ffmpeg_manager, 'set_stream_key'):
-            ffmpeg_manager.set_stream_key(stream_key)
-
-        logger.info(f"🔑 Установлен ручной Stream Key: {stream_key[:10]}...")
-
-        return jsonify({
-            'status': 'success',
-            'message': 'Stream key установлен',
-            'stream_key_masked': stream_key[:10] + '...' if len(stream_key) > 10 else stream_key,
-            'mode': 'manual'
-        })
-
-    except Exception as e:
-        logger.error(f"Ошибка установки stream key: {e}", exc_info=True)
-        return jsonify({
-            'status': 'error',
-            'message': f'Ошибка установки stream key: {str(e)}'
-        }), 500
-
-@app.route('/api/start_youtube_manual_stream', methods=['POST'])
-def start_youtube_manual_stream():
-    from flask import request, jsonify
-    """Запуск стрима в ручном режиме через stream key с возвратом watch_url"""
-    try:
-        if not youtube_oauth:
-            return jsonify({
-                'status': 'error',
-                'message': 'YouTube OAuth не инициализирован'
-            }), 501
-
-        # Получаем параметры
-        if request.is_json:
-            data = request.get_json()
-        else:
-            data = request.form
-
-        # Обязательные параметры
-        stream_key = data.get('stream_key', '').strip()
-        if not stream_key:
-            return jsonify({
-                'status': 'error',
-                'message': 'Stream key обязателен для ручного режима'
-            }), 400
-
-        title = data.get('title', "🤖 AI Agents Live: Научные дебаты ИИ")
-        input_source = data.get('input_source',
-                                ffmpeg_manager.get_video_source() if hasattr(ffmpeg_manager, 'get_video_source')
-                                else 'input.mp4')
-
-        # Дополнительные параметры
-        video_bitrate = data.get('video_bitrate', '3000k')
-        audio_bitrate = data.get('audio_bitrate', '160k')
-        framerate = data.get('framerate', '30')
-        resolution = data.get('resolution', '1920x1080')
-
-        # Получаем broadcast_id если указан (для watch_url)
-        broadcast_id = data.get('broadcast_id', '').strip()
-
-        logger.info(f"🎬 Запуск YouTube стрима (ручной режим): {title}")
-        logger.info(f"🔑 Stream Key: {stream_key[:10]}...")
-
-        # Устанавливаем ручной режим и stream key
-        youtube_oauth.set_mode('manual')
-        youtube_oauth.set_manual_stream_key(stream_key)
-
-        # Проверяем, не идет ли уже трансляция
-        status = youtube_oauth.get_stream_status()
-        if status.get('is_live') or status.get('ffmpeg_running'):
-            return jsonify({
-                'status': 'already_running',
-                'message': 'Трансляция уже запущена',
-                'current_status': status
-            })
-
-        # Если FFmpeg менеджер существует, устанавливаем stream key
-        if hasattr(ffmpeg_manager, 'set_stream_key'):
-            ffmpeg_manager.set_stream_key(stream_key)
-
-        # Запускаем ffmpeg стрим
-        ffmpeg_result = youtube_oauth.start_ffmpeg_stream(
-            input_source=input_source,
-            video_bitrate=video_bitrate,
-            audio_bitrate=audio_bitrate,
-            framerate=framerate,
-            resolution=resolution
-        )
-
-        if ffmpeg_result and ffmpeg_result.get('success'):
-            # Пытаемся получить watch_url различными способами
-            watch_url = None
-
-            # Способ 1: Если broadcast_id предоставлен пользователем
-            if broadcast_id:
-                watch_url = f"https://youtube.com/watch?v={broadcast_id}"
-                logger.info(f"📺 Используем предоставленный broadcast_id: {broadcast_id}")
-
-            # Способ 2: Получаем из YouTube API если есть доступ
-            elif youtube_oauth.youtube:
-                try:
-                    # Ищем активные трансляции
-                    request = youtube_oauth.youtube.liveBroadcasts().list(
-                        part='id,snippet',
-                        broadcastStatus='active',
-                        maxResults=1
-                    )
-                    response = request.execute()
-
-                    if 'items' in response and len(response['items']) > 0:
-                        broadcast_id = response['items'][0]['id']
-                        watch_url = f"https://youtube.com/watch?v={broadcast_id}"
-                        logger.info(f"📺 Найдена активная трансляция: {broadcast_id}")
-                except Exception as api_error:
-                    logger.warning(f"Не удалось получить broadcast_id из API: {api_error}")
-
-            # Способ 3: Мониторим YouTube Studio через браузерное расширение (симуляция)
-            if not watch_url:
-                # Генерируем временный ID для отслеживания
-                import hashlib
-                import time
-                temp_id = hashlib.md5(f"{stream_key}_{int(time.time())}".encode()).hexdigest()[:11]
-
-                # В реальном приложении здесь можно:
-                # 1. Использовать YouTube Data API для поиска
-                # 2. Парсить YouTube Studio
-                # 3. Использовать Selenium для автоматизации
-
-                watch_url = None  # В ручном режиме без API нельзя получить точный watch_url
-
-                logger.info("⚠️  Для получения watch_url в ручном режиме:")
-                logger.info("   1. Проверьте YouTube Studio через 1-2 минуты")
-                logger.info("   2. Скопируйте ссылку из 'Контент' → 'Трансляции'")
-                logger.info("   3. Или используйте YouTube API режим для автоматического получения")
-
-            # Формируем полный ответ
-            response_data = {
-                'status': 'started',
-                'message': 'Ручной стрим запущен успешно',
-                'mode': 'manual',
-                'stream_key_masked': stream_key[:10] + '...' if len(stream_key) > 10 else stream_key,
-                'stream_key_full': stream_key,  # Только для отладки
-                'rtmp_url': f"rtmp://a.rtmp.youtube.com/live2/{stream_key}",
-                'full_rtmp_url': ffmpeg_result.get('rtmp_url'),
-                'ffmpeg_pid': ffmpeg_result.get('process_id'),
-                'ffmpeg_status': 'running',
-                'youtube_status': youtube_oauth.get_stream_status(),
-                'watch_url': watch_url,
-                'broadcast_id': broadcast_id if broadcast_id else None,
-                'instructions': [
-                    '🎬 РУЧНОЙ РЕЖИМ ЗАПУЩЕН',
-                    f'🔑 Stream Key: {stream_key}',
-                    f'📍 RTMP URL: rtmp://a.rtmp.youtube.com/live2/{stream_key}',
-                    '',
-                    '📋 ПОЛУЧЕНИЕ ССЫЛКИ НА ТРАНСЛЯЦИЮ:',
-                    '1. Подождите 1-2 минуты пока YouTube получит поток',
-                    '2. Откройте YouTube Studio',
-                    '3. Перейдите в "Контент" → "Трансляции"',
-                    '4. Найдите вашу активную трансляцию',
-                    '5. Скопируйте ссылку на трансляцию',
-                    '',
-                    '📱 АЛЬТЕРНАТИВНЫЕ СПОСОБЫ:',
-                    f'• Используйте прямой URL: https://youtube.com/live/{stream_key} (может не работать)',
-                    '• Используйте YouTube API режим для автоматического получения ссылки'
-                ]
-            }
-
-            # Если есть watch_url, добавляем в инструкции
-            if watch_url:
-                response_data['instructions'].insert(4, f'📺 Ссылка на трансляцию: {watch_url}')
-                response_data['instructions'].insert(5, '')
-
-            return jsonify(response_data)
-        else:
-            error_msg = ffmpeg_result.get('message',
-                                          'Неизвестная ошибка') if ffmpeg_result else 'Не удалось запустить FFmpeg'
-            return jsonify({
-                'status': 'error',
-                'message': f'Ошибка запуска FFmpeg: {error_msg}'
-            }), 500
-
-    except Exception as e:
-        logger.error(f"Ошибка запуска ручного YouTube стрима: {e}", exc_info=True)
-        return jsonify({
-            'status': 'error',
-            'message': f'Внутренняя ошибка сервера: {str(e)}'
-        }), 500
-
 @app.route('/api/start_youtube_oauth_stream', methods=['POST'])
 def start_youtube_oauth_stream():
     """Запуск стрима через YouTube OAuth API"""
@@ -2906,11 +2340,11 @@ def start_youtube_oauth_stream():
         logger.info(f"🎬 Запуск YouTube стрима через OAuth: {title}")
 
         # Создаем трансляцию через YouTube API
-        result = youtube_oauth.start_stream(
+        result = youtube_oauth.start_full_stream(
             title=title,
             description=description,
             privacy_status=privacy_status,
-            use_api = True
+            resolution=resolution
         )
 
         if result and result.get('success'):

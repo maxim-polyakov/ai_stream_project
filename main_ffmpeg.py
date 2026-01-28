@@ -530,15 +530,78 @@ class YouTubeOAuthStream:
             self.metrics['errors'].append(str(e))
             return False
 
+    def get_broadcast_info(self, broadcast_id: str) -> Optional[Dict[str, Any]]:
+        """Получение информации о трансляции"""
+        try:
+            request = self.youtube.liveBroadcasts().list(
+                part="id,snippet,status,contentDetails",
+                id=broadcast_id,
+                maxResults=1
+            )
+            response = request.execute()
+
+            if response.get('items'):
+                return response['items'][0]
+            return None
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения информации о трансляции: {e}")
+            return None
+
+    def cleanup_old_broadcasts(self, max_age_hours: int = 24) -> int:
+        """
+        Удаление старых трансляций для освобождения лимитов
+        Возвращает количество удаленных трансляций
+        """
+        try:
+            # Получаем все трансляции
+            request = self.youtube.liveBroadcasts().list(
+                part="id,snippet,status",
+                mine=True,
+                maxResults=50
+            )
+            response = request.execute()
+
+            deleted_count = 0
+            now = datetime.now()
+
+            for broadcast in response.get('items', []):
+                created_str = broadcast['snippet']['publishedAt']
+                created = datetime.fromisoformat(created_str.replace('Z', '+00:00'))
+
+                # Проверяем возраст трансляции
+                age_hours = (now - created).total_seconds() / 3600
+
+                if age_hours > max_age_hours:
+                    # Удаляем старую трансляцию
+                    delete_request = self.youtube.liveBroadcasts().delete(
+                        id=broadcast['id']
+                    )
+                    delete_request.execute()
+                    deleted_count += 1
+                    logger.info(f"🗑️ Удалена старая трансляция: {broadcast['id']}")
+
+                    # Задержка между удалениями
+                    time.sleep(1)
+
+            if deleted_count > 0:
+                logger.info(f"✅ Удалено {deleted_count} старых трансляций")
+
+            return deleted_count
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка очистки старых трансляций: {e}")
+            return 0
+        
     def start_full_stream(
             self,
             title: str,
             description: str = "",
             privacy_status: str = "unlisted",
-            resolution: str = "1080p"
+            resolution: str = "1080p",
+            delay_between_steps: bool = True
     ) -> Optional[Dict[str, Any]]:
         """
-        Полный процесс запуска трансляции через OAuth
+        Полный процесс запуска трансляции через OAuth с защитой от rate limits
         """
         try:
             print("\n" + "=" * 70)
@@ -554,6 +617,10 @@ class YouTubeOAuthStream:
                     return None
             print("✅ Аутентификация успешна")
 
+            # Задержка перед следующей операцией
+            if delay_between_steps:
+                time.sleep(2)
+
             # 2. Создание трансляции
             print("🔧 Шаг 2: Создание трансляции...")
             broadcast = self.create_live_broadcast(
@@ -567,6 +634,11 @@ class YouTubeOAuthStream:
                 return None
             print(f"✅ Трансляция создана: {self.broadcast_id}")
 
+            # Критически важная задержка! YouTube не любит быстрые последовательные запросы
+            if delay_between_steps:
+                print("⏳ Ждем 5 секунд перед созданием потока...")
+                time.sleep(5)
+
             # 3. Создание потока
             print("🔧 Шаг 3: Создание потока...")
             stream_info = self.create_stream(
@@ -579,6 +651,11 @@ class YouTubeOAuthStream:
                 return None
             print(f"✅ Поток создан: {self.stream_id}")
 
+            # Еще одна задержка перед привязкой
+            if delay_between_steps:
+                print("⏳ Ждем 3 секунды перед привязкой...")
+                time.sleep(3)
+
             # 4. Привязка
             print("🔧 Шаг 4: Привязка трансляции к потоку...")
             if not self.bind_broadcast_to_stream():
@@ -586,10 +663,20 @@ class YouTubeOAuthStream:
                 return None
             print("✅ Трансляция привязана к потоку")
 
-            # 5. ПЕРЕДАЕМ УПРАВЛЕНИЕ FFMPEG
-            print("🔧 Шаг 5: Запуск FFmpeg стрима...")
-            # Здесь мы НЕ запускаем трансляцию через API
-            # Ждем, пока FFmpeg подключится к YouTube
+            # 5. Получаем полную информацию о трансляции
+            print("🔧 Шаг 5: Получение информации о трансляции...")
+            if delay_between_steps:
+                time.sleep(2)
+
+            broadcast_info = self.get_broadcast_info(self.broadcast_id)
+
+            # 6. Проверяем статус и ждем, если нужно
+            if broadcast_info and broadcast_info.get('status', {}).get('lifeCycleStatus') == 'ready':
+                print("✅ Трансляция в статусе 'ready' - можно начинать стриминг")
+            else:
+                print("⚠️  Трансляция создана, но статус не 'ready'")
+                print("⏳ Ждем 10 секунд для инициализации...")
+                time.sleep(10)
 
             result = {
                 'success': True,
@@ -598,19 +685,44 @@ class YouTubeOAuthStream:
                 'watch_url': f"https://youtube.com/watch?v={self.broadcast_id}",
                 'stream_key': stream_info['stream_key'],
                 'rtmp_url': stream_info['rtmp_url'],
-                'message': "Трансляция создана, запустите FFmpeg для начала стрима. Трансляция автоматически начнется когда YouTube получит поток."
+                'ingestion_info': {
+                    'rtmp_url': stream_info['rtmp_url'],
+                    'stream_name': stream_info['stream_key']
+                },
+                'message': "Трансляция создана, запустите FFmpeg для начала стрима. Трансляция автоматически начнется когда YouTube получит поток.",
+                'broadcast_info': broadcast_info
             }
 
             print("\n" + "=" * 70)
             print("🎬 YOUTUBE ТРАНСЛЯЦИЯ ГОТОВА К ЗАПУСКУ!")
             print("=" * 70)
-            print(f"📺 Ссылка: {result['watch_url']}")
+            print(f"📺 Ссылка для просмотра: {result['watch_url']}")
             print(f"🔑 Stream Key: {result['stream_key']}")
             print(f"📍 RTMP URL: {result['rtmp_url']}")
-            print("\n⚠️  Важно: Трансляция автоматически начнется")
-            print("когда YouTube получит видеопоток от FFmpeg.")
-            print("Обычно это занимает 30-60 секунд.")
+
+            # Дополнительная информация о лимитах
+            print("\n" + "=" * 70)
+            print("⚠️  ВАЖНАЯ ИНФОРМАЦИЯ О ЛИМИТАХ YOUTUBE:")
             print("=" * 70)
+            print("1. YouTube API имеет строгие лимиты на частоту запросов")
+            print("2. Не создавайте больше 1 трансляции в 2 минуты")
+            print("3. При ошибке 'rate limit' ждите 5-10 минут")
+            print("4. Максимум 50 активных/запланированных трансляций на канал")
+            print("5. Новые каналы имеют более строгие лимиты")
+
+            # Добавляем подсказку для пользователя
+            print("\n💡 СОВЕТ: Если получаете ошибку 'rate limit':")
+            print("   - Подождите 10-15 минут")
+            print("   - Удалите ненужные запланированные трансляции")
+            print("   - Используйте 'unlisted' вместо 'public' для тестов")
+            print("   - Создавайте трансляции заранее (1-2 раза в день)")
+            print("=" * 70)
+
+            # Логируем метрики
+            logger.info(f"📊 Трансляция создана успешно. Всего создано: {self.metrics['broadcasts_created']}")
+
+            # Очищаем счетчик ошибок rate limit после успешного создания
+            self.rate_limit_errors = 0
 
             return result
 

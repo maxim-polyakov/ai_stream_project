@@ -503,9 +503,9 @@ class EdgeTTSManager:
 
         self.voice_map = {
             'male_ru': 'ru-RU-DmitryNeural',
-            'male_ru_deep': 'ru-RU-DmitryNeural',
+            'male_ru_deep': 'ru-RU-EkaterinaRUS',
             'female_ru': 'ru-RU-SvetlanaNeural',
-            'female_ru_soft': 'ru-RU-DariyaNeural'
+            'female_ru_soft': 'ru-RU-Polina-Apollo'
         }
 
         # Инициализация pygame для локального воспроизведения

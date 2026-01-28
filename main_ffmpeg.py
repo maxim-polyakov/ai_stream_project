@@ -2649,6 +2649,106 @@ def oauth_callback():
         """
 
 
+@app.route('/api/start_youtube_manual_stream', methods=['POST'])
+def start_youtube_manual_stream():
+    """Запуск стрима в ручном режиме через stream key"""
+    try:
+        if not youtube_oauth:
+            return jsonify({
+                'status': 'error',
+                'message': 'YouTube OAuth не инициализирован'
+            }), 501
+
+        # Получаем параметры
+        if request.is_json:
+            data = request.get_json()
+        else:
+            data = request.form
+
+        # Обязательные параметры
+        stream_key = data.get('stream_key', '').strip()
+        if not stream_key:
+            return jsonify({
+                'status': 'error',
+                'message': 'Stream key обязателен для ручного режима'
+            }), 400
+
+        title = data.get('title', "🤖 AI Agents Live: Научные дебаты ИИ")
+        input_source = data.get('input_source',
+                                ffmpeg_manager.get_video_source() if hasattr(ffmpeg_manager, 'get_video_source')
+                                else 'input.mp4')
+
+        # Дополнительные параметры
+        video_bitrate = data.get('video_bitrate', '3000k')
+        audio_bitrate = data.get('audio_bitrate', '160k')
+        framerate = data.get('framerate', '30')
+        resolution = data.get('resolution', '1920x1080')
+
+        logger.info(f"🎬 Запуск YouTube стрима (ручной режим): {title}")
+        logger.info(f"🔑 Stream Key: {stream_key[:10]}...")
+
+        # Устанавливаем ручной режим и stream key
+        youtube_oauth.set_mode('manual')
+        youtube_oauth.set_manual_stream_key(stream_key)
+
+        # Проверяем, не идет ли уже трансляция
+        status = youtube_oauth.get_stream_status()
+        if status.get('is_live') or status.get('ffmpeg_running'):
+            return jsonify({
+                'status': 'already_running',
+                'message': 'Трансляция уже запущена',
+                'current_status': status
+            })
+
+        # Если FFmpeg менеджер существует, устанавливаем stream key
+        if hasattr(ffmpeg_manager, 'set_stream_key'):
+            ffmpeg_manager.set_stream_key(stream_key)
+
+        # Запускаем ffmpeg стрим
+        ffmpeg_result = youtube_oauth.start_ffmpeg_stream(
+            input_source=input_source,
+            video_bitrate=video_bitrate,
+            audio_bitrate=audio_bitrate,
+            framerate=framerate,
+            resolution=resolution
+        )
+
+        if ffmpeg_result and ffmpeg_result.get('success'):
+            # Получаем обновленный статус
+            status = youtube_oauth.get_stream_status()
+
+            return jsonify({
+                'status': 'started',
+                'message': 'Ручной стрим запущен успешно',
+                'mode': 'manual',
+                'stream_key_masked': stream_key[:10] + '...' if len(stream_key) > 10 else stream_key,
+                'rtmp_url': f"rtmp://a.rtmp.youtube.com/live2/{stream_key}",
+                'full_rtmp_url': ffmpeg_result.get('rtmp_url'),
+                'ffmpeg_pid': ffmpeg_result.get('process_id'),
+                'ffmpeg_status': 'running',
+                'youtube_status': status,
+                'instructions': [
+                    '1. Стрим запущен в ручном режиме',
+                    '2. YouTube автоматически создаст трансляцию при получении потока',
+                    '3. Проверьте YouTube Studio через 1-2 минуты',
+                    '4. Ссылка на трансляцию появится в YouTube Studio'
+                ]
+            })
+        else:
+            error_msg = ffmpeg_result.get('message',
+                                          'Неизвестная ошибка') if ffmpeg_result else 'Не удалось запустить FFmpeg'
+            return jsonify({
+                'status': 'error',
+                'message': f'Ошибка запуска FFmpeg: {error_msg}'
+            }), 500
+
+    except Exception as e:
+        logger.error(f"Ошибка запуска ручного YouTube стрима: {e}", exc_info=True)
+        return jsonify({
+            'status': 'error',
+            'message': f'Внутренняя ошибка сервера: {str(e)}'
+        }), 500
+    
 @app.route('/api/set_youtube_stream_key', methods=['POST'])
 def set_youtube_stream_key():
     """Установка ручного stream key для YouTube"""

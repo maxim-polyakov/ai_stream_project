@@ -1275,88 +1275,116 @@ class EdgeTTSManager:
         logger.info("Edge TTS Manager инициализирован")
 
     async def _stream_audio_to_ffmpeg(self, audio_file: str) -> bool:
-        """Отправка аудио файла в FFmpeg стрим"""
+        """Отправка аудио файла в FFmpeg стрим через отдельный процесс"""
         try:
             if not self.ffmpeg_manager or not self.ffmpeg_manager.is_streaming:
+                logger.warning("⚠️ Стрим не активен")
+                return False
+
+            if not self.ffmpeg_manager.rtmp_url:
+                logger.error("❌ RTMP URL не установлен")
                 return False
 
             # Получаем длительность аудио
             duration = self._get_audio_duration(audio_file)
-            logger.debug(f"⏱️  Длительность аудио: {duration:.2f} сек")
+            logger.info(f"🎵 Стриминг аудио: {os.path.basename(audio_file)} ({duration:.1f} сек)")
 
-            # Используем ffmpeg для конвертации и отправки аудио
+            # Ключевое изменение: используем отдельный FFmpeg процесс
+            # который подключается к тому же RTMP URL
             ffmpeg_cmd = [
                 'ffmpeg',
-                '-re',  # Реальное время (важно для синхронизации!)
-                '-i', audio_file,
-                '-f', 's16le',  # Сырое аудио
-                '-ar', '44100',
-                '-ac', '2',
-                '-'
+                '-re',  # КРИТИЧЕСКИ ВАЖНО: реальное время
+                '-i', audio_file,  # Входной аудио файл
+                '-c:a', 'aac',  # Кодек аудио
+                '-b:a', '128k',  # Битрейт
+                '-ar', '44100',  # Частота дискретизации
+                '-ac', '2',  # Стерео
+                '-vn',  # Без видео (только аудио)
+                '-f', 'flv',  # Формат вывода FLV
+                self.ffmpeg_manager.rtmp_url  # Отправляем на тот же RTMP URL
             ]
 
-            logger.debug(f"Запускаем ffmpeg для аудио: {' '.join(ffmpeg_cmd[:5])}...")
+            logger.debug(f"Аудио команда FFmpeg: {' '.join(ffmpeg_cmd)}")
 
-            # Запускаем процесс
+            # Запускаем асинхронный процесс
             process = await asyncio.create_subprocess_exec(
                 *ffmpeg_cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
 
-            # Читаем и отправляем аудио данные
-            total_bytes = 0
-            chunk_size = 88200  # 0.5 секунды аудио (44100 Гц * 2 канала * 2 байта)
-
-            while True:
-                try:
-                    # Читаем порцию аудио
-                    audio_data = await process.stdout.read(chunk_size)
-                    if not audio_data:
+            # Запускаем задачи для мониторинга вывода
+            async def monitor_stderr():
+                """Мониторинг ошибок"""
+                error_messages = []
+                while True:
+                    line = await process.stderr.readline()
+                    if not line:
                         break
 
-                    total_bytes += len(audio_data)
+                    line_str = line.decode('utf-8', errors='ignore').strip()
+                    if line_str:
+                        if 'error' in line_str.lower() or 'fail' in line_str.lower():
+                            logger.error(f"FFmpeg аудио: {line_str}")
+                            error_messages.append(line_str)
+                        elif 'frame=' in line_str or 'size=' in line_str:
+                            # Пропускаем обычные сообщения о прогрессе
+                            pass
+                        else:
+                            logger.debug(f"FFmpeg аудио: {line_str}")
 
-                    # Отправляем в FFmpeg stdin
-                    if self.ffmpeg_manager.ffmpeg_stdin:
-                        try:
-                            # Нужно выполнить в отдельном потоке, так как stdin не асинхронный
-                            await asyncio.get_event_loop().run_in_executor(
-                                None,
-                                lambda: self.ffmpeg_manager.ffmpeg_stdin.write(audio_data)
-                            )
-                            # Не flush слишком часто, это может замедлить
-                            if total_bytes % (chunk_size * 10) == 0:
-                                await asyncio.get_event_loop().run_in_executor(
-                                    None,
-                                    self.ffmpeg_manager.ffmpeg_stdin.flush
-                                )
-                        except (BrokenPipeError, OSError) as e:
-                            logger.error(f"❌ Ошибка записи в FFmpeg stdin: {e}")
-                            break
+                return error_messages
 
-                except Exception as e:
-                    logger.error(f"❌ Ошибка чтения аудио: {e}")
-                    break
-
-            # Ждем завершения процесса
-            await process.wait()
-
-            # Финальный flush
-            if self.ffmpeg_manager.ffmpeg_stdin:
+            async def wait_with_timeout(timeout: float):
+                """Ожидание с таймаутом"""
                 try:
-                    await asyncio.get_event_loop().run_in_executor(
-                        None,
-                        self.ffmpeg_manager.ffmpeg_stdin.flush
-                    )
+                    await asyncio.wait_for(process.wait(), timeout)
+                    return True
+                except asyncio.TimeoutError:
+                    return False
+
+            # Мониторим ошибки в фоне
+            monitor_task = asyncio.create_task(monitor_stderr())
+
+            # Ждем завершения процесса с таймаутом
+            timeout = duration + 10  # Длительность + 10 секунд запас
+            completed = await wait_with_timeout(timeout)
+
+            # Получаем ошибки
+            error_messages = await monitor_task
+
+            if completed:
+                # Процесс завершился
+                returncode = process.returncode
+                if returncode == 0:
+                    logger.info(f"✅ Аудио успешно отправлено в стрим")
+                    return True
+                else:
+                    logger.error(f"❌ FFmpeg завершился с кодом {returncode}")
+                    if error_messages:
+                        logger.error(f"Последние ошибки: {'; '.join(error_messages[-3:])}")
+                    return False
+            else:
+                # Таймаут - завершаем процесс
+                logger.warning(f"⚠️ Таймаут ({timeout} сек), завершаю аудио процесс...")
+                try:
+                    process.terminate()
+                    await asyncio.wait_for(process.wait(), 5)
                 except:
-                    pass
+                    try:
+                        process.kill()
+                        await process.wait()
+                    except:
+                        pass
 
-            logger.debug(f"📊 Отправлено {total_bytes} байт аудио")
-            return True
+                logger.error("❌ Аудио процесс не завершился вовремя")
+                return False
 
+        except FileNotFoundError:
+            logger.error("❌ FFmpeg не найден. Установите FFmpeg и добавьте в PATH")
+            return False
         except Exception as e:
-            logger.error(f"❌ Ошибка стриминга аудио в FFmpeg: {e}", exc_info=True)
+            logger.error(f"❌ Ошибка стриминга аудио: {e}", exc_info=True)
             return False
 
     async def text_to_speech_and_stream(self, text: str, voice_id: str = 'male_ru', agent_name: str = "") -> Optional[

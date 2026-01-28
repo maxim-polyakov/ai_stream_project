@@ -677,7 +677,7 @@ class FFmpegStreamManager:
         """Запуск FFmpeg стрима с передачей аудио"""
         if not self.stream_key:
             logger.error("❌ Stream Key не установлен!")
-            return False
+            return {'success': False, 'error': 'Stream Key не установлен'}
 
         try:
             self.start_time = time.time()
@@ -771,11 +771,11 @@ class FFmpegStreamManager:
                 threading.Thread(target=self._audio_processor, daemon=True).start()
 
             logger.info(f"🎬 FFmpeg стрим запущен (PID: {self.ffmpeg_pid})")
-            return True
+            return {'success': True, 'pid': self.ffmpeg_pid, 'message': 'Стрим запущен'}
 
         except Exception as e:
             logger.error(f"❌ Ошибка запуска FFmpeg: {e}", exc_info=True)
-            return False
+            return {'success': False, 'error': str(e)}
 
     def _monitor_ffmpeg(self):
         """Мониторинг процесса FFmpeg"""

@@ -673,66 +673,62 @@ class FFmpegStreamManager:
         self.video_param = source_param
         logger.info(f"📹 Источник видео: {source_type}")
 
-    def stream_audio_pipe(self, audio_file: str) -> bool:
-        """Отправка аудио через pipe в работающий FFmpeg процесс"""
+    def stream_audio_pipe_safe(self, audio_file: str) -> bool:
+        """Более надежный метод отправки аудио через конвертацию в WAV"""
         if not self.is_streaming or not self.ffmpeg_stdin:
             logger.error("❌ Стрим не активен или stdin недоступен")
             return False
 
         try:
-            # ВАЖНО: Используем -re для реального времени
-            ffmpeg_convert_cmd = [
+            # Сначала конвертируем MP3 в WAV файл
+            temp_wav = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+            temp_wav.close()
+
+            # Конвертация MP3 -> WAV
+            convert_cmd = [
                 'ffmpeg',
-                '-re',  # Реальное время - важно!
-                '-i', audio_file,  # Входной MP3 файл
-                '-f', 's16le',  # Формат выхода
-                '-ar', '44100',  # Частота дискретизации
-                '-ac', '2',  # Стерео
-                '-acodec', 'pcm_s16le',  # Кодек PCM
-                '-bufsize', '64k',  # Маленький буфер для реального времени
-                '-'  # Вывод в stdout
+                '-i', audio_file,
+                '-acodec', 'pcm_s16le',
+                '-ar', '44100',
+                '-ac', '2',
+                '-y',  # Перезаписать
+                temp_wav.name
             ]
 
-            logger.info(f"🎵 Отправка аудио в стрим: {os.path.basename(audio_file)}")
+            logger.info(f"🔄 Конвертация MP3 в WAV: {os.path.basename(audio_file)}")
 
-            # Запускаем конвертер с буферизацией в 0
-            converter = subprocess.Popen(
-                ffmpeg_convert_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=0,  # НЕ буферизируем!
-                text=False
-            )
+            result = subprocess.run(convert_cmd, capture_output=True, text=True, timeout=10)
 
-            # Запускаем чтение stderr в отдельном потоке (чтобы избежать deadlock)
-            stderr_data = []
+            if result.returncode != 0:
+                logger.error(f"❌ Ошибка конвертации в WAV: {result.stderr[:200]}")
+                os.unlink(temp_wav.name)
+                return False
 
-            def read_stderr():
+            # Теперь читаем WAV файл и отправляем сырые PCM данные
+            wav_file_size = os.path.getsize(temp_wav.name)
+
+            # В WAV файле первые 44 байта - заголовок
+            header_size = 44
+
+            logger.info(f"📤 Отправка WAV аудио: {os.path.basename(audio_file)} ({wav_file_size} байт)")
+
+            with open(temp_wav.name, 'rb') as wav_file:
+                # Пропускаем заголовок WAV
+                wav_file.seek(header_size)
+
+                chunk_size = 88200  # 0.5 секунды аудио
+                total_sent = 0
+
                 while True:
-                    line = converter.stderr.readline()
-                    if not line:
-                        break
-                    stderr_data.append(line.decode('utf-8', errors='ignore'))
-
-            stderr_thread = threading.Thread(target=read_stderr, daemon=True)
-            stderr_thread.start()
-
-            # Читаем данные порциями и отправляем
-            chunk_size = 88200  # 0.5 секунды аудио (44100 * 2 * 2)
-            total_sent = 0
-
-            try:
-                while True:
-                    # Читаем с таймаутом
-                    audio_data = converter.stdout.read(chunk_size)
+                    # Читаем PCM данные
+                    audio_data = wav_file.read(chunk_size)
                     if not audio_data:
-                        break  # Конец данных
+                        break
 
-                    # Проверяем, жив ли основной процесс
-                    if not self.is_streaming or self.stream_process.poll() is not None:
-                        logger.error("❌ Основной FFmpeg процесс завершился")
-                        converter.terminate()
-                        return False
+                    # Проверяем статус основного процесса
+                    if not self.is_streaming:
+                        logger.warning("⚠️ Стрим остановлен во время отправки аудио")
+                        break
 
                     # Отправляем данные
                     try:
@@ -741,37 +737,22 @@ class FFmpegStreamManager:
                         total_sent += len(audio_data)
                     except BrokenPipeError:
                         logger.error("❌ Broken pipe: основной FFmpeg процесс завершился")
-                        converter.terminate()
-                        return False
+                        break
                     except Exception as e:
                         logger.error(f"❌ Ошибка записи аудио: {e}")
-                        converter.terminate()
-                        return False
+                        break
 
-            except Exception as e:
-                logger.error(f"❌ Ошибка чтения данных: {e}")
-                converter.terminate()
-                return False
-            finally:
-                # Завершаем процесс конвертера
-                converter.terminate()
-                converter.wait(timeout=5)
+            # Очистка
+            try:
+                os.unlink(temp_wav.name)
+            except:
+                pass
 
-                if converter.poll() is None:
-                    converter.kill()
-
-            # Проверяем результат
-            return_code = converter.poll()
-            if return_code == 0 or return_code == 255:  # 255 это нормальный выход для ffmpeg при SIGTERM
-                logger.info(f"✅ Аудио успешно отправлено ({total_sent} байт)")
-                return True
-            else:
-                error_output = ''.join(stderr_data[-5:]) if stderr_data else "Нет информации об ошибке"
-                logger.error(f"❌ Ошибка конвертации аудио (код: {return_code}): {error_output}")
-                return False
+            logger.info(f"✅ Аудио отправлено ({total_sent} байт PCM данных)")
+            return total_sent > 0
 
         except Exception as e:
-            logger.error(f"❌ Ошибка stream_audio_pipe: {e}", exc_info=True)
+            logger.error(f"❌ Ошибка stream_audio_pipe_safe: {e}", exc_info=True)
             return False
 
     def start_stream(self, use_audio: bool = True):

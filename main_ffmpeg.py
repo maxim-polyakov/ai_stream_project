@@ -674,87 +674,102 @@ class FFmpegStreamManager:
         logger.info(f"📹 Источник видео: {source_type}")
 
     def start_stream(self, use_audio: bool = True):
-        """Запуск FFmpeg стрима с объединением аудио и видео"""
+        """Запуск FFmpeg стрима с передачей аудио"""
         if not self.stream_key:
             logger.error("❌ Stream Key не установлен!")
             return {'success': False, 'error': 'Stream Key не установлен'}
 
         try:
             self.start_time = time.time()
-            self.rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{self.stream_key}"
 
-            logger.info(f"🎬 Подготовка стрима на: {self.rtmp_url}")
+            # ВАРИАНТ 1: Самый простой рабочий вариант
+            video_input = [
+                '-f', 'lavfi',
+                '-i', 'color=size=1920x1080:rate=30'  # ПРОСТЕЙШАЯ КОМАНДА
+            ]
 
-            # 1. Создаем основной видео источник
-            video_filter = "color=black:size=1920x1080:rate=30"
-            current_time = datetime.now().strftime("%H:%M")
+            # ВАРИАНТ 2: Альтернативный формат (попробуйте если первый не работает)
+            # video_input = [
+            #     '-f', 'lavfi',
+            #     '-i', 'color=c=black:s=1920x1080:r=30'
+            # ]
 
-            # Добавляем текст с текущим временем (опционально)
-            video_filter += f",drawtext=text='AI Stream {current_time}':fontcolor=white:fontsize=24:x=(w-text_w)/2:y=20"
+            # ВАРИАНТ 3: Если lavfi не работает, создаем статическое изображение
+            # if not os.path.exists('static_frame.png'):
+            #     # Создаем статический кадр
+            #     subprocess.run([
+            #         'ffmpeg', '-f', 'lavfi', '-i', 'color=size=1920x1080:rate=1',
+            #         '-frames:v', '1', 'static_frame.png'
+            #     ], capture_output=True)
+            #
+            # video_input = [
+            #     '-loop', '1',
+            #     '-i', 'static_frame.png',
+            #     '-framerate', '30'
+            # ]
 
-            # 2. Создаем сложный фильтр для смешивания аудио
-            # Мы будем использовать amix фильтр для смешивания разных аудио источников
-            complex_filter = f"""
-                [0:v]fps=30,format=yuv420p[video];
-                [1:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[audio1];
-                [2:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[audio2];
-                [audio1][audio2]amix=inputs=2:duration=longest:dropout_transition=0[audio_out]
-            """
+            # Аудио источник - ПРОСТОЙ вариант
+            audio_input = [
+                '-f', 'lavfi',
+                '-i', 'sine=frequency=440'  # Простая синусоида 440Hz
+            ]
 
-            # 3. Команда FFmpeg
+            # Или тишина (комментируйте строку выше и раскомментируйте эту):
+            # audio_input = [
+            #     '-f', 'lavfi',
+            #     '-i', 'anullsrc'
+            # ]
+
+            # ПРОСТАЯ КОМАНДА FFMPEG
             ffmpeg_cmd = [
                 'ffmpeg',
-                '-re',  # Реальное время для видео
-
-                # Видео источник
-                '-f', 'lavfi',
-                '-i', video_filter,
-
-                # Основной аудио источник (тишина)
-                '-f', 'lavfi',
-                '-i', 'anullsrc=r=44100:cl=stereo',
-
-                # Второй аудио источник для TTS (будет подключаться позже)
-                '-f', 'lavfi',
-                '-i', 'anullsrc=r=44100:cl=stereo',
-
-                # Комплексный фильтр для обработки
-                '-filter_complex', complex_filter.strip().replace('\n', ' '),
-
-                # Кодек видео
-                '-map', '[video]',
+                '-re',  # Реальное время
+                *video_input,
+                *audio_input,
                 '-c:v', 'libx264',
                 '-preset', 'veryfast',
-                '-tune', 'zerolatency',
                 '-pix_fmt', 'yuv420p',
+                '-b:v', '3000k',
+                '-maxrate', '3000k',
+                '-bufsize', '6000k',
                 '-g', '60',
-                '-b:v', '4500k',
-                '-maxrate', '4500k',
-                '-bufsize', '9000k',
-                '-r', '30',
-
-                # Кодек аудио
-                '-map', '[audio_out]',
                 '-c:a', 'aac',
                 '-b:a', '128k',
                 '-ar', '44100',
-                '-ac', '2',
-
-                # Формат вывода
                 '-f', 'flv',
-                '-flvflags', 'no_duration_filesize',
                 self.rtmp_url
             ]
 
-            logger.info(f"🚀 Запуск FFmpeg: {' '.join(ffmpeg_cmd[:10])}...")
-            logger.debug(f"Полная команда: {' '.join(ffmpeg_cmd)}")
+            # Выводим команду для отладки
+            cmd_str = ' '.join(ffmpeg_cmd)
+            logger.info(f"🚀 Запуск FFmpeg команды:")
+            logger.info(f"   {cmd_str[:200]}...")
 
-            # Запускаем FFmpeg
+            # Сначала тестируем команду локально
+            logger.info("🔧 Тестирование FFmpeg команды...")
+            test_cmd = ffmpeg_cmd.copy()
+            # Заменяем вывод на тестовый
+            test_cmd[-1] = '-'
+            test_cmd.insert(-1, '-t')
+            test_cmd.insert(-1, '2')
+            test_cmd.insert(-1, '-f')
+            test_cmd.insert(-1, 'null')
+
+            try:
+                result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=15)
+                if result.returncode == 0:
+                    logger.info("✅ Тест FFmpeg успешен")
+                else:
+                    logger.warning(f"⚠️ Тест FFmpeg не прошел: {result.stderr[:300]}")
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось протестировать FFmpeg: {e}")
+
+            # Запускаем реальный стрим
             self.stream_process = subprocess.Popen(
                 ffmpeg_cmd,
-                stdout=subprocess.PIPE,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
-                stdin=subprocess.PIPE,  # Теперь используем stdin
                 text=False,
                 bufsize=0
             )
@@ -762,18 +777,30 @@ class FFmpegStreamManager:
             self.is_streaming = True
             self.ffmpeg_pid = self.stream_process.pid
             self.ffmpeg_stdin = self.stream_process.stdin
-            self.ffmpeg_stdout = self.stream_process.stdout
-            self.ffmpeg_stderr = self.stream_process.stderr
 
             # Запуск мониторинга
             threading.Thread(target=self._monitor_ffmpeg, daemon=True).start()
+
             logger.info(f"🎬 FFmpeg стрим запущен (PID: {self.ffmpeg_pid})")
+
+            # Проверяем через 5 секунд
+            threading.Thread(target=self._check_stream_status, daemon=True).start()
 
             return {'success': True, 'pid': self.ffmpeg_pid, 'message': 'Стрим запущен'}
 
         except Exception as e:
             logger.error(f"❌ Ошибка запуска FFmpeg: {e}", exc_info=True)
             return {'success': False, 'error': str(e)}
+
+    def _check_stream_status(self):
+        """Проверка статуса стрима через 5 секунд"""
+        time.sleep(5)
+        if self.stream_process and self.stream_process.poll() is None:
+            logger.info("✅ Стрим работает стабильно")
+            socketio.emit('stream_connected', {'status': 'streaming'})
+        else:
+            logger.error("❌ Стрим не запустился или завершился")
+
     def _monitor_ffmpeg(self):
         """Мониторинг процесса FFmpeg"""
         try:

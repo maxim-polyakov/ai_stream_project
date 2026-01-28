@@ -1038,6 +1038,18 @@ def handle_request_update():
     })
 
     sys.exit(0)
+
+
+def signal_handler(signum, frame):
+    """Обработчик сигналов"""
+    print(f"\n🛑 Получен сигнал {signum}. Завершение...")
+
+    # Останавливаем стрим
+    if ffmpeg_manager.is_streaming:
+        ffmpeg_manager.stop_stream()
+
+    sys.exit(0)
+    
 if __name__ == '__main__':
     # Инициализируем event loop для дискуссий
     discussion_loop_event_loop = asyncio.new_event_loop()

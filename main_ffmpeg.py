@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 🤖 AI Stream с FFmpeg стримингом на YouTube
-Версия с OAuth 2.0 для YouTube API
+Версия БЕЗ YouTube API - только прямой стрим через stream key
 ЕДИНЫЙ ПРОЦЕСС С ПАЙПАМИ ДЛЯ АУДИО
 """
 
@@ -21,21 +21,18 @@ from flask import Flask, render_template, request, jsonify, redirect, url_for
 from flask_socketio import SocketIO, emit
 import signal
 import shutil
-from urllib.parse import urlencode
-import queue
 import tempfile
 
-discussion_loop_event_loop = None  # <-- Добавить эту строку
+discussion_loop_event_loop = None
 discussion_thread = None
 discussion_loop_task = None
+
 # Проверяем импорты
 try:
     import openai
     import edge_tts
     import pygame
-
     from config import Config
-
     print("✅ Все основные зависимости установлены")
 except ImportError as e:
     print(f"❌ Ошибка импорта: {e}")
@@ -51,24 +48,6 @@ try:
     print("✅ PyAudio доступен для аудио захвата")
 except ImportError:
     print("⚠️ PyAudio не установлен. Аудио захват будет ограничен.")
-    print("📦 Для захвата аудио установите: pip install pyaudio")
-
-# Импорты для YouTube OAuth
-YOUTUBE_OAUTH_AVAILABLE = False
-try:
-    from google_auth_oauthlib.flow import Flow
-    from google.oauth2.credentials import Credentials
-    from google.auth.transport.requests import Request
-    from googleapiclient.discovery import build
-    from googleapiclient.errors import HttpError
-
-    YOUTUBE_OAUTH_AVAILABLE = True
-    print("✅ Google OAuth модули установлены")
-except ImportError as e:
-    print(f"⚠️ Google OAuth модуль не найден: {e}")
-    print("Для YouTube трансляций установите:")
-    print("pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib")
-    YOUTUBE_OAUTH_AVAILABLE = False
 
 # Настройка логирования
 logging.basicConfig(
@@ -96,550 +75,16 @@ socketio = SocketIO(app,
 # Инициализация OpenAI
 if Config.OPENAI_API_KEY:
     from openai import OpenAI
-
     openai_client = OpenAI(api_key=Config.OPENAI_API_KEY)
 else:
     logger.warning("⚠️ OpenAI API ключ не найден. Будут использоваться демо-сообщения.")
     openai_client = None
 
 
-# ========== YOUTUBE OAUTH API ==========
-
-class YouTubeOAuthStream:
-    """Управление YouTube трансляциями через OAuth 2.0"""
-
-    def __init__(self):
-        self.youtube = None
-        self.broadcast_id = None
-        self.stream_id = None
-        self.is_live = False
-        self.credentials = None
-        self.stream_key = None
-        self.rtmp_url = None
-        self.token_file = 'youtube_token.json'
-
-        # Скоупы для YouTube API
-        self.SCOPES = [
-            'https://www.googleapis.com/auth/youtube',
-            'https://www.googleapis.com/auth/youtube.force-ssl',
-            'https://www.googleapis.com/auth/youtube.readonly'
-        ]
-
-        # OAuth настройки
-        self.CLIENT_SECRETS_FILE = 'client_secrets.json'
-        self.REDIRECT_URI = 'http://localhost:5500/oauth2callback'
-
-        # Статистика
-        self.metrics = {
-            'streams_created': 0,
-            'broadcasts_created': 0,
-            'errors': []
-        }
-
-        logger.info("Инициализация YouTube API с OAuth 2.0")
-
-    def get_auth_url(self) -> Optional[str]:
-        """Получение URL для аутентификации через OAuth"""
-        try:
-            if not os.path.exists(self.CLIENT_SECRETS_FILE):
-                logger.error(f"❌ Файл клиента OAuth не найден: {self.CLIENT_SECRETS_FILE}")
-                print(f"❌ Файл клиента OAuth не найден: {self.CLIENT_SECRETS_FILE}")
-                print("📋 Создайте файл client_secrets.json:")
-                print("1. Перейдите в Google Cloud Console")
-                print("2. Создайте OAuth 2.0 Client ID")
-                print("3. Скачайте JSON файл")
-                print("4. Сохраните как 'client_secrets.json'")
-                return None
-
-            flow = Flow.from_client_secrets_file(
-                self.CLIENT_SECRETS_FILE,
-                scopes=self.SCOPES,
-                redirect_uri=self.REDIRECT_URI
-            )
-
-            # Генерируем URL для аутентификации
-            auth_url, _ = flow.authorization_url(
-                access_type='offline',
-                include_granted_scopes='true',
-                prompt='consent'  # Всегда запрашиваем согласие
-            )
-
-            return auth_url
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка получения URL авторизации: {e}")
-            return None
-
-    def authenticate_with_code(self, authorization_code: str) -> bool:
-        """Аутентификация с помощью authorization code"""
-        try:
-            flow = Flow.from_client_secrets_file(
-                self.CLIENT_SECRETS_FILE,
-                scopes=self.SCOPES,
-                redirect_uri=self.REDIRECT_URI
-            )
-
-            # Получаем токен по коду
-            flow.fetch_token(code=authorization_code)
-            credentials = flow.credentials
-
-            # Сохраняем токен
-            self._save_credentials(credentials)
-
-            # Инициализируем API клиент
-            return self._initialize_youtube(credentials)
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка аутентификации с кодом: {e}")
-            return False
-
-    def load_credentials(self) -> bool:
-        """Загрузка сохраненных токенов"""
-        try:
-            if not os.path.exists(self.token_file):
-                return False
-
-            credentials = Credentials.from_authorized_user_file(
-                self.token_file,
-                self.SCOPES
-            )
-
-            # Проверяем, не истек ли токен
-            if credentials and credentials.expired and credentials.refresh_token:
-                credentials.refresh(Request())
-
-            return self._initialize_youtube(credentials)
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка загрузки токенов: {e}")
-            return False
-
-    def _initialize_youtube(self, credentials: Credentials) -> bool:
-        """Инициализация YouTube API клиента"""
-        try:
-            self.credentials = credentials
-            self.youtube = build(
-                'youtube',
-                'v3',
-                credentials=credentials,
-                cache_discovery=False
-            )
-
-            # Сохраняем обновленные токены
-            self._save_credentials(credentials)
-
-            # Проверяем доступ
-            return self.test_api_access()
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка инициализации YouTube API: {e}")
-            return False
-
-    def _save_credentials(self, credentials: Credentials):
-        """Сохранение токенов в файл"""
-        try:
-            token_data = {
-                'token': credentials.token,
-                'refresh_token': credentials.refresh_token,
-                'token_uri': credentials.token_uri,
-                'client_id': credentials.client_id,
-                'client_secret': credentials.client_secret,
-                'scopes': credentials.scopes
-            }
-
-            with open(self.token_file, 'w') as f:
-                json.dump(token_data, f)
-
-            logger.info("✅ Токены сохранены")
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка сохранения токенов: {e}")
-
-    def test_api_access(self) -> bool:
-        """Проверка доступа к YouTube API"""
-        try:
-            # Простой запрос для проверки доступа
-            request = self.youtube.channels().list(
-                part="snippet",
-                mine=True
-            )
-            response = request.execute()
-
-            if 'items' in response and len(response['items']) > 0:
-                channel_info = response['items'][0]['snippet']
-                logger.info(f"✅ Доступ к YouTube API подтвержден")
-                logger.info(f"📺 Канал: {channel_info['title']}")
-                return True
-
-            return False
-
-        except HttpError as e:
-            error_details = json.loads(e.content.decode('utf-8'))
-            logger.error(f"❌ Ошибка YouTube API: {error_details}")
-
-            if e.resp.status == 403:
-                error_message = error_details.get('error', {}).get('message', '')
-                if 'liveStreamingNotEnabled' in error_message:
-                    logger.error("❌ YouTube Live Streaming не включен для этого аккаунта!")
-                    logger.error("📋 Решение:")
-                    logger.error("1. Войдите в YouTube Studio")
-                    logger.error("2. Перейдите в 'Контент' → 'Трансляции'")
-                    logger.error("3. Активируйте функцию live streaming")
-                    logger.error("4. Подтвердите номер телефона")
-                    logger.error("5. Подождите 24 часа")
-
-            return False
-        except Exception as e:
-            logger.error(f"❌ Ошибка проверки доступа: {e}")
-            return False
-
-    def create_live_broadcast(
-            self,
-            title: str,
-            description: str = "",
-            privacy_status: str = "unlisted",
-            scheduled_time: Optional[datetime] = None
-    ) -> Optional[Dict[str, Any]]:
-        """Создание трансляции"""
-        try:
-            if not self.youtube:
-                logger.error("❌ YouTube API не инициализирован")
-                return None
-
-            if not scheduled_time:
-                scheduled_time = datetime.now() + timedelta(minutes=2)
-
-            broadcast_body = {
-                'snippet': {
-                    'title': title,
-                    'description': description,
-                    'scheduledStartTime': scheduled_time.isoformat()
-                },
-                'status': {
-                    'privacyStatus': privacy_status,
-                    'selfDeclaredMadeForKids': False
-                },
-                'contentDetails': {
-                    'enableAutoStart': True,
-                    'enableAutoStop': True,
-                    'enableEmbed': True,
-                    'recordFromStart': True,
-                    'enableDvr': True,
-                    'enableContentEncryption': False,
-                    'enableLowLatency': True,
-                    'projection': 'rectangular',
-                    'stereoLayout': 'mono'
-                }
-            }
-
-            request = self.youtube.liveBroadcasts().insert(
-                part='snippet,status,contentDetails',
-                body=broadcast_body
-            )
-
-            response = request.execute()
-            self.broadcast_id = response['id']
-
-            logger.info(f"📡 Трансляция создана: {self.broadcast_id}")
-            logger.info(f"📺 Заголовок: {title}")
-            logger.info(f"🔒 Статус: {privacy_status}")
-
-            self.metrics['broadcasts_created'] += 1
-
-            return response
-
-        except HttpError as e:
-            error_details = json.loads(e.content.decode('utf-8'))
-            logger.error(f"❌ Ошибка создания трансляции: {error_details}")
-            self.metrics['errors'].append(str(error_details))
-            return None
-        except Exception as e:
-            logger.error(f"❌ Ошибка создания трансляции: {e}")
-            self.metrics['errors'].append(str(e))
-            return None
-
-    def create_stream(
-            self,
-            title: str = "AI Live Stream",
-            resolution: str = "1080p",
-            frame_rate: str = "30fps"
-    ) -> Optional[Dict[str, Any]]:
-        """Создание потока для трансляции"""
-        try:
-            if not self.youtube:
-                logger.error("❌ YouTube API не инициализирован")
-                return None
-
-            stream_body = {
-                'snippet': {
-                    'title': title
-                },
-                'cdn': {
-                    'frameRate': frame_rate,
-                    'ingestionType': 'rtmp',
-                    'resolution': resolution,
-                    'format': ''
-                }
-            }
-
-            request = self.youtube.liveStreams().insert(
-                part='snippet,cdn',
-                body=stream_body
-            )
-
-            response = request.execute()
-            self.stream_id = response['id']
-
-            # Получаем данные для стрима
-            stream_key = response['cdn']['ingestionInfo']['streamName']
-            ingestion_address = response['cdn']['ingestionInfo']['ingestionAddress']
-            self.stream_key = stream_key
-            self.rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
-
-            logger.info(f"🌊 Поток создан: {self.stream_id}")
-            logger.info(f"🔑 Stream Key: {stream_key}")
-            logger.info(f"📍 RTMP URL: {self.rtmp_url}")
-
-            self.metrics['streams_created'] += 1
-
-            return {
-                'stream_id': self.stream_id,
-                'stream_key': stream_key,
-                'ingestion_address': ingestion_address,
-                'rtmp_url': self.rtmp_url,
-                'full_response': response
-            }
-
-        except HttpError as e:
-            error_details = json.loads(e.content.decode('utf-8'))
-            logger.error(f"❌ Ошибка создания потока: {error_details}")
-            self.metrics['errors'].append(str(error_details))
-            return None
-        except Exception as e:
-            logger.error(f"❌ Ошибка создания потока: {e}")
-            self.metrics['errors'].append(str(e))
-            return None
-
-    def bind_broadcast_to_stream(self) -> bool:
-        """Привязка трансляции к потоку"""
-        try:
-            if not self.broadcast_id or not self.stream_id:
-                logger.error("❌ Нет broadcast_id или stream_id")
-                return False
-
-            request = self.youtube.liveBroadcasts().bind(
-                part='id,contentDetails',
-                id=self.broadcast_id,
-                streamId=self.stream_id
-            )
-
-            response = request.execute()
-            logger.info("🔗 Трансляция привязана к потоку")
-            return True
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка привязки: {e}")
-            self.metrics['errors'].append(str(e))
-            return False
-
-    def start_broadcast(self) -> bool:
-        """Начало трансляции"""
-        try:
-            if not self.broadcast_id:
-                logger.error("❌ Нет активной трансляции")
-                return False
-
-            # Сначала проверяем текущий статус трансляции
-            request = self.youtube.liveBroadcasts().list(
-                part='status',
-                id=self.broadcast_id
-            )
-            response = request.execute()
-
-            if 'items' not in response or len(response['items']) == 0:
-                logger.error("❌ Трансляция не найдена")
-                return False
-
-            current_status = response['items'][0]['status']['lifeCycleStatus']
-            logger.info(f"📊 Текущий статус трансляции: {current_status}")
-
-            # Можно переводить в live только из статусов 'ready' или 'testing'
-            if current_status not in ['ready', 'testing']:
-                logger.error(f"❌ Невозможно начать трансляцию из статуса {current_status}")
-                logger.info("ℹ️ Ожидайте 1-2 минуты после создания трансляции")
-                return False
-
-            # Теперь переводим в live
-            request = self.youtube.liveBroadcasts().transition(
-                broadcastStatus='live',
-                id=self.broadcast_id,
-                part='id,snippet,status'
-            )
-
-            response = request.execute()
-            self.is_live = True
-
-            logger.info("🎬 ТРАНСЛЯЦИЯ НАЧАЛАСЬ!")
-            logger.info(f"📺 Ссылка: https://youtube.com/watch?v={self.broadcast_id}")
-
-            return True
-
-        except HttpError as e:
-            error_details = json.loads(e.content.decode('utf-8'))
-            logger.error(f"❌ Ошибка начала трансляции: {error_details}")
-
-            if 'invalidTransition' in str(error_details):
-                logger.info("📋 Возможные причины:")
-                logger.info("1. Трансляция уже идет (status: live)")
-                logger.info("2. Трансляция еще не готова (status: created)")
-                logger.info("3. Не прошло достаточно времени после создания")
-                logger.info("4. Не привязан stream или stream не активен")
-
-            return False
-        except Exception as e:
-            logger.error(f"❌ Ошибка начала трансляции: {e}")
-            return False
-
-    def complete_broadcast(self) -> bool:
-        """Завершение трансляции"""
-        try:
-            if not self.broadcast_id:
-                return True
-
-            request = self.youtube.liveBroadcasts().transition(
-                broadcastStatus='complete',
-                id=self.broadcast_id,
-                part='status'
-            )
-
-            response = request.execute()
-            self.is_live = False
-
-            logger.info("🛑 Трансляция завершена")
-
-            # Очищаем ID
-            self.broadcast_id = None
-            self.stream_id = None
-            self.stream_key = None
-            self.rtmp_url = None
-
-            return True
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка завершения: {e}")
-            self.metrics['errors'].append(str(e))
-            return False
-
-    def start_full_stream(
-            self,
-            title: str,
-            description: str = "",
-            privacy_status: str = "unlisted",
-            resolution: str = "1080p"
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Полный процесс запуска трансляции через OAuth
-        """
-        try:
-            print("\n" + "=" * 70)
-            print("🎬 ЗАПУСК YOUTUBE ТРАНСЛЯЦИИ ЧЕРЕЗ OAUTH")
-            print("=" * 70)
-
-            # 1. Проверяем аутентификацию
-            print("🔧 Шаг 1: Проверка аутентификации...")
-            if not self.youtube:
-                if not self.load_credentials():
-                    print("❌ Не аутентифицирован. Требуется OAuth авторизация")
-                    print("ℹ️ Используйте ручной Stream Key или пройдите OAuth авторизацию")
-                    return None
-            print("✅ Аутентификация успешна")
-
-            # 2. Создание трансляции
-            print("🔧 Шаг 2: Создание трансляции...")
-            broadcast = self.create_live_broadcast(
-                title=title,
-                description=description,
-                privacy_status=privacy_status
-            )
-
-            if not broadcast:
-                print("❌ Не удалось создать трансляцию")
-                return None
-            print(f"✅ Трансляция создана: {self.broadcast_id}")
-
-            # 3. Создание потока
-            print("🔧 Шаг 3: Создание потока...")
-            stream_info = self.create_stream(
-                title=f"Stream for: {title[:50]}",
-                resolution=resolution
-            )
-
-            if not stream_info:
-                print("❌ Не удалось создать поток")
-                return None
-            print(f"✅ Поток создан: {self.stream_id}")
-
-            # 4. Привязка
-            print("🔧 Шаг 4: Привязка трансляции к потоку...")
-            if not self.bind_broadcast_to_stream():
-                print("❌ Не удалось привязать")
-                return None
-            print("✅ Трансляция привязана к потоку")
-
-            # 5. ПЕРЕДАЕМ УПРАВЛЕНИЕ FFMPEG
-            print("🔧 Шаг 5: Запуск FFmpeg стрима...")
-            # Здесь мы НЕ запускаем трансляцию через API
-            # Ждем, пока FFmpeg подключится к YouTube
-
-            result = {
-                'success': True,
-                'broadcast_id': self.broadcast_id,
-                'stream_id': self.stream_id,
-                'watch_url': f"https://youtube.com/watch?v={self.broadcast_id}",
-                'stream_key': stream_info['stream_key'],
-                'rtmp_url': stream_info['rtmp_url'],
-                'message': "Трансляция создана, запустите FFmpeg для начала стрима. Трансляция автоматически начнется когда YouTube получит поток."
-            }
-
-            print("\n" + "=" * 70)
-            print("🎬 YOUTUBE ТРАНСЛЯЦИЯ ГОТОВА К ЗАПУСКУ!")
-            print("=" * 70)
-            print(f"📺 Ссылка: {result['watch_url']}")
-            print(f"🔑 Stream Key: {result['stream_key']}")
-            print(f"📍 RTMP URL: {result['rtmp_url']}")
-            print("\n⚠️  Важно: Трансляция автоматически начнется")
-            print("когда YouTube получит видеопоток от FFmpeg.")
-            print("Обычно это занимает 30-60 секунд.")
-            print("=" * 70)
-
-            return result
-
-        except Exception as e:
-            import traceback
-            print(f"❌ Ошибка запуска трансляции: {e}")
-            traceback.print_exc()
-            logger.error(f"❌ Ошибка запуска трансляции: {e}")
-            self.metrics['errors'].append(str(e))
-            return None
-
-    def get_metrics(self) -> Dict[str, Any]:
-        """Получение метрик работы"""
-        return {
-            **self.metrics,
-            'timestamp': datetime.now().isoformat(),
-            'is_live': self.is_live,
-            'current_broadcast': self.broadcast_id,
-            'current_stream': self.stream_id,
-            'stream_key': self.stream_key,
-            'rtmp_url': self.rtmp_url,
-            'authenticated': self.youtube is not None
-        }
-
-
 # ========== FFMPEG STREAM MANAGER с ПАЙПАМИ ==========
 
 class FFmpegStreamManager:
-    """Управление FFmpeg стримом на YouTube"""
+    """Управление FFmpeg стримом на YouTube через stream key"""
 
     def __init__(self):
         self.stream_process = None
@@ -660,18 +105,15 @@ class FFmpegStreamManager:
         # Флаг для определения, используем ли мы PyAudio
         self.use_pyaudio = PYTHON_AUDIO_AVAILABLE
 
-    def set_stream_key(self, stream_key: str):
+        logger.info("FFmpeg Stream Manager инициализирован")
+
+    def set_stream_key(self, stream_key: str) -> bool:
         """Установка ключа стрима"""
         self.stream_key = stream_key
         self.rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
         logger.info(f"🔑 Stream Key установлен: {stream_key[:10]}...")
+        logger.info(f"📍 RTMP URL: {self.rtmp_url}")
         return True
-
-    def set_video_source(self, source_type: str, source_param: str = None):
-        """Установка источника видео"""
-        self.video_source = source_type
-        self.video_param = source_param
-        logger.info(f"📹 Источник видео: {source_type}")
 
     def stream_audio_pipe(self, audio_file: str) -> bool:
         """Более надежный метод отправки аудио через конвертацию в WAV"""
@@ -691,7 +133,7 @@ class FFmpegStreamManager:
                 '-acodec', 'pcm_s16le',
                 '-ar', '44100',
                 '-ac', '2',
-                '-y',  # Перезаписать
+                '-y',
                 temp_wav.name
             ]
 
@@ -757,131 +199,42 @@ class FFmpegStreamManager:
 
     def _audio_queue_processor(self):
         """Обработчик очереди аудио файлов"""
-        import numpy as np
-
         while self.is_streaming:
             try:
                 if self.audio_queue:
                     # Берем следующий файл из очереди
                     audio_file = self.audio_queue.pop(0)
-                    self.current_audio = audio_file
+                    logger.info(f"🎵 Воспроизведение аудио из очереди: {os.path.basename(audio_file)}")
 
                     # Отправляем аудио
-                    self._send_audio_file(audio_file)
+                    success = self.stream_audio_pipe(audio_file)
 
-                    # Очищаем текущий файл
-                    self.current_audio = None
+                    if not success:
+                        logger.warning(f"⚠️ Не удалось воспроизвести аудио, пропускаем")
+
+                    # Удаляем временный файл если он был создан TTS
+                    if audio_file.startswith(tempfile.gettempdir()):
+                        try:
+                            os.unlink(audio_file)
+                        except:
+                            pass
                 else:
-                    # Если очередь пуста, отправляем тишину
-                    self._send_silence(0.1)  # 100 мс тишины
+                    # Если очередь пуста, ждем
+                    time.sleep(0.1)
 
             except Exception as e:
                 logger.error(f"❌ Ошибка в обработчике аудио: {e}")
                 time.sleep(0.1)
 
-    def _send_silence(self, duration: float = 0.1):
-        """Отправка тишины в стрим"""
-        if not self.ffmpeg_stdin or not self.is_streaming:
-            return
-
-        try:
-            # Количество сэмплов для указанной длительности
-            samples = int(44100 * duration)
-            # 16-bit PCM стерео тишина (нулевые значения)
-            silence_data = b'\x00' * (samples * 2 * 2)  # samples * channels * bytes_per_sample
-
-            self.ffmpeg_stdin.write(silence_data)
-            self.ffmpeg_stdin.flush()
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка отправки тишины: {e}")
-            self.is_streaming = False
-
-    def _send_audio_file(self, audio_file: str):
-        """Отправка аудио файла в стрим"""
-        if not self.ffmpeg_stdin or not self.is_streaming:
-            logger.error("❌ Не могу отправить аудио: stdin недоступен")
-            return False
-
-        try:
-            # Конвертируем MP3 в сырые PCM данные
-            ffmpeg_cmd = [
-                'ffmpeg',
-                '-i', audio_file,  # Входной файл
-                '-f', 's16le',  # Формат выхода: 16-bit PCM
-                '-ar', '44100',  # Частота дискретизации
-                '-ac', '2',  # Стерео
-                '-acodec', 'pcm_s16le',  # Кодек
-                '-'  # Вывод в stdout
-            ]
-
-            logger.info(f"🎵 Конвертация и отправка: {os.path.basename(audio_file)}")
-
-            # Запускаем конвертер
-            converter = subprocess.Popen(
-                ffmpeg_cmd,
-                stdout=subprocess.PIPE,  # Читаем его вывод
-                stderr=subprocess.PIPE,
-                bufsize=10 ** 7  # Большой буфер
-            )
-
-            # Читаем и отправляем данные
-            chunk_size = 44100 * 2 * 2  # 1 секунда аудио (44.1k * 2 канала * 2 байта)
-            total_sent = 0
-
-            while True:
-                # Читаем порцию данных
-                audio_data = converter.stdout.read(chunk_size)
-                if not audio_data:
-                    break
-
-                # Проверяем статус
-                if not self.is_streaming:
-                    break
-
-                # Отправляем данные
-                try:
-                    self.ffmpeg_stdin.write(audio_data)
-                    self.ffmpeg_stdin.flush()
-                    total_sent += len(audio_data)
-                except BrokenPipeError:
-                    logger.error("❌ Broken pipe: FFmpeg завершился")
-                    self.is_streaming = False
-                    break
-                except Exception as e:
-                    logger.error(f"❌ Ошибка записи аудио: {e}")
-                    break
-
-            # Ждем завершения конвертера
-            converter.wait(timeout=5)
-
-            if converter.returncode == 0:
-                logger.info(f"✅ Аудио отправлено ({total_sent} байт)")
-                return True
-            else:
-                error = converter.stderr.read().decode('utf-8', errors='ignore')[:200]
-                logger.error(f"❌ Ошибка конвертации: {error}")
-                return False
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка отправки аудио файла: {e}")
-            return False
-
-    def add_audio_to_stream(self, audio_file: str) -> bool:
+    def add_audio_to_queue(self, audio_file: str) -> bool:
         """Добавление аудио файла в очередь на воспроизведение"""
         if not os.path.exists(audio_file):
             logger.error(f"❌ Аудио файл не найден: {audio_file}")
             return False
 
-        # Проверяем формат файла
-        if not audio_file.lower().endswith('.mp3'):
-            logger.warning(f"⚠️  Файл не MP3: {audio_file}")
-
-        # Добавляем в очередь
         self.audio_queue.append(audio_file)
         logger.info(f"📥 Аудио добавлено в очередь: {os.path.basename(audio_file)}")
         logger.info(f"📊 Размер очереди: {len(self.audio_queue)} файлов")
-
         return True
 
     def start_stream(self, use_audio: bool = True):
@@ -905,7 +258,7 @@ class FFmpegStreamManager:
 
                 # Видео источник
                 '-f', 'lavfi',
-                '-i', 'color=size=1920x1080:rate=30',
+                '-i', 'color=size=1920x1080:rate=30:color=black',
 
                 # Аудио источник через stdin (сырые PCM данные)
                 '-f', 's16le',  # Формат: 16-bit signed little-endian PCM
@@ -938,8 +291,9 @@ class FFmpegStreamManager:
                 self.rtmp_url
             ]
 
-            logger.info(f"🚀 Запуск FFmpeg с поддержкой аудио через stdin")
-            logger.debug(f"Команда: {' '.join(ffmpeg_cmd[:12])}...")
+            logger.info(f"🚀 Запуск FFmpeg стрима на YouTube")
+            logger.info(f"🔑 Stream Key: {self.stream_key[:10]}...")
+            logger.info(f"📍 RTMP URL: {self.rtmp_url}")
 
             # Запускаем FFmpeg
             self.stream_process = subprocess.Popen(
@@ -955,7 +309,7 @@ class FFmpegStreamManager:
             self.ffmpeg_pid = self.stream_process.pid
             self.ffmpeg_stdin = self.stream_process.stdin  # ВАЖНО: сохраняем stdin
 
-            logger.info(f"✅ FFmpeg запущен (PID: {self.ffmpeg_pid}), stdin доступен: {self.ffmpeg_stdin is not None}")
+            logger.info(f"✅ FFmpeg запущен (PID: {self.ffmpeg_pid})")
 
             # Запускаем мониторинг
             threading.Thread(target=self._monitor_ffmpeg, daemon=True).start()
@@ -964,20 +318,17 @@ class FFmpegStreamManager:
             threading.Thread(target=self._audio_queue_processor, daemon=True).start()
 
             logger.info(f"🎬 FFmpeg стрим запущен (PID: {self.ffmpeg_pid})")
+            socketio.emit('stream_started', {
+                'pid': self.ffmpeg_pid,
+                'rtmp_url': self.rtmp_url,
+                'stream_key': self.stream_key[:10] + '...'
+            })
+
             return {'success': True, 'pid': self.ffmpeg_pid, 'message': 'Стрим запущен'}
 
         except Exception as e:
             logger.error(f"❌ Ошибка запуска FFmpeg: {e}", exc_info=True)
             return {'success': False, 'error': str(e)}
-
-    def _check_stream_status(self):
-        """Проверка статуса стрима через 5 секунд"""
-        time.sleep(5)
-        if self.stream_process and self.stream_process.poll() is None:
-            logger.info("✅ Стрим работает стабильно")
-            socketio.emit('stream_connected', {'status': 'streaming'})
-        else:
-            logger.error("❌ Стрим не запустился или завершился")
 
     def _monitor_ffmpeg(self):
         """Мониторинг процесса FFmpeg"""
@@ -1013,295 +364,7 @@ class FFmpegStreamManager:
                     self.ffmpeg_stdin.close()
                 except:
                     pass
-
-    def _audio_processor(self):
-        """Обработчик аудио очереди"""
-        import numpy as np
-
-        while self.is_streaming:
-            try:
-                if self.audio_queue:
-                    audio_file = self.audio_queue.pop(0)
-                    self.is_playing_audio = True
-                    self.stream_audio_realtime(audio_file)
-                    self.is_playing_audio = False
-                else:
-                    # Отправляем тишину
-                    silence_duration = 0.1  # 100 мс
-                    samples = int(self.audio_sample_rate * silence_duration)
-                    silence = np.zeros(samples * self.audio_channels, dtype=np.int16).tobytes()
-
-                    if self.ffmpeg_stdin:
-                        try:
-                            self.ffmpeg_stdin.write(silence)
-                            self.ffmpeg_stdin.flush()
-                        except:
-                            break
-
-                    time.sleep(silence_duration)
-            except Exception as e:
-                logger.error(f"Ошибка обработчика аудио: {e}")
-                time.sleep(0.1)
-
-    def add_audio_to_queue(self, audio_file: str):
-        """Добавление аудио файла в очередь на воспроизведение"""
-        if not os.path.exists(audio_file):
-            logger.error(f"❌ Аудио файл не найден: {audio_file}")
-            return False
-
-        self.audio_queue.append(audio_file)
-        logger.info(f"🎵 Аудио добавлено в очередь: {os.path.basename(audio_file)}")
-        logger.info(f"📊 Очередь аудио: {len(self.audio_queue)} файлов")
-        return True
-
-    def send_audio_to_stream(self, audio_data: bytes):
-        """Отправка аудио данных в стрим"""
-        if not self.is_streaming or not self.ffmpeg_stdin:
-            logger.warning("⚠️ Не могу отправить аудио: стрим не активен")
-            return False
-
-        try:
-            # Отправляем аудио в FFmpeg
-            self.ffmpeg_stdin.write(audio_data)
-            self.ffmpeg_stdin.flush()
-            return True
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка отправки аудио: {e}")
-            return False
-
-    def play_audio_file(self, audio_file: str) -> bool:
-        """Воспроизведение аудио файла (MP3) и отправка в стрим"""
-        if not os.path.exists(audio_file):
-            logger.error(f"❌ Аудио файл не найден: {audio_file}")
-            return False
-
-        try:
-            logger.info(f"▶️ Воспроизведение аудио: {os.path.basename(audio_file)}")
-
-            # Вариант 1: Используем отдельный FFmpeg процесс для отправки аудио
-            ffmpeg_audio_cmd = [
-                'ffmpeg',
-                '-re',  # Реальное время
-                '-i', audio_file,
-                '-c:a', 'aac',
-                '-b:a', '128k',
-                '-ar', '44100',
-                '-ac', '2',
-                '-f', 'flv',
-                self.rtmp_url
-            ]
-
-            logger.debug(f"Запуск отдельного FFmpeg для аудио")
-
-            # Запускаем отдельный процесс для аудио
-            process = subprocess.Popen(
-                ffmpeg_audio_cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE
-            )
-
-            # Ждем завершения (но не блокируем основной поток)
-            def wait_for_process():
-                process.wait()
-                if process.returncode == 0:
-                    logger.info(f"✅ Аудио успешно воспроизведено: {os.path.basename(audio_file)}")
-                else:
-                    error = process.stderr.read().decode('utf-8', errors='ignore')
-                    logger.error(f"❌ Ошибка воспроизведения аудио: {error}")
-
-            # Запускаем в отдельном потоке
-            threading.Thread(target=wait_for_process, daemon=True).start()
-
-            return True
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка воспроизведения аудио файла: {e}", exc_info=True)
-            return False
-
-    def stream_audio_realtime(self, audio_file: str):
-        """Стриминг аудио в реальном времени с синхронизацией"""
-        if not self.is_streaming:
-            logger.warning("Стрим не активен")
-            return False
-
-        try:
-            # Получаем длительность аудио
-            duration = self._get_audio_duration(audio_file)
-
-            # Команда для конвертации и отправки аудио в реальном времени
-            ffmpeg_cmd = [
-                'ffmpeg',
-                '-re',  # Реальное время (важно для синхронизации!)
-                '-i', audio_file,  # Входной файл
-                '-f', 's16le',  # Формат выхода
-                '-ar', '44100',  # Частота дискретизации
-                '-ac', '2',  # Стерео
-                '-c:a', 'pcm_s16le',  # Кодек аудио
-                '-'  # Вывод в stdout
-            ]
-
-            logger.info(f"🎵 Стриминг аудио: {os.path.basename(audio_file)} ({duration:.1f} сек)")
-
-            process = subprocess.Popen(
-                ffmpeg_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=0
-            )
-
-            # Стримим аудио порциями
-            chunk_size = 88200  # 0.5 секунды аудио (44100 Гц * 2 канала * 2 байта)
-
-            while True:
-                audio_data = process.stdout.read(chunk_size)
-                if not audio_data:
-                    break
-
-                if self.ffmpeg_stdin:
-                    try:
-                        self.ffmpeg_stdin.write(audio_data)
-                        self.ffmpeg_stdin.flush()
-                    except BrokenPipeError:
-                        logger.error("FFmpeg перестал принимать аудио")
-                        break
-
-            process.wait()
-            logger.info(f"✅ Аудио завершено: {os.path.basename(audio_file)}")
-            return True
-
-        except Exception as e:
-            logger.error(f"Ошибка стриминга аудио: {e}")
-            return False
-
-    def _get_audio_duration(self, audio_file: str) -> float:
-        """Получение длительности аудио файла через ffprobe"""
-        try:
-            cmd = [
-                'ffprobe',
-                '-v', 'error',
-                '-show_entries', 'format=duration',
-                '-of', 'csv=p=0',
-                audio_file
-            ]
-
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode == 0:
-                return float(result.stdout.strip())
-        except:
-            pass
-
-        # Если не получилось, оцениваем примерно
-        try:
-            # Примерная оценка: 0.1 секунды на слово
-            import re
-            with open(audio_file, 'rb') as f:
-                # Читаем ID3 тег для MP3
-                f.seek(-128, 2)
-                tag = f.read(3)
-                if tag == b'TAG':
-                    # MP3 с тегом
-                    return 5.0
-        except:
-            pass
-
-        return 5.0  # Значение по умолчанию
-
-    def stream_audio_sync(self, audio_file: str, wait_for_completion: bool = True):
-        """Синхронное воспроизведение аудио файла"""
-        if not self.is_streaming:
-            logger.warning("Стрим не активен")
-            return False
-
-        try:
-            # Создаем отдельный процесс для конвертации и отправки аудио
-            ffmpeg_cmd = [
-                'ffmpeg',
-                '-i', audio_file,
-                '-f', 's16le',
-                '-ar', '44100',
-                '-ac', '2',
-                '-'
-            ]
-
-            process = subprocess.Popen(
-                ffmpeg_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                bufsize=0
-            )
-
-            # Создаем pipe для отправки данных
-            def send_audio():
-                while True:
-                    data = process.stdout.read(4096)
-                    if not data:
-                        break
-
-                    if self.ffmpeg_stdin:
-                        try:
-                            self.ffmpeg_stdin.write(data)
-                            self.ffmpeg_stdin.flush()
-                        except:
-                            break
-
-            # Запускаем в отдельном потоке
-            audio_thread = threading.Thread(target=send_audio, daemon=True)
-            audio_thread.start()
-
-            if wait_for_completion:
-                audio_thread.join(timeout=30)  # Максимум 30 секунд
-
-            process.wait(timeout=5)
-            return True
-
-        except Exception as e:
-            logger.error(f"Ошибка синхронного воспроизведения аудио: {e}")
-            return False
-
-    def play_audio_simple(self, audio_file: str):
-        """Простое воспроизведение аудио файла (самый надежный метод)"""
-        if not self.is_streaming or not self.ffmpeg_stdin:
-            logger.warning("Стрим не активен или stdin недоступен")
-            return False
-
-        try:
-            # Используем ffmpeg для прямой отправки в rtmp
-            ffmpeg_audio_cmd = [
-                'ffmpeg',
-                '-re',  # Реальное время
-                '-i', audio_file,
-                '-c:a', 'aac',
-                '-b:a', '128k',
-                '-ar', '44100',
-                '-ac', '2',
-                '-f', 'flv',
-                self.rtmp_url
-            ]
-
-            logger.info(f"▶️ Воспроизведение аудио: {os.path.basename(audio_file)}")
-
-            # Запускаем отдельный процесс для аудио
-            process = subprocess.Popen(
-                ffmpeg_audio_cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE
-            )
-
-            # Ждем завершения
-            process.wait()
-
-            if process.returncode == 0:
-                logger.info(f"✅ Аудио успешно воспроизведено")
-                return True
-            else:
-                error = process.stderr.read().decode('utf-8', errors='ignore')
-                logger.error(f"❌ Ошибка воспроизведения аудио: {error}")
-                return False
-
-        except Exception as e:
-            logger.error(f"Ошибка простого воспроизведения аудио: {e}")
-            return False
+            socketio.emit('stream_stopped', {'time': datetime.now().isoformat()})
 
     def stop_stream(self):
         """Остановка стрима"""
@@ -1347,8 +410,6 @@ class FFmpegStreamManager:
             'stream_key': self.stream_key[:10] + '...' if self.stream_key else None,
             'rtmp_url': self.rtmp_url,
             'pid': self.ffmpeg_pid,
-            'video_source': self.video_source,
-            'use_pyaudio': self.use_pyaudio,
             'audio_queue_size': len(self.audio_queue),
             'is_playing_audio': self.is_playing_audio
         }
@@ -1371,59 +432,6 @@ class FFmpegStreamManager:
 
         return status
 
-    def check_stream_connection(self):
-        """Проверка подключения к YouTube"""
-        if not self.rtmp_url:
-            return {'connected': False, 'error': 'No RTMP URL'}
-
-        try:
-            # Используем ffprobe для проверки подключения
-            cmd = [
-                'ffprobe',
-                '-v', 'error',
-                '-timeout', '5000000',  # 5 секунд таймаут
-                self.rtmp_url
-            ]
-
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-
-            return {
-                'connected': result.returncode == 0,
-                'output': result.stdout if result.returncode == 0 else result.stderr
-            }
-
-        except subprocess.TimeoutExpired:
-            return {'connected': False, 'error': 'Connection timeout'}
-        except Exception as e:
-            return {'connected': False, 'error': str(e)}
-
-    def create_test_audio(self, text: str = "Тестовое сообщение", voice: str = "male_ru"):
-        """Создание тестового аудио файла"""
-        try:
-            import tempfile
-            import asyncio
-            import edge_tts
-
-            # Создаем временный файл
-            with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as tmp:
-                temp_path = tmp.name
-
-            # Генерируем аудио
-            async def generate():
-                tts = edge_tts.Communicate(
-                    text=text,
-                    voice='ru-RU-DmitryNeural' if voice == 'male_ru' else 'ru-RU-SvetlanaNeural'
-                )
-                await tts.save(temp_path)
-
-            asyncio.run(generate())
-
-            logger.info(f"✅ Тестовое аудио создано: {temp_path}")
-            return temp_path
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка создания тестового аудио: {e}")
-            return None
 
 # ========== EDGE TTS MANAGER ==========
 
@@ -1452,255 +460,8 @@ class EdgeTTSManager:
 
         logger.info("Edge TTS Manager инициализирован")
 
-    async def _stream_audio_to_ffmpeg(self, audio_file: str) -> bool:
-        """Отправка аудио файла в FFmpeg стрим через отдельный процесс"""
-        try:
-            if not self.ffmpeg_manager or not self.ffmpeg_manager.is_streaming:
-                logger.warning("⚠️ Стрим не активен")
-                return False
-
-            if not self.ffmpeg_manager.rtmp_url:
-                logger.error("❌ RTMP URL не установлен")
-                return False
-
-            # Получаем длительность аудио
-            duration = self._get_audio_duration(audio_file)
-            logger.info(f"🎵 Стриминг аудио: {os.path.basename(audio_file)} ({duration:.1f} сек)")
-
-            # Ключевое изменение: используем отдельный FFmpeg процесс
-            # который подключается к тому же RTMP URL
-            ffmpeg_cmd = [
-                'ffmpeg',
-                '-re',  # КРИТИЧЕСКИ ВАЖНО: реальное время
-                '-i', audio_file,  # Входной аудио файл
-                '-c:a', 'aac',  # Кодек аудио
-                '-b:a', '128k',  # Битрейт
-                '-ar', '44100',  # Частота дискретизации
-                '-ac', '2',  # Стерео
-                '-vn',  # Без видео (только аудио)
-                '-f', 'flv',  # Формат вывода FLV
-                self.ffmpeg_manager.rtmp_url  # Отправляем на тот же RTMP URL
-            ]
-
-            logger.debug(f"Аудио команда FFmpeg: {' '.join(ffmpeg_cmd)}")
-
-            # Запускаем асинхронный процесс
-            process = await asyncio.create_subprocess_exec(
-                *ffmpeg_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-
-            # Запускаем задачи для мониторинга вывода
-            async def monitor_stderr():
-                """Мониторинг ошибок"""
-                error_messages = []
-                while True:
-                    line = await process.stderr.readline()
-                    if not line:
-                        break
-
-                    line_str = line.decode('utf-8', errors='ignore').strip()
-                    if line_str:
-                        if 'error' in line_str.lower() or 'fail' in line_str.lower():
-                            logger.error(f"FFmpeg аудио: {line_str}")
-                            error_messages.append(line_str)
-                        elif 'frame=' in line_str or 'size=' in line_str:
-                            # Пропускаем обычные сообщения о прогрессе
-                            pass
-                        else:
-                            logger.debug(f"FFmpeg аудио: {line_str}")
-
-                return error_messages
-
-            async def wait_with_timeout(timeout: float):
-                """Ожидание с таймаутом"""
-                try:
-                    await asyncio.wait_for(process.wait(), timeout)
-                    return True
-                except asyncio.TimeoutError:
-                    return False
-
-            # Мониторим ошибки в фоне
-            monitor_task = asyncio.create_task(monitor_stderr())
-
-            # Ждем завершения процесса с таймаутом
-            timeout = duration + 10  # Длительность + 10 секунд запас
-            completed = await wait_with_timeout(timeout)
-
-            # Получаем ошибки
-            error_messages = await monitor_task
-
-            if completed:
-                # Процесс завершился
-                returncode = process.returncode
-                if returncode == 0:
-                    logger.info(f"✅ Аудио успешно отправлено в стрим")
-                    return True
-                else:
-                    logger.error(f"❌ FFmpeg завершился с кодом {returncode}")
-                    if error_messages:
-                        logger.error(f"Последние ошибки: {'; '.join(error_messages[-3:])}")
-                    return False
-            else:
-                # Таймаут - завершаем процесс
-                logger.warning(f"⚠️ Таймаут ({timeout} сек), завершаю аудио процесс...")
-                try:
-                    process.terminate()
-                    await asyncio.wait_for(process.wait(), 5)
-                except:
-                    try:
-                        process.kill()
-                        await process.wait()
-                    except:
-                        pass
-
-                logger.error("❌ Аудио процесс не завершился вовремя")
-                return False
-
-        except FileNotFoundError:
-            logger.error("❌ FFmpeg не найден. Установите FFmpeg и добавьте в PATH")
-            return False
-        except Exception as e:
-            logger.error(f"❌ Ошибка стриминга аудио: {e}", exc_info=True)
-            return False
-
-    async def _add_to_stream_queue(self, audio_file: str, agent_name: str = ""):
-        """Добавление аудио файла в очередь стрима"""
-        try:
-            # 1. Локальное воспроизведение (если доступно)
-            if self.pygame_available:
-                try:
-                    pygame.mixer.music.load(audio_file)
-                    pygame.mixer.music.play()
-                    logger.debug(f"🔊 Локальное воспроизведение: {os.path.basename(audio_file)}")
-                except Exception as e:
-                    logger.warning(f"⚠️ Не удалось воспроизвести локально: {e}")
-
-            # 2. Добавление в очередь стрима
-            if self.ffmpeg_manager and hasattr(self.ffmpeg_manager, 'add_audio_to_stream'):
-                # Добавляем в очередь FFmpeg стрима
-                success = self.ffmpeg_manager.add_audio_to_stream(audio_file)
-
-                if success:
-                    duration = self._get_audio_duration(audio_file)
-                    logger.info(
-                        f"📤 Аудио добавлено в очередь стрима: {os.path.basename(audio_file)} ({duration:.1f} сек)")
-
-                    # Ждем окончания воспроизведения (для синхронизации дискуссии)
-                    await asyncio.sleep(duration)
-                else:
-                    logger.error(f"❌ Не удалось добавить аудио в очередь")
-                    # Все равно ждем предполагаемую длительность
-                    await asyncio.sleep(5)  # Запасная пауза
-            else:
-                logger.warning(f"⚠️ FFmpeg менеджер не доступен для отправки аудио")
-                # Ждем примерную длительность аудио
-                duration = self._get_audio_duration(audio_file)
-                await asyncio.sleep(duration)
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка добавления в очередь: {e}")
-
-    def _get_audio_duration(self, audio_file: str) -> float:
-        """Получение длительности аудио файла"""
-        try:
-            # Используем ffprobe для получения точной длительности
-            cmd = [
-                'ffprobe',
-                '-v', 'error',
-                '-show_entries', 'format=duration',
-                '-of', 'default=noprint_wrappers=1:nokey=1',
-                audio_file
-            ]
-
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-
-            if result.returncode == 0:
-                duration = float(result.stdout.strip())
-                return duration
-            else:
-                # Приблизительная оценка: 0.3 секунды на слово
-                import re
-                with open(audio_file, 'rb') as f:
-                    size = os.path.getsize(audio_file)
-                    # MP3: примерно 16 KB на секунду при 128kbps
-                    return size / 16000  # Приблизительная оценка
-
-        except Exception as e:
-            logger.warning(f"⚠️ Не удалось получить длительность аудио: {e}")
-            # Запасная оценка: 0.3 секунды на слово
-            return 5.0  # Значение по умолчанию
-
-    async def text_to_speech_and_stream(self, text: str, voice_id: str = 'male_ru', agent_name: str = "") -> Optional[
-        str]:
-        """Генерация аудио и добавление в очередь стрима"""
-        try:
-            if voice_id not in self.voice_map:
-                voice_id = 'male_ru'
-
-            voice_name = self.voice_map[voice_id]
-
-            # Хэш для имени файла
-            text_hash = hashlib.md5(f"{text}_{voice_id}".encode()).hexdigest()
-            cache_file = os.path.join(self.cache_dir, f"{agent_name}_{text_hash}.mp3")
-
-            # Проверяем кэш
-            if os.path.exists(cache_file):
-                logger.debug(f"♻️ Используем кэшированное аудио: {os.path.basename(cache_file)}")
-                await self._add_to_stream_queue(cache_file, agent_name)
-                return cache_file
-
-            # Настройки голоса
-            rate = '+0%'
-            pitch = '+0Hz'
-
-            if voice_id == 'male_ru_deep':
-                rate = '-10%'
-                pitch = '-20Hz'
-            elif voice_id == 'female_ru_soft':
-                rate = '-5%'
-                pitch = '+10Hz'
-
-            # Генерация аудио
-            logger.info(f"🔊 Генерация аудио: {agent_name} ({voice_name}) - {len(text)} символов")
-
-            communicate = edge_tts.Communicate(
-                text=text,
-                voice=voice_name,
-                rate=rate,
-                pitch=pitch
-            )
-
-            await communicate.save(cache_file)
-
-            # Получаем информацию о файле
-            file_size = os.path.getsize(cache_file) / 1024  # в KB
-            duration = self._get_audio_duration(cache_file)
-
-            logger.info(f"💾 Аудио сохранено: {os.path.basename(cache_file)}")
-            logger.info(f"📊 Размер файла: {file_size:.1f} KB, Длительность: {duration:.1f} сек")
-
-            # Добавляем в очередь стрима
-            await self._add_to_stream_queue(cache_file, agent_name)
-
-            return cache_file
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка Edge TTS: {e}", exc_info=True)
-            return None
-
     async def generate_audio_only(self, text: str, voice_id: str = 'male_ru', agent_name: str = "") -> Optional[str]:
-        """Генерация аудио файла БЕЗ воспроизведения
-
-        Args:
-            text: Текст для озвучивания
-            voice_id: Идентификатор голоса
-            agent_name: Имя агента (для имени файла)
-
-        Returns:
-            Путь к созданному аудио файлу или None в случае ошибки
-        """
+        """Генерация аудио файла БЕЗ воспроизведения"""
         try:
             if voice_id not in self.voice_map:
                 voice_id = 'male_ru'
@@ -1754,83 +515,6 @@ class EdgeTTSManager:
             logger.error(f"❌ Ошибка генерации аудио: {e}", exc_info=True)
             return None
 
-    async def _play_and_stream(self, audio_file: str, agent_name: str = ""):
-        """Воспроизведение аудио локально и добавление в очередь стрима"""
-        try:
-            # 1. Локальное воспроизведение (если доступно)
-            if self.pygame_available:
-                try:
-                    pygame.mixer.music.load(audio_file)
-                    pygame.mixer.music.play()
-                    logger.debug(f"🔊 Локальное воспроизведение: {os.path.basename(audio_file)}")
-
-                    # Ждем окончания локального воспроизведения
-                    duration = self._get_audio_duration(audio_file)
-                    await asyncio.sleep(duration)
-
-                except Exception as e:
-                    logger.warning(f"⚠️ Не удалось воспроизвести локально: {e}")
-                    # Если локальное воспроизведение не удалось, все равно добавляем в стрим
-                    await self._add_to_stream_queue(audio_file, agent_name)
-
-            # 2. Добавление в очередь YouTube стрима
-            elif self.ffmpeg_manager and hasattr(self.ffmpeg_manager, 'add_audio_to_stream'):
-                await self._add_to_stream_queue(audio_file, agent_name)
-
-            # 3. Если нет локального воспроизведения и нет FFmpeg менеджера
-            else:
-                logger.warning(f"⚠️ Нет доступных методов воспроизведения аудио")
-                # Просто ждем примерное время воспроизведения
-                duration = self._get_audio_duration(audio_file)
-                await asyncio.sleep(duration)
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка воспроизведения аудио: {e}", exc_info=True)
-
-            # Запасной вариант: просто ждем
-            try:
-                duration = self._get_audio_duration(audio_file)
-                await asyncio.sleep(duration)
-            except:
-                await asyncio.sleep(5)  # Запасная пауза 5 секунд
-
-    async def speak_direct(self, text: str, voice_id: str = 'male_ru') -> bool:
-        """Прямое озвучивание текста (без добавления в историю агента)"""
-        try:
-            logger.info(f"🎤 Прямое озвучивание: {text[:50]}...")
-
-            # Генерация временного файла
-            import tempfile
-            import asyncio
-
-            with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as tmp:
-                temp_path = tmp.name
-
-            # Генерация аудио
-            voice_name = self.voice_map.get(voice_id, 'ru-RU-DmitryNeural')
-
-            communicate = edge_tts.Communicate(
-                text=text,
-                voice=voice_name
-            )
-
-            await communicate.save(temp_path)
-
-            # Добавление в очередь стрима
-            await self._add_to_stream_queue(temp_path, "Direct")
-
-            # Удаляем временный файл после использования
-            try:
-                os.unlink(temp_path)
-            except:
-                pass
-
-            return True
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка прямого озвучивания: {e}")
-            return False
-
     def _get_audio_duration(self, audio_file: str) -> float:
         """Получение длительности аудио файла в секундах"""
         try:
@@ -1856,7 +540,6 @@ class EdgeTTSManager:
                 logger.warning(f"Не удалось получить длительность через ffprobe: {result.stderr}")
 
                 # Альтернативный метод: оцениваем по размеру файла
-                # Предполагаем MP3 с битрейтом 128kbps
                 file_size = os.path.getsize(audio_file)  # в байтах
                 bitrate = 128000  # 128 kbps
                 duration = file_size * 8 / bitrate  # в секундах
@@ -1864,21 +547,8 @@ class EdgeTTSManager:
 
         except Exception as e:
             logger.warning(f"Ошибка получения длительности аудио: {e}")
-
-            # Самый простой метод: оцениваем по количеству слов
-            # В среднем 10 слов в секунду для русского языка
-            try:
-                with open(audio_file, 'rb') as f:
-                    # Читаем первые 1000 байт для анализа
-                    header = f.read(1000)
-                    # Если это MP3, оцениваем по размеру
-                    if b'ID3' in header or b'MP3' in header:
-                        file_size = os.path.getsize(audio_file)
-                        return max(3.0, min(file_size / 16000, 30.0))  # Оценочно
-            except:
-                pass
-
             return 5.0  # Значение по умолчанию
+
 
 # ========== AI AGENT ==========
 
@@ -1955,6 +625,8 @@ class AIAgent:
         except Exception as e:
             logger.error(f"❌ Ошибка генерации ответа для {self.name}: {e}")
             return f"Как эксперт в {self.expertise.lower()}, я считаю, что {topic.lower()} требует внимательного изучения."
+
+
 # ========== AI STREAM MANAGER ==========
 
 class AIStreamManager:
@@ -2040,7 +712,7 @@ class AIStreamManager:
 
                 logger.info(f"💬 {agent.name}: {message[:80]}...")
 
-                # Генерация аудио файла БЕЗ воспроизведения
+                # Генерация аудио файла
                 logger.info(f"🔊 Генерация TTS для {agent.name}...")
 
                 audio_file = await self.tts_manager.generate_audio_only(
@@ -2050,29 +722,22 @@ class AIStreamManager:
                 )
 
                 if audio_file and self.ffmpeg_manager:
-                    # Получаем длительность аудио
-                    audio_duration = self.tts_manager._get_audio_duration(audio_file)
-                    logger.info(f"⏱️  Длительность аудио: {audio_duration:.1f} сек")
+                    # Добавляем аудио в очередь стрима
+                    success = self.ffmpeg_manager.add_audio_to_queue(audio_file)
 
-                    # Отправляем аудио в стрим через pipe
-                    logger.info(f"📤 Отправка аудио в стрим...")
+                    if success:
+                        # Получаем длительность аудио
+                        audio_duration = self.tts_manager._get_audio_duration(audio_file)
+                        logger.info(f"⏱️  Ожидание завершения аудио: {audio_duration:.1f} сек")
 
-                    # Запускаем отправку в отдельном потоке
-                    def send_audio():
-                        success = self.ffmpeg_manager.stream_audio_pipe(audio_file)
-                        if success:
-                            logger.info(f"✅ Аудио отправлено в стрим: {os.path.basename(audio_file)}")
-                        else:
-                            logger.error(f"❌ Не удалось отправить аудио в стрим")
-
-                    audio_thread = threading.Thread(target=send_audio, daemon=True)
-                    audio_thread.start()
-
-                    # Ждем пока аудио должно воспроизвестись
-                    await asyncio.sleep(audio_duration)
-
-                    # Даем небольшой буфер
-                    await asyncio.sleep(0.5)
+                        # Ждем пока аудио должно воспроизвестись
+                        await asyncio.sleep(audio_duration + 0.5)  # Небольшой буфер
+                    else:
+                        logger.warning(f"⚠️ Не удалось добавить аудио в очередь")
+                        # Ждем по количеству слов
+                        word_count = len(message.split())
+                        pause_duration = max(3, min(word_count * 0.3, 10))
+                        await asyncio.sleep(pause_duration)
                 else:
                     # Если аудио не сгенерировалось, ждем по количеству слов
                     word_count = len(message.split())
@@ -2117,24 +782,6 @@ class AIStreamManager:
             self.is_discussion_active = False
             self.active_agent = None
 
-    def _get_audio_duration(self, audio_file: str) -> float:
-        """Получение длительности аудио файла"""
-        try:
-            result = subprocess.run([
-                'ffprobe',
-                '-v', 'error',
-                '-show_entries', 'format=duration',
-                '-of', 'default=noprint_wrappers=1:nokey=1',
-                audio_file
-            ], capture_output=True, text=True)
-
-            duration = float(result.stdout.strip())
-            return duration
-
-        except Exception as e:
-            logger.warning(f"Не удалось получить длительность аудио: {e}")
-            return 5.0
-
     def get_agents_state(self) -> List[Dict[str, Any]]:
         """Состояние агентов"""
         return [
@@ -2163,30 +810,11 @@ class AIStreamManager:
             'ffmpeg_streaming': self.ffmpeg_manager.is_streaming if self.ffmpeg_manager else False
         }
 
+
+# ========== ИНИЦИАЛИЗАЦИЯ ==========
+
 ffmpeg_manager = FFmpegStreamManager()
 stream_manager = AIStreamManager(ffmpeg_manager)
-
-# Инициализация YouTube OAuth
-youtube_oauth = None
-
-if YOUTUBE_OAUTH_AVAILABLE:
-    try:
-        print(f"\n🔧 Инициализация YouTube OAuth...")
-        youtube_oauth = YouTubeOAuthStream()
-
-        # Пробуем загрузить сохраненные токены
-        if youtube_oauth.load_credentials():
-            print("✅ YouTube OAuth: Токены загружены, аутентифицирован")
-        else:
-            print("ℹ️ YouTube OAuth: Требуется авторизация")
-
-    except Exception as e:
-        print(f"❌ Ошибка инициализации YouTube OAuth: {e}")
-        import traceback
-        traceback.print_exc()
-        youtube_oauth = None
-else:
-    print("ℹ️ YouTube OAuth не будет использоваться")
 
 
 # ========== АСИНХРОННЫЙ ЦИКЛ ==========
@@ -2231,224 +859,13 @@ def health():
         'discussion_active': stream_manager.is_discussion_active
     })
 
-@app.route('/oauth')
-def oauth_start():
-    """Начало OAuth процесса"""
-    try:
-        if not youtube_oauth:
-            return jsonify({
-                'status': 'error',
-                'message': 'YouTube OAuth не инициализирован'
-            })
-
-        auth_url = youtube_oauth.get_auth_url()
-        if not auth_url:
-            return jsonify({
-                'status': 'error',
-                'message': 'Не удалось получить URL авторизации. Проверьте client_secrets.json'
-            })
-
-        return redirect(auth_url)
-
-    except Exception as e:
-        logger.error(f"Ошибка начала OAuth: {e}")
-        return jsonify({'status': 'error', 'message': str(e)})
-
-
-@app.route('/oauth2callback')
-def oauth_callback():
-    """Callback URL для OAuth"""
-    try:
-        authorization_code = request.args.get('code')
-        if not authorization_code:
-            return jsonify({
-                'status': 'error',
-                'message': 'Код авторизации не получен'
-            })
-
-        if youtube_oauth.authenticate_with_code(authorization_code):
-            return """
-            <html>
-            <body>
-                <h1>✅ Авторизация успешна!</h1>
-                <p>Теперь вы можете создавать YouTube трансляции.</p>
-                <p><a href="/">Вернуться к управлению стримом</a></p>
-            </body>
-            </html>
-            """
-        else:
-            return """
-            <html>
-            <body>
-                <h1>❌ Ошибка авторизации</h1>
-                <p>Не удалось авторизоваться в YouTube.</p>
-                <p><a href="/">Вернуться к управлению стримом</a></p>
-            </body>
-            </html>
-            """
-
-    except Exception as e:
-        logger.error(f"Ошибка OAuth callback: {e}")
-        return f"""
-        <html>
-        <body>
-            <h1>❌ Ошибка</h1>
-            <p>{str(e)}</p>
-            <p><a href="/">Вернуться к управлению стримом</a></p>
-        </body>
-        </html>
-        """
-
-
-@app.route('/api/start_youtube_oauth_stream', methods=['POST'])
-def start_youtube_oauth_stream():
-    """Запуск стрима через YouTube OAuth API"""
-    try:
-        if not youtube_oauth:
-            return jsonify({
-                'status': 'error',
-                'message': 'YouTube OAuth не настроен'
-            }), 501
-
-        # Проверяем аутентификацию
-        if not youtube_oauth.youtube:
-            # Если не аутентифицирован, возвращаем URL для авторизации
-            auth_url = youtube_oauth.get_auth_url()
-            if auth_url:
-                return jsonify({
-                    'status': 'auth_required',
-                    'auth_url': auth_url,
-                    'message': 'Требуется авторизация в YouTube'
-                })
-            else:
-                return jsonify({
-                    'status': 'error',
-                    'message': 'Не удалось получить URL авторизации'
-                })
-
-        # Получаем параметры
-        if request.is_json:
-            data = request.get_json()
-        else:
-            data = request.form
-
-        title = data.get('title', "🤖 AI Agents Live: Научные дебаты ИИ")
-        description = data.get('description', Config.STREAM_DESCRIPTION)
-        privacy_status = data.get('privacy_status', 'unlisted')
-        resolution = data.get('resolution', '1080p')
-
-        logger.info(f"🎬 Запуск YouTube стрима через OAuth: {title}")
-
-        # Создаем трансляцию через YouTube API
-        result = youtube_oauth.start_full_stream(
-            title=title,
-            description=description,
-            privacy_status=privacy_status,
-            resolution=resolution
-        )
-
-        if result and result.get('success'):
-            # Устанавливаем stream key в FFmpeg менеджер
-            ffmpeg_manager.set_stream_key(result['stream_key'])
-
-            # Запускаем FFmpeg стрим
-            ffmpeg_result = ffmpeg_manager.start_stream()
-
-            if ffmpeg_result.get('success'):
-                return jsonify({
-                    'status': 'started',
-                    'broadcast_id': youtube_oauth.broadcast_id,
-                    'stream_id': youtube_oauth.stream_id,
-                    'watch_url': f"https://youtube.com/watch?v={youtube_oauth.broadcast_id}",
-                    'stream_key': youtube_oauth.stream_key,
-                    'rtmp_url': youtube_oauth.rtmp_url,
-                    'pid': ffmpeg_manager.ffmpeg_pid,
-                    'message': 'YouTube трансляция создана и FFmpeg стрим запущен. Трансляция начнется автоматически через 30-60 секунд.'
-                })
-            else:
-                return jsonify({
-                    'status': 'error',
-                    'message': f'Трансляция создана, но не удалось запустить FFmpeg стрим: {ffmpeg_result.get("error", "Unknown error")}'
-                }), 500
-        else:
-            error_msg = result.get('message', 'Неизвестная ошибка') if result else 'Не удалось создать трансляцию'
-            return jsonify({
-                'status': 'error',
-                'message': error_msg
-            }), 500
-
-    except Exception as e:
-        logger.error(f"Ошибка запуска YouTube стрима: {e}", exc_info=True)
-        return jsonify({
-            'status': 'error',
-            'message': f'Внутренняя ошибка сервера: {str(e)}'
-        }), 500
-
-
-@app.route('/api/test_audio/<int:agent_id>')
-def test_audio(agent_id):
-    """Тестирование аудио для агента"""
-    try:
-        # Найти агента
-        agent = None
-        for a in stream_manager.agents:
-            if a.id == agent_id:
-                agent = a
-                break
-
-        if not agent:
-            return jsonify({'success': False, 'error': 'Агент не найден'})
-
-        # Тестовый текст
-        test_text = f"Привет! Это тестовое сообщение от {agent.name}. Проверка звука на стриме."
-
-        # Запустить в отдельном потоке
-        def run_test():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-            audio_file = loop.run_until_complete(
-                stream_manager.tts_manager.text_to_speech_and_stream(
-                    text=test_text,
-                    voice_id=agent.voice,
-                    agent_name=agent.name
-                )
-            )
-
-            return audio_file
-
-        thread = threading.Thread(target=run_test)
-        thread.start()
-        thread.join(timeout=30)
-
-        return jsonify({
-            'success': True,
-            'message': f'Тестовое аудио для {agent.name} отправлено'
-        })
-
-    except Exception as e:
-        logger.error(f"Ошибка тестирования аудио: {e}")
-        return jsonify({'success': False, 'error': str(e)})
-
-
 @app.route('/')
 def index():
     """Главная страница"""
-    youtube_status = {
-        'available': youtube_oauth is not None,
-        'authenticated': youtube_oauth is not None and youtube_oauth.youtube is not None,
-        'has_broadcast': youtube_oauth is not None and youtube_oauth.broadcast_id is not None,
-        'is_live': youtube_oauth is not None and youtube_oauth.is_live,
-        'broadcast_id': youtube_oauth.broadcast_id if youtube_oauth else None,
-        'stream_key': youtube_oauth.stream_key if youtube_oauth else None,
-        'rtmp_url': youtube_oauth.rtmp_url if youtube_oauth else None
-    }
-
     return render_template('index.html',
                            agents=stream_manager.get_agents_state(),
                            topic=stream_manager.current_topic or "Загрузка темы...",
-                           stats=stream_manager.get_stats(),
-                           youtube_status=youtube_status)
+                           stats=stream_manager.get_stats())
 
 
 @app.route('/api/agents')
@@ -2465,25 +882,10 @@ def get_stats():
 
 @app.route('/api/start_discussion', methods=['POST'])
 def api_start_discussion():
-    """Ручной запуск дискуссии с триггером в event loop"""
+    """Ручной запуск дискуссии"""
     try:
         if not stream_manager.is_discussion_active:
             stream_manager.is_discussion_active = True
-
-            # Если есть event loop, можно триггернуть
-            if discussion_loop_event_loop and discussion_loop_event_loop.is_running():
-                # Триггерим запуск в event loop дискуссии
-                def trigger_discussion():
-                    if discussion_loop_event_loop.is_running():
-                        # Запланировать задачу в event loop
-                        asyncio.run_coroutine_threadsafe(
-                            stream_manager.run_discussion_round(),
-                            discussion_loop_event_loop
-                        )
-
-                # Запускаем в отдельном потоке для безопасности
-                threading.Thread(target=trigger_discussion, daemon=True).start()
-
             topic = stream_manager.select_topic()
 
             return jsonify({
@@ -2511,67 +913,51 @@ def api_stop_discussion():
     return jsonify({'success': True, 'message': 'Дискуссия остановлена'})
 
 
-@app.route('/api/youtube_control', methods=['POST'])
-def api_youtube_control():
-    """Управление YouTube трансляцией"""
+@app.route('/api/test_audio/<int:agent_id>')
+def test_audio(agent_id):
+    """Тестирование аудио для агента"""
     try:
-        data = request.get_json() if request.is_json else request.form
-        action = data.get('action', 'get_info')
+        # Найти агента
+        agent = None
+        for a in stream_manager.agents:
+            if a.id == agent_id:
+                agent = a
+                break
 
-        if not youtube_oauth:
-            return jsonify({
-                'status': 'error',
-                'message': 'YouTube OAuth не настроен'
-            })
+        if not agent:
+            return jsonify({'success': False, 'error': 'Агент не найден'})
 
-        if action == 'get_info':
-            metrics = youtube_oauth.get_metrics()
-            return jsonify({
-                'status': 'success',
-                'authenticated': youtube_oauth.youtube is not None,
-                'has_broadcast': youtube_oauth.broadcast_id is not None,
-                'is_live': youtube_oauth.is_live,
-                'broadcast_id': youtube_oauth.broadcast_id,
-                'stream_id': youtube_oauth.stream_id,
-                'stream_info': {
-                    'stream_key': youtube_oauth.stream_key,
-                    'rtmp_url': youtube_oauth.rtmp_url
-                },
-                'metrics': metrics
-            })
+        # Тестовый текст
+        test_text = f"Привет! Это тестовое сообщение от {agent.name}. Проверка звука на стриме."
 
-        elif action == 'start_stream':
-            title = data.get('title', "🤖 AI Agents Live Stream")
-            description = data.get('description', Config.STREAM_DESCRIPTION)
+        # Запустить в отдельном потоке
+        def run_test():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
 
-            result = youtube_oauth.start_full_stream(
-                title=title,
-                description=description
+            audio_file = loop.run_until_complete(
+                stream_manager.tts_manager.generate_audio_only(
+                    text=test_text,
+                    voice_id=agent.voice,
+                    agent_name=agent.name
+                )
             )
 
-            if result and result.get('success'):
-                return jsonify({
-                    'status': 'started',
-                    **result
-                })
-            else:
-                return jsonify({
-                    'status': 'error',
-                    'message': 'Не удалось создать трансляцию'
-                }), 500
+            if audio_file and ffmpeg_manager:
+                ffmpeg_manager.add_audio_to_queue(audio_file)
 
-        else:
-            return jsonify({
-                'status': 'error',
-                'message': f'Неизвестное действие: {action}'
-            }), 400
+        thread = threading.Thread(target=run_test)
+        thread.start()
+        thread.join(timeout=30)
+
+        return jsonify({
+            'success': True,
+            'message': f'Тестовое аудио для {agent.name} отправлено'
+        })
 
     except Exception as e:
-        logger.error(f"Ошибка YouTube контроля: {e}")
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
+        logger.error(f"Ошибка тестирования аудио: {e}")
+        return jsonify({'success': False, 'error': str(e)})
 
 
 @app.route('/api/test_audio', methods=['POST'])
@@ -2588,13 +974,15 @@ def api_test_audio():
             asyncio.set_event_loop(loop)
 
             audio_file = loop.run_until_complete(
-                stream_manager.tts_manager.text_to_speech_and_stream(
+                stream_manager.tts_manager.generate_audio_only(
                     text=text,
                     voice_id=voice,
                     agent_name="Тест"
                 )
             )
-            return audio_file
+
+            if audio_file and ffmpeg_manager:
+                ffmpeg_manager.add_audio_to_queue(audio_file)
 
         thread = threading.Thread(target=run_test)
         thread.start()
@@ -2699,16 +1087,11 @@ def api_start_stream():
         result = ffmpeg_manager.start_stream()
 
         if result.get('success'):
-            # Уведомляем всех клиентов
-            socketio.emit('stream_started', {
-                'pid': result['pid'],
-                'rtmp_url': ffmpeg_manager.rtmp_url
-            })
-
             return jsonify({
                 'status': 'started',
                 'pid': result['pid'],
                 'rtmp_url': ffmpeg_manager.rtmp_url,
+                'stream_key': ffmpeg_manager.stream_key[:10] + '...',
                 'message': 'Стрим запущен'
             })
         else:
@@ -2724,6 +1107,7 @@ def api_start_stream():
             'message': str(e)
         }), 500
 
+
 @app.route('/api/stream_status')
 def get_stream_status():
     """Получение статуса стрима"""
@@ -2735,25 +1119,12 @@ def get_stream_health():
     """Получение здоровья стрима"""
     return jsonify(ffmpeg_manager.get_stream_health())
 
+
 @app.route('/api/change_topic', methods=['POST'])
 def api_change_topic():
     """Смена темы"""
     topic = stream_manager.select_topic()
     return jsonify({'success': True, 'topic': topic})
-
-@app.route('/youtube-control')
-def youtube_control():
-    """Страница управления YouTube API"""
-    return render_template('youtube_control.html')
-
-
-@app.route('/api/youtube_auth_status')
-def youtube_auth_status():
-    """Проверка статуса аутентификации YouTube"""
-    if youtube_oauth and youtube_oauth.youtube:
-        return jsonify({'authenticated': True})
-    else:
-        return jsonify({'authenticated': False})
 
 
 # ========== SOCKET.IO HANDLERS ==========
@@ -2787,6 +1158,22 @@ def handle_request_update():
 def handle_disconnect():
     logger.info(f"📡 Клиент отключен: {request.sid}")
 
+
+@socketio.on('stream_started')
+def handle_stream_started(data):
+    logger.info(f"🎬 Стрим запущен: {data}")
+
+
+@socketio.on('stream_stopped')
+def handle_stream_stopped(data):
+    logger.info(f"🛑 Стрим остановлен: {data}")
+
+
+@socketio.on('stream_connected')
+def handle_stream_connected(data):
+    logger.info(f"✅ Стрим подключен к YouTube: {data}")
+
+
 def signal_handler(signum, frame):
     """Обработчик сигналов"""
     print(f"\n🛑 Получен сигнал {signum}. Завершение...")
@@ -2796,8 +1183,6 @@ def signal_handler(signum, frame):
         ffmpeg_manager.stop_stream()
 
     sys.exit(0)
-
-
 if __name__ == '__main__':
     # Инициализируем event loop для дискуссий
     discussion_loop_event_loop = asyncio.new_event_loop()
@@ -2807,21 +1192,14 @@ if __name__ == '__main__':
     signal.signal(signal.SIGTERM, signal_handler)
 
     print("=" * 70)
-    print("🤖 AI AGENTS STREAM WITH FFMPEG")
+    print("🤖 AI AGENTS STREAM - ПРЯМОЙ STREAM KEY РЕЖИМ")
     print("=" * 70)
 
-    # Информация о зависимостях
-    print(f"📦 Версии зависимостей:")
-    print(f"   Flask: 2.3.0")
-    print(f"   Flask-SocketIO: 5.3.0")
-    print(f"   OpenAI: >=1.3.0")
-    print(f"   Edge TTS: >=6.1.9")
-    print(f"   FFmpeg: системный")
-
-    if YOUTUBE_OAUTH_AVAILABLE:
-        print(f"   YouTube API: Доступен ✅")
-    else:
-        print(f"   YouTube API: Не доступен (используйте ручной Stream Key)")
+    print("📦 Используемые технологии:")
+    print("   • FFmpeg для прямой трансляции на YouTube")
+    print("   • OpenAI GPT для генерации диалогов")
+    print("   • Edge TTS для генерации голоса")
+    print("   • WebSocket для реального обновления UI")
 
     # Создаем директории
     os.makedirs("stream_ui", exist_ok=True)

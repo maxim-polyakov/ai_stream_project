@@ -84,7 +84,7 @@ else:
 # ========== FFMPEG STREAM MANAGER с ПАЙПАМИ ==========
 
 class FFmpegStreamManager:
-    """Управление FFmpeg стримом на YouTube через stream key"""
+    """Управление FFmpeg стримом на YouTube с фоновой тишиной"""
 
     def __init__(self):
         self.stream_process = None
@@ -92,41 +92,58 @@ class FFmpegStreamManager:
         self.stream_key = None
         self.rtmp_url = None
         self.ffmpeg_pid = None
-        self.video_source = "black"
         self.ffmpeg_stdin = None
         self.start_time = None
-        self.audio_queue = []  # Очередь аудио файлов для воспроизведения
+        self.audio_queue = []
         self.is_playing_audio = False
+        self.silence_generator = None
 
-        # Настройки аудио
-        self.audio_sample_rate = 44100
-        self.audio_channels = 2
-
-        # Флаг для определения, используем ли мы PyAudio
-        self.use_pyaudio = PYTHON_AUDIO_AVAILABLE
-
-        logger.info("FFmpeg Stream Manager инициализирован")
+        logger.info("FFmpeg Stream Manager инициализирован с поддержкой тишины")
 
     def set_stream_key(self, stream_key: str) -> bool:
         """Установка ключа стрима"""
         self.stream_key = stream_key
         self.rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
         logger.info(f"🔑 Stream Key установлен: {stream_key[:10]}...")
-        logger.info(f"📍 RTMP URL: {self.rtmp_url}")
         return True
 
-    def stream_audio_pipe(self, audio_file: str) -> bool:
-        """Более надежный метод отправки аудио через конвертацию в WAV"""
+    def _generate_silence(self):
+        """Генератор бесконечной тишины (нулевые PCM сэмплы)"""
+        chunk_size = 88200  # 0.5 секунды аудио (44100 Hz * 2 channels * 2 bytes * 0.5 sec)
+
+        while self.is_streaming:
+            try:
+                # Создаем тишину: нулевые байты
+                silence_chunk = b'\x00' * chunk_size
+
+                if self.ffmpeg_stdin and self.is_streaming:
+                    self.ffmpeg_stdin.write(silence_chunk)
+                    self.ffmpeg_stdin.flush()
+
+                # Небольшая пауза между чанками
+                time.sleep(0.45)  # Немного меньше 0.5 сек для непрерывности
+
+            except BrokenPipeError:
+                logger.error("❌ Broken pipe: основной FFmpeg процесс завершился")
+                break
+            except Exception as e:
+                logger.error(f"❌ Ошибка генерации тишины: {e}")
+                time.sleep(0.1)
+
+    def stream_audio_file(self, audio_file: str) -> bool:
+        """Отправка аудио файла поверх тишины"""
         if not self.is_streaming or not self.ffmpeg_stdin:
             logger.error("❌ Стрим не активен или stdin недоступен")
             return False
 
         try:
-            # Сначала конвертируем MP3 в WAV файл
+            logger.info(f"🔊 Воспроизведение аудио: {os.path.basename(audio_file)}")
+
+            # Сначала конвертируем в сырые PCM данные
             temp_wav = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
             temp_wav.close()
 
-            # Конвертация MP3 -> WAV
+            # Конвертация в WAV/PCM
             convert_cmd = [
                 'ffmpeg',
                 '-i', audio_file,
@@ -137,137 +154,83 @@ class FFmpegStreamManager:
                 temp_wav.name
             ]
 
-            logger.info(f"🔄 Конвертация MP3 в WAV: {os.path.basename(audio_file)}")
-
             result = subprocess.run(convert_cmd, capture_output=True, text=True, timeout=10)
 
             if result.returncode != 0:
-                logger.error(f"❌ Ошибка конвертации в WAV: {result.stderr[:200]}")
+                logger.error(f"❌ Ошибка конвертации аудио: {result.stderr[:200]}")
                 os.unlink(temp_wav.name)
                 return False
 
-            # Теперь читаем WAV файл и отправляем сырые PCM данные
-            wav_file_size = os.path.getsize(temp_wav.name)
-
-            # В WAV файле первые 44 байта - заголовок
-            header_size = 44
-
-            logger.info(f"📤 Отправка WAV аудио: {os.path.basename(audio_file)} ({wav_file_size} байт)")
+            # Читаем и отправляем PCM данные
+            header_size = 44  # Размер WAV заголовка
 
             with open(temp_wav.name, 'rb') as wav_file:
-                # Пропускаем заголовок WAV
                 wav_file.seek(header_size)
 
-                chunk_size = 88200  # 0.5 секунды аудио
+                chunk_size = 88200  # 0.5 секунды
                 total_sent = 0
 
                 while True:
-                    # Читаем PCM данные
                     audio_data = wav_file.read(chunk_size)
                     if not audio_data:
                         break
 
-                    # Проверяем статус основного процесса
-                    if not self.is_streaming:
-                        logger.warning("⚠️ Стрим остановлен во время отправки аудио")
-                        break
-
-                    # Отправляем данные
+                    # Отправляем аудио данные
                     try:
-                        self.ffmpeg_stdin.write(audio_data)
-                        self.ffmpeg_stdin.flush()
-                        total_sent += len(audio_data)
-                    except BrokenPipeError:
-                        logger.error("❌ Broken pipe: основной FFmpeg процесс завершился")
-                        break
+                        if self.ffmpeg_stdin and self.is_streaming:
+                            self.ffmpeg_stdin.write(audio_data)
+                            self.ffmpeg_stdin.flush()
+                            total_sent += len(audio_data)
+                        else:
+                            break
                     except Exception as e:
-                        logger.error(f"❌ Ошибка записи аудио: {e}")
+                        logger.error(f"❌ Ошибка отправки аудио: {e}")
                         break
 
-            # Очистка
+            # Очистка временного файла
             try:
                 os.unlink(temp_wav.name)
             except:
                 pass
 
-            logger.info(f"✅ Аудио отправлено ({total_sent} байт PCM данных)")
-            return total_sent > 0
+            logger.info(f"✅ Аудио отправлено: {total_sent} байт")
+            return True
 
         except Exception as e:
-            logger.error(f"❌ Ошибка stream_audio_pipe_safe: {e}", exc_info=True)
+            logger.error(f"❌ Ошибка воспроизведения аудио: {e}", exc_info=True)
             return False
 
-    def _audio_queue_processor(self):
-        """Обработчик очереди аудио файлов"""
-        while self.is_streaming:
-            try:
-                if self.audio_queue:
-                    # Берем следующий файл из очереди
-                    audio_file = self.audio_queue.pop(0)
-                    logger.info(f"🎵 Воспроизведение аудио из очереди: {os.path.basename(audio_file)}")
-
-                    # Отправляем аудио
-                    success = self.stream_audio_pipe(audio_file)
-
-                    if not success:
-                        logger.warning(f"⚠️ Не удалось воспроизвести аудио, пропускаем")
-
-                    # Удаляем временный файл если он был создан TTS
-                    if audio_file.startswith(tempfile.gettempdir()):
-                        try:
-                            os.unlink(audio_file)
-                        except:
-                            pass
-                else:
-                    # Если очередь пуста, ждем
-                    time.sleep(0.1)
-
-            except Exception as e:
-                logger.error(f"❌ Ошибка в обработчике аудио: {e}")
-                time.sleep(0.1)
-
-    def add_audio_to_queue(self, audio_file: str) -> bool:
-        """Добавление аудио файла в очередь на воспроизведение"""
-        if not os.path.exists(audio_file):
-            logger.error(f"❌ Аудио файл не найден: {audio_file}")
-            return False
-
-        self.audio_queue.append(audio_file)
-        logger.info(f"📥 Аудио добавлено в очередь: {os.path.basename(audio_file)}")
-        logger.info(f"📊 Размер очереди: {len(self.audio_queue)} файлов")
-        return True
-
-    def start_stream(self, use_audio: bool = True):
-        """Запуск FFmpeg стрима с поддержкой аудио через stdin"""
+    def start_stream(self):
+        """Запуск FFmpeg стрима с фоновой тишиной"""
         if not self.stream_key:
             logger.error("❌ Stream Key не установлен!")
             return {'success': False, 'error': 'Stream Key не установлен'}
 
         try:
             self.start_time = time.time()
+            self.audio_queue = []
 
-            # Инициализируем переменные для аудио
-            self.audio_queue = []  # Очередь аудио файлов
-            self.current_audio = None
-            self.ffmpeg_stdin = None
-
-            # Команда FFmpeg с поддержкой аудио через stdin
+            # Команда FFmpeg для стрима с тишиной
             ffmpeg_cmd = [
                 'ffmpeg',
                 '-re',
 
-                # Видео источник
+                # Видео источник (статичное изображение)
                 '-f', 'lavfi',
-                '-i', 'color=size=1920x1080:rate=30:color=black',
+                '-i', 'color=size=1920x1080:rate=30:color=0x1a1a2e',
 
-                # Аудио источник через stdin (сырые PCM данные)
-                '-f', 's16le',  # Формат: 16-bit signed little-endian PCM
-                '-ar', '44100',  # Частота дискретизации: 44.1 kHz
-                '-ac', '2',  # Стерео
+                # Аудио источник - тишина через stdin
+                '-f', 's16le',
+                '-ar', '44100',
+                '-ac', '2',
                 '-channel_layout', 'stereo',
-                '-i', 'pipe:0',  # Читать из stdin
+                '-i', 'pipe:0',
 
-                # Видео кодек
+                # Фильтр для улучшения видео
+                '-vf',
+                'drawtext=text="AI Agents Live":fontcolor=white:fontsize=40:box=1:boxcolor=black@0.5:boxborderw=5:x=(w-text_w)/2:y=20',
+
+                # Видео настройки
                 '-c:v', 'libx264',
                 '-preset', 'veryfast',
                 '-tune', 'zerolatency',
@@ -276,9 +239,9 @@ class FFmpegStreamManager:
                 '-b:v', '4500k',
                 '-maxrate', '4500k',
                 '-bufsize', '9000k',
-                '-r', '30',  # Частота кадров
+                '-r', '30',
 
-                # Аудио кодек
+                # Аудио настройки
                 '-c:a', 'aac',
                 '-b:a', '128k',
                 '-ar', '44100',
@@ -291,25 +254,30 @@ class FFmpegStreamManager:
                 self.rtmp_url
             ]
 
-            logger.info(f"🚀 Запуск FFmpeg стрима на YouTube")
-            logger.info(f"🔑 Stream Key: {self.stream_key[:10]}...")
-            logger.info(f"📍 RTMP URL: {self.rtmp_url}")
+            logger.info(f"🚀 Запуск FFmpeg стрима с фоновой тишиной")
 
             # Запускаем FFmpeg
             self.stream_process = subprocess.Popen(
                 ffmpeg_cmd,
-                stdin=subprocess.PIPE,  # КРИТИЧЕСКИ ВАЖНО!
+                stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
-                bufsize=0,  # Небуферизованный ввод/вывод
-                text=False  # Бинарный режим
+                bufsize=0,
+                text=False
             )
 
             self.is_streaming = True
             self.ffmpeg_pid = self.stream_process.pid
-            self.ffmpeg_stdin = self.stream_process.stdin  # ВАЖНО: сохраняем stdin
+            self.ffmpeg_stdin = self.stream_process.stdin
 
             logger.info(f"✅ FFmpeg запущен (PID: {self.ffmpeg_pid})")
+
+            # Запускаем генератор тишины в отдельном потоке
+            self.silence_generator = threading.Thread(
+                target=self._generate_silence,
+                daemon=True
+            )
+            self.silence_generator.start()
 
             # Запускаем мониторинг
             threading.Thread(target=self._monitor_ffmpeg, daemon=True).start()
@@ -317,7 +285,6 @@ class FFmpegStreamManager:
             # Запускаем обработчик аудио очереди
             threading.Thread(target=self._audio_queue_processor, daemon=True).start()
 
-            logger.info(f"🎬 FFmpeg стрим запущен (PID: {self.ffmpeg_pid})")
             socketio.emit('stream_started', {
                 'pid': self.ffmpeg_pid,
                 'rtmp_url': self.rtmp_url,
@@ -330,6 +297,79 @@ class FFmpegStreamManager:
             logger.error(f"❌ Ошибка запуска FFmpeg: {e}", exc_info=True)
             return {'success': False, 'error': str(e)}
 
+    def _audio_queue_processor(self):
+        """Обработчик очереди аудио файлов"""
+        while self.is_streaming:
+            try:
+                if self.audio_queue:
+                    audio_file = self.audio_queue.pop(0)
+
+                    if os.path.exists(audio_file):
+                        logger.info(f"🎵 Воспроизведение: {os.path.basename(audio_file)}")
+
+                        # Отмечаем что воспроизводим аудио
+                        self.is_playing_audio = True
+
+                        # Воспроизводим аудио файл
+                        success = self.stream_audio_file(audio_file)
+
+                        # Возвращаемся к тишине
+                        self.is_playing_audio = False
+
+                        if success:
+                            # Получаем длительность аудио
+                            duration = self._get_audio_duration(audio_file)
+                            logger.info(f"⏱️  Аудио длилось: {duration:.1f} сек")
+                        else:
+                            logger.warning(f"⚠️ Не удалось воспроизвести аудио")
+
+                        # Удаляем временный файл
+                        if audio_file.startswith(tempfile.gettempdir()):
+                            try:
+                                os.unlink(audio_file)
+                            except:
+                                pass
+                else:
+                    time.sleep(0.1)
+
+            except Exception as e:
+                logger.error(f"❌ Ошибка в обработчике аудио: {e}")
+                time.sleep(0.1)
+
+    def _get_audio_duration(self, audio_file: str) -> float:
+        """Получение длительности аудио файла"""
+        try:
+            cmd = [
+                'ffprobe',
+                '-v', 'error',
+                '-show_entries', 'format=duration',
+                '-of', 'default=noprint_wrappers=1:nokey=1',
+                audio_file
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+
+            if result.returncode == 0 and result.stdout.strip():
+                return float(result.stdout.strip())
+            else:
+                # Примерная оценка
+                file_size = os.path.getsize(audio_file)
+                return file_size / (128000 / 8)  # 128 kbps
+
+        except:
+            return 5.0  # Значение по умолчанию
+
+    def add_audio_to_queue(self, audio_file: str) -> bool:
+        """Добавление аудио файла в очередь"""
+        if not os.path.exists(audio_file):
+            logger.error(f"❌ Аудио файл не найден: {audio_file}")
+            return False
+
+        self.audio_queue.append(audio_file)
+        logger.info(f"📥 Аудио добавлено в очередь: {os.path.basename(audio_file)}")
+        logger.info(f"📊 Размер очереди: {len(self.audio_queue)} файлов")
+        return True
+
     def _monitor_ffmpeg(self):
         """Мониторинг процесса FFmpeg"""
         try:
@@ -338,21 +378,18 @@ class FFmpegStreamManager:
             for line in iter(self.stream_process.stderr.readline, b''):
                 line = line.decode('utf-8', errors='ignore').strip()
 
-                # Проверяем подключение
-                if 'rtmp://' in line and ('connected' in line.lower() or 'connected to' in line.lower()):
+                if 'rtmp://' in line and 'connected' in line.lower():
                     if not stream_connected:
                         stream_connected = True
                         logger.info("✅ Успешное подключение к YouTube RTMP серверу")
                         socketio.emit('stream_connected', {'status': 'connected'})
 
-                # Логируем статистику
                 if 'frame=' in line and 'fps=' in line:
-                    logger.debug(f"FFmpeg: {line}")
-                elif 'error' in line.lower() or 'failed' in line.lower():
+                    if self.is_playing_audio:
+                        logger.debug(f"FFmpeg (audio playing): {line}")
+                elif 'error' in line.lower():
                     logger.error(f"FFmpeg error: {line}")
-                    socketio.emit('stream_error', {'message': line})
 
-            # Ждем завершения процесса
             self.stream_process.wait()
 
         except Exception as e:
@@ -364,7 +401,7 @@ class FFmpegStreamManager:
                     self.ffmpeg_stdin.close()
                 except:
                     pass
-            socketio.emit('stream_stopped', {'time': datetime.now().isoformat()})
+            socketio.emit('stream_stopped')
 
     def stop_stream(self):
         """Остановка стрима"""
@@ -373,23 +410,18 @@ class FFmpegStreamManager:
             self.is_streaming = False
 
             try:
-                # Очищаем очередь аудио
                 self.audio_queue.clear()
 
-                # Закрываем stdin
                 if self.ffmpeg_stdin:
                     self.ffmpeg_stdin.close()
 
-                # Отправляем SIGTERM
                 self.stream_process.terminate()
 
-                # Ждем завершения
                 for _ in range(20):
                     if self.stream_process.poll() is not None:
                         break
                     time.sleep(0.5)
 
-                # Если все еще жив - SIGKILL
                 if self.stream_process.poll() is None:
                     self.stream_process.kill()
                     self.stream_process.wait()
@@ -400,7 +432,6 @@ class FFmpegStreamManager:
             except Exception as e:
                 logger.error(f"❌ Ошибка остановки FFmpeg: {e}")
                 return False
-
         return True
 
     def get_status(self):
@@ -414,29 +445,11 @@ class FFmpegStreamManager:
             'is_playing_audio': self.is_playing_audio
         }
 
-    def get_stream_health(self):
-        """Проверка здоровья стрима"""
-        status = self.get_status()
-
-        # Проверяем, жив ли процесс
-        if self.stream_process:
-            status['process_alive'] = (self.stream_process.poll() is None)
-            if not status['process_alive']:
-                status['exit_code'] = self.stream_process.poll()
-        else:
-            status['process_alive'] = False
-
-        # Проверяем время работы
-        if self.start_time:
-            status['uptime'] = time.time() - self.start_time
-
-        return status
-
 
 # ========== EDGE TTS MANAGER ==========
 
 class EdgeTTSManager:
-    """Менеджер TTS для генерации аудио и передачи в стрим"""
+    """Менеджер TTS для генерации аудио"""
 
     def __init__(self, ffmpeg_manager: FFmpegStreamManager = None):
         self.cache_dir = 'audio_cache'
@@ -450,18 +463,10 @@ class EdgeTTSManager:
             'female_ru_soft': 'ru-RU-DariyaNeural'
         }
 
-        # Инициализация pygame для локального воспроизведения
-        try:
-            pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=2048)
-            self.pygame_available = True
-        except:
-            self.pygame_available = False
-            logger.warning("⚠️ Pygame не доступен для локального воспроизведения")
-
         logger.info("Edge TTS Manager инициализирован")
 
     async def generate_audio_only(self, text: str, voice_id: str = 'male_ru', agent_name: str = "") -> Optional[str]:
-        """Генерация аудио файла БЕЗ воспроизведения"""
+        """Генерация аудио файла"""
         try:
             if voice_id not in self.voice_map:
                 voice_id = 'male_ru'
@@ -485,7 +490,7 @@ class EdgeTTSManager:
                 pitch = '+10Hz'
 
             # Генерация аудио
-            logger.info(f"🔊 Генерация аудио: {agent_name} ({voice_name}) - {len(text)} символов")
+            logger.info(f"🔊 Генерация аудио: {agent_name} ({voice_name})")
 
             communicate = edge_tts.Communicate(
                 text=text,
@@ -496,58 +501,17 @@ class EdgeTTSManager:
 
             await communicate.save(cache_file)
 
-            # Проверяем, что файл создан и не пустой
             if os.path.exists(cache_file) and os.path.getsize(cache_file) > 0:
-                logger.info(f"💾 Аудио сохранено: {os.path.basename(cache_file)}")
-
-                # Получаем информацию о файле
-                file_size = os.path.getsize(cache_file) / 1024  # KB
-                duration = self._get_audio_duration(cache_file)
-
-                logger.info(f"📊 Размер файла: {file_size:.1f} KB, Длительность: {duration:.1f} сек")
-
+                file_size = os.path.getsize(cache_file) / 1024
+                logger.info(f"💾 Аудио сохранено: {os.path.basename(cache_file)} ({file_size:.1f} KB)")
                 return cache_file
             else:
-                logger.error(f"❌ Аудио файл не создан или пустой: {cache_file}")
+                logger.error(f"❌ Аудио файл не создан")
                 return None
 
         except Exception as e:
             logger.error(f"❌ Ошибка генерации аудио: {e}", exc_info=True)
             return None
-
-    def _get_audio_duration(self, audio_file: str) -> float:
-        """Получение длительности аудио файла в секундах"""
-        try:
-            if not os.path.exists(audio_file):
-                logger.error(f"Файл не найден: {audio_file}")
-                return 0.0
-
-            # Используем ffprobe для получения точной длительности
-            cmd = [
-                'ffprobe',
-                '-v', 'error',
-                '-show_entries', 'format=duration',
-                '-of', 'default=noprint_wrappers=1:nokey=1',
-                audio_file
-            ]
-
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-
-            if result.returncode == 0 and result.stdout.strip():
-                duration = float(result.stdout.strip())
-                return duration
-            else:
-                logger.warning(f"Не удалось получить длительность через ffprobe: {result.stderr}")
-
-                # Альтернативный метод: оцениваем по размеру файла
-                file_size = os.path.getsize(audio_file)  # в байтах
-                bitrate = 128000  # 128 kbps
-                duration = file_size * 8 / bitrate  # в секундах
-                return duration
-
-        except Exception as e:
-            logger.warning(f"Ошибка получения длительности аудио: {e}")
-            return 5.0  # Значение по умолчанию
 
 
 # ========== AI AGENT ==========
@@ -633,7 +597,7 @@ class AIStreamManager:
     """Менеджер стрима"""
 
     def __init__(self, ffmpeg_manager: FFmpegStreamManager = None):
-        self.agents: List[AIAgent] = []
+        self.agents = []
         self.tts_manager = EdgeTTSManager(ffmpeg_manager)
         self.ffmpeg_manager = ffmpeg_manager
         self.current_topic = ""
@@ -660,7 +624,7 @@ class AIStreamManager:
         return self.current_topic
 
     async def run_discussion_round(self):
-        """Запуск раунда дискуссии с отправкой звука в стрим"""
+        """Запуск раунда дискуссии"""
         if self.is_discussion_active:
             return
 
@@ -673,7 +637,6 @@ class AIStreamManager:
 
             logger.info(f"🚀 Начало раунда #{self.discussion_round}")
 
-            # Определяем порядок выступлений
             speaking_order = random.sample(self.agents, len(self.agents))
 
             for agent in speaking_order:
@@ -688,8 +651,7 @@ class AIStreamManager:
                     'expertise': agent.expertise
                 })
 
-                # Генерация ответа через OpenAI
-                logger.info(f"🤖 {agent.name} генерирует ответ...")
+                # Генерация ответа
                 message = await agent.generate_response(
                     self.current_topic,
                     self.conversation_history
@@ -699,7 +661,7 @@ class AIStreamManager:
                 self.conversation_history.append(f"{agent.name}: {message}")
                 self.message_count += 1
 
-                # Отправляем сообщение в WebSocket
+                # Отправляем сообщение
                 socketio.emit('new_message', {
                     'agent_id': agent.id,
                     'agent_name': agent.name,
@@ -712,9 +674,7 @@ class AIStreamManager:
 
                 logger.info(f"💬 {agent.name}: {message[:80]}...")
 
-                # Генерация аудио файла
-                logger.info(f"🔊 Генерация TTS для {agent.name}...")
-
+                # Генерация аудио
                 audio_file = await self.tts_manager.generate_audio_only(
                     text=message,
                     voice_id=agent.voice,
@@ -726,24 +686,18 @@ class AIStreamManager:
                     success = self.ffmpeg_manager.add_audio_to_queue(audio_file)
 
                     if success:
-                        # Получаем длительность аудио
-                        audio_duration = self.tts_manager._get_audio_duration(audio_file)
-                        logger.info(f"⏱️  Ожидание завершения аудио: {audio_duration:.1f} сек")
+                        # Ждем завершения аудио
+                        audio_duration = self._get_audio_duration(audio_file)
+                        logger.info(f"⏱️  Аудио длительность: {audio_duration:.1f} сек")
 
-                        # Ждем пока аудио должно воспроизвестись
-                        await asyncio.sleep(audio_duration + 0.5)  # Небольшой буфер
+                        # Даем время на воспроизведение
+                        await asyncio.sleep(audio_duration + 1.0)
                     else:
-                        logger.warning(f"⚠️ Не удалось добавить аудио в очередь")
-                        # Ждем по количеству слов
-                        word_count = len(message.split())
-                        pause_duration = max(3, min(word_count * 0.3, 10))
-                        await asyncio.sleep(pause_duration)
+                        await asyncio.sleep(5)  # Пауза если аудио не воспроизвелось
                 else:
-                    # Если аудио не сгенерировалось, ждем по количеству слов
+                    # Если нет аудио, ждем по количеству слов
                     word_count = len(message.split())
-                    pause_duration = max(3, min(word_count * 0.3, 10))
-                    logger.warning(f"⚠️ Аудио не сгенерировано, ждем {pause_duration} сек")
-                    await asyncio.sleep(pause_duration)
+                    await asyncio.sleep(max(3, min(word_count * 0.3, 10)))
 
                 # Агент заканчивает говорить
                 socketio.emit('agent_stop_speaking', {'agent_id': agent.id})
@@ -751,16 +705,13 @@ class AIStreamManager:
 
                 # Пауза между агентами
                 if agent != speaking_order[-1]:
-                    pause = random.uniform(1.5, 3.0)
-                    logger.debug(f"⏸️  Пауза между агентами: {pause:.1f} сек")
-                    await asyncio.sleep(pause)
+                    await asyncio.sleep(random.uniform(1.5, 3.0))
 
             logger.info(f"✅ Раунд #{self.discussion_round} завершен")
 
             socketio.emit('round_complete', {
                 'round': self.discussion_round,
-                'total_messages': self.message_count,
-                'next_round_in': Config.DISCUSSION_INTERVAL
+                'total_messages': self.message_count
             })
 
             # Пауза перед следующим раундом
@@ -772,43 +723,21 @@ class AIStreamManager:
 
         except Exception as e:
             logger.error(f"❌ Ошибка в раунде дискуссии: {e}", exc_info=True)
-
-            socketio.emit('error', {
-                'message': f'Ошибка в дискуссии: {str(e)}',
-                'round': self.discussion_round
-            })
-
         finally:
             self.is_discussion_active = False
             self.active_agent = None
 
-    def get_agents_state(self) -> List[Dict[str, Any]]:
-        """Состояние агентов"""
-        return [
-            {
-                'id': agent.id,
-                'name': agent.name,
-                'expertise': agent.expertise,
-                'avatar': agent.avatar,
-                'color': agent.color,
-                'is_speaking': agent.id == self.active_agent,
-                'message_count': len(agent.message_history)
-            }
-            for agent in self.agents
-        ]
+    def _get_audio_duration(self, audio_file: str) -> float:
+        """Получение длительности аудио"""
+        try:
+            if not os.path.exists(audio_file):
+                return 5.0
 
-    def get_stats(self) -> Dict[str, Any]:
-        """Статистика"""
-        return {
-            'message_count': self.message_count,
-            'discussion_round': self.discussion_round,
-            'current_topic': self.current_topic,
-            'is_active': self.is_discussion_active,
-            'active_agent': self.active_agent,
-            'agents_count': len(self.agents),
-            'conversation_history': len(self.conversation_history),
-            'ffmpeg_streaming': self.ffmpeg_manager.is_streaming if self.ffmpeg_manager else False
-        }
+            file_size = os.path.getsize(audio_file)
+            return file_size / (128000 / 8)  # 128 kbps
+
+        except:
+            return 5.0
 
 
 # ========== ИНИЦИАЛИЗАЦИЯ ==========
@@ -982,14 +911,16 @@ def api_test_audio():
             )
 
             if audio_file and ffmpeg_manager:
+                # Добавляем в очередь вместо прямого воспроизведения
                 ffmpeg_manager.add_audio_to_queue(audio_file)
+                logger.info(f"✅ Тестовое аудио добавлено в очередь")
 
         thread = threading.Thread(target=run_test)
         thread.start()
 
         return jsonify({
             'success': True,
-            'message': 'Тестовое аудио запущено'
+            'message': 'Тестовое аудио добавлено в очередь'
         })
 
     except Exception as e:

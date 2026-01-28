@@ -2906,11 +2906,10 @@ def start_youtube_oauth_stream():
         logger.info(f"🎬 Запуск YouTube стрима через OAuth: {title}")
 
         # Создаем трансляцию через YouTube API
-        result = youtube_oauth.start_full_stream(
+        result = youtube_oauth.start_stream(
             title=title,
             description=description,
-            privacy_status=privacy_status,
-            resolution=resolution
+            privacy_status=privacy_status
         )
 
         if result and result.get('success'):

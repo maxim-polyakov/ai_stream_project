@@ -984,6 +984,93 @@ class FFmpegStreamManager:
 
         logger.info("🛑 Видео контроллер остановлен")
 
+    def _init_concat_file(self, concat_path: str, default_video: str):
+        """Инициализация concat файла"""
+        try:
+            with open(concat_path, 'w') as f:
+                if default_video and os.path.exists(default_video):
+                    # Добавляем дефолтное видео с короткой длительностью
+                    f.write(f"file '{os.path.abspath(default_video)}'\n")
+                    f.write("duration 1.0\n")  # 1 секунда
+                    logger.info(f"📋 Concat файл инициализирован с дефолтным видео")
+                else:
+                    # Создаем тестовый источник
+                    f.write("file 'testsrc=size=1920x1080:rate=30:duration=1'\n")
+                    f.write("duration 1.0\n")
+                    logger.info(f"📋 Concat файл инициализирован с тестовым источником")
+
+            # Добавляем в список temp_files чтобы не удалялся
+            if not hasattr(self, 'temp_files'):
+                self.temp_files = []
+            self.temp_files.append(concat_path)
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка инициализации concat файла: {e}")
+
+    def _append_to_concat_file(self, video_path: str, duration: float):
+        """Добавление видео в concat файл"""
+        try:
+            if not hasattr(self, 'concat_list_path') or not self.concat_list_path:
+                logger.error("❌ Concat файл не инициализирован")
+                return
+
+            # Полный путь к видео файлу
+            abs_video_path = os.path.abspath(video_path)
+
+            # Открываем concat файл для добавления
+            with open(self.concat_list_path, 'a') as f:
+                f.write(f"\nfile '{abs_video_path}'\n")
+                f.write(f"duration {duration}\n")
+
+            logger.info(f"📝 Добавлено в concat: {os.path.basename(video_path)} ({duration} сек)")
+
+            # Проверяем что файл существует и читается
+            if os.path.exists(self.concat_list_path):
+                with open(self.concat_list_path, 'r') as f:
+                    content = f.read()
+                    logger.debug(f"📋 Содержимое concat файла ({len(content)} байт):\n{content[-500:]}")
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка добавления в concat файл: {e}")
+
+    def _dynamic_concat_updater(self):
+        """Динамическое обновление concat файла во время стрима"""
+        logger.info("🎬 Запуск динамического обновления concat файла")
+
+        while self.is_streaming:
+            try:
+                time.sleep(0.5)  # Проверяем каждые 500мс
+
+                # Если есть видео в очереди, добавляем в concat файл
+                if self.video_queue:
+                    video_item = self.video_queue.pop(0)
+                    video_path = video_item['path']
+                    duration = video_item.get('duration', 10.0)
+                    filename = video_item.get('filename', os.path.basename(video_path))
+
+                    logger.info(f"🎥 Добавляю видео в concat: {filename} ({duration:.1f} сек)")
+
+                    # Добавляем видео в concat файл
+                    self._append_to_concat_file(video_path, duration)
+
+                    # Отправляем уведомление
+                    socketio.emit('video_playing', {
+                        'filename': filename,
+                        'duration': duration,
+                        'timestamp': datetime.now().isoformat(),
+                        'queue_remaining': len(self.video_queue)
+                    })
+
+                    # FFmpeg автоматически перейдет на новое видео из concat файла
+                    # Ждем пока видео воспроизводится
+                    time.sleep(duration)
+
+            except Exception as e:
+                logger.error(f"❌ Ошибка в динамическом обновлении: {e}")
+                time.sleep(1)
+
+        logger.info("🛑 Динамическое обновление concat файла остановлено")
+
     def start_stream(self, use_audio: bool = True):
         """Запуск единого FFmpeg процесса для видео и аудио"""
         if not self.stream_key:
@@ -999,12 +1086,21 @@ class FFmpegStreamManager:
             self.is_playing_audio = False
             self.is_playing_video = False
 
+            # Список временных файлов (чтобы не удалялись)
+            self.temp_files = []
+
             logger.info(f"🚀 Запуск FFmpeg стрима на YouTube...")
             logger.info(f"🔗 RTMP URL: {self.rtmp_url}")
 
-            # ВАЖНО: Используем concat демаксера для динамической смены видео
-            # Создаем список видео для конкатенации
-            concat_list_path = self._create_video_concat_list()
+            # Создаем ПЕРМАНЕНТНЫЙ concat файл в video_cache директории
+            concat_list_path = os.path.join(self.video_cache_dir, 'stream_concat.txt')
+            self.concat_list_path = concat_list_path
+
+            # Создаем дефолтное видео если его нет
+            default_video = self._create_default_video_file()
+
+            # Инициализируем concat файл с дефолтным видео
+            self._init_concat_file(concat_list_path, default_video)
 
             # ЕДИНАЯ команда FFmpeg с concat демаксером
             ffmpeg_cmd = [
@@ -1014,6 +1110,7 @@ class FFmpegStreamManager:
                 '-re',
                 '-f', 'concat',
                 '-safe', '0',
+                '-stream_loop', '-1',  # Зацикливаем список
                 '-i', concat_list_path,
 
                 # Вход 2: Аудио через stdin (сырой PCM)
@@ -1053,7 +1150,7 @@ class FFmpegStreamManager:
             ]
 
             logger.info(f"🚀 Запуск FFmpeg с concat демаксером")
-            logger.debug(f"Команда: {' '.join(ffmpeg_cmd[:15])}...")
+            logger.info(f"📋 Concat файл: {concat_list_path}")
 
             # Запускаем FFmpeg процесс
             self.stream_process = subprocess.Popen(
@@ -1068,7 +1165,6 @@ class FFmpegStreamManager:
             self.is_streaming = True
             self.ffmpeg_pid = self.stream_process.pid
             self.ffmpeg_stdin = self.stream_process.stdin
-            self.concat_list_path = concat_list_path
 
             logger.info(f"✅ FFmpeg запущен (PID: {self.ffmpeg_pid})")
 
@@ -1081,9 +1177,9 @@ class FFmpegStreamManager:
                 daemon=True
             ).start()
 
-            # Запускаем видео контроллер
+            # Запускаем видео контроллер для обновления concat файла
             threading.Thread(
-                target=self._video_controller,
+                target=self._dynamic_concat_updater,
                 daemon=True
             ).start()
 
@@ -1092,7 +1188,8 @@ class FFmpegStreamManager:
                 'rtmp_url': self.rtmp_url,
                 'has_video': True,
                 'has_audio': True,
-                'concat_mode': True
+                'concat_mode': True,
+                'concat_file': concat_list_path
             })
 
             return {'success': True, 'pid': self.ffmpeg_pid}

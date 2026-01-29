@@ -584,17 +584,10 @@ class FFmpegStreamManager:
         """Получение динамического видео источника"""
         with self.video_source_lock:
             if self.active_video_source and os.path.exists(self.active_video_source):
-                video_info = self._get_video_info(self.active_video_source)
-                if video_info and video_info.get('duration', 0) > 0:
-                    # Используем активное видео
-                    return self.active_video_source
+                return self.active_video_source
 
-        # Если нет активного видео, используем динамический фильтр
-        with self.video_source_lock:
-            current_video = self.active_video_source
-            filter_str = self._create_video_source_filter(current_video)
-
-        return f"lavfi -i {filter_str}"
+        # Возвращаем дефолтное видео
+        return self._create_video_source_filter()
 
     def add_video_from_cache(self, video_filename: str, duration: float = None) -> bool:
         """Добавление видео из кэша в стрим"""
@@ -634,23 +627,39 @@ class FFmpegStreamManager:
             return cache_path
         return None
 
+    def _create_default_video_file(self):
+        """Создание дефолтного видео файла"""
+        default_path = os.path.join(self.video_cache_dir, "default.mp4")
+
+        # Создаем простое видео с помощью FFmpeg
+        cmd = [
+            'ffmpeg',
+            '-f', 'lavfi',
+            '-i', 'color=size=1920x1080:rate=30:color=black:duration=10',
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',
+            '-pix_fmt', 'yuv420p',
+            '-y',
+            default_path
+        ]
+
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=10)
+            logger.info(f"✅ Создан дефолтный видео файл: {default_path}")
+        except Exception as e:
+            logger.error(f"❌ Ошибка создания дефолтного видео: {e}")
+
     def _create_video_source_filter(self, video_path: str = None) -> str:
         """Создание фильтра для видео источника"""
         if not video_path:
-            # Черный экран с текстом по умолчанию
-            return (
-                "color=size=1920x1080:rate=30:color=black,"
-                "drawtext=text='AI Agents Discussion':fontcolor=white:fontsize=48:x=(w-text_w)/2:y=50,"
-                "format=yuv420p"
-            )
+            # Если нет видео, возвращаем путь к дефолтному файлу
+            default_video = os.path.join(self.video_cache_dir, "default.mp4")
+            if not os.path.exists(default_video):
+                self._create_default_video_file()
+            return default_video
         else:
-            # Видео из файла с возможностью циклического воспроизведения
-            return (
-                f"movie='{video_path}':loop=0:setpts=N/FRAME_RATE/TB[vid];"
-                "color=size=1920x1080:rate=30:color=black[bg];"
-                "[bg][vid]overlay=(W-w)/2:(H-h)/2:shortest=1,"
-                "format=yuv420p"
-            )
+            # Возвращаем путь к файлу
+            return video_path
 
     def start_stream(self, use_audio: bool = True):
         """Запуск FFmpeg стрима с динамической загрузкой видео из кэша"""
@@ -671,11 +680,47 @@ class FFmpegStreamManager:
             # Получаем динамический видео источник
             video_source = self._get_dynamic_video_source()
 
+            if not video_source or not os.path.exists(video_source):
+                logger.error("❌ Видео файл не найден")
+                return {'success': False, 'error': 'Видео файл не найден'}
+
+            logger.info(f"🎬 Используем видео: {os.path.basename(video_source)}")
+
             # Команда FFmpeg с динамическим видео источником
             ffmpeg_cmd = [
                 'ffmpeg',
-                '-re',
+                '-re',  # Реальное время
                 '-fflags', '+genpts',
+                '-stream_loop', '-1',  # Зацикливание
+                '-i', video_source,  # ПУТЬ К ВИДЕО ФАЙЛУ
+
+                # Аудио источник через stdin
+                '-f', 's16le',
+                '-ar', str(self.audio_sample_rate),
+                '-ac', str(self.audio_channels),
+                '-channel_layout', 'stereo',
+                '-i', 'pipe:0',
+
+                # Видео настройки
+                '-c:v', 'libx264',
+                '-preset', 'veryfast',
+                '-tune', 'zerolatency',
+                '-pix_fmt', 'yuv420p',
+                '-g', '60',
+                '-b:v', '4500k',
+                '-maxrate', '4500k',
+                '-bufsize', '9000k',
+                '-r', '30',
+
+                # Аудио настройки
+                '-c:a', 'aac',
+                '-b:a', '128k',
+                '-ar', '44100',
+                '-ac', '2',
+
+                # Вывод
+                '-f', 'flv',
+                self.rtmp_url
             ]
 
             # Проверяем, является ли источник фильтром lavfi

@@ -91,7 +91,7 @@ else:
 # ========== FFMPEG STREAM MANAGER с ПАЙПАМИ ==========
 
 class FFmpegStreamManager:
-    """Управление FFmpeg стримом на YouTube через stream key"""
+    """Управление FFmpeg стримом на YouTube с поддержкой видеофайлов"""
 
     def __init__(self):
         self.stream_process = None
@@ -99,8 +99,6 @@ class FFmpegStreamManager:
         self.stream_key = None
         self.rtmp_url = None
         self.ffmpeg_pid = None
-        self.video_source = "black"
-        self.ffmpeg_stdin = None
         self.start_time = None
 
         # Очередь и управление аудио
@@ -108,20 +106,34 @@ class FFmpegStreamManager:
         self.current_audio = None
         self.is_playing_audio = False
         self.audio_processor_thread = None
-        self.silence_generator = None
 
-        # Конфигурация
+        # Очередь и управление видео
+        self.video_queue = []
+        self.current_video = None
+        self.is_playing_video = False
+        self.video_processor_thread = None
+
+        # Конфигурация аудио
         self.audio_sample_rate = 44100
         self.audio_channels = 2
         self.audio_format = 's16le'
         self.bytes_per_sample = 2
+
+        # Конфигурация видео
+        self.video_width = 1920
+        self.video_height = 1080
+        self.video_fps = 30
+        self.video_bitrate = '4500k'
 
         # Для генерации тишины
         self.silence_chunk_duration = 0.1  # 100ms
         self.silence_chunk_size = int(self.audio_sample_rate * self.audio_channels *
                                       self.bytes_per_sample * self.silence_chunk_duration)
 
-        logger.info("FFmpeg Stream Manager инициализирован")
+        # Текущий источник видео
+        self.current_video_source = "color=size=1920x1080:rate=30:color=black"
+
+        logger.info("FFmpeg Stream Manager с поддержкой видео инициализирован")
 
     def set_stream_key(self, stream_key: str) -> bool:
         """Установка ключа стрима"""
@@ -130,9 +142,175 @@ class FFmpegStreamManager:
         logger.info(f"🔑 Stream Key установлен: {stream_key[:10]}...")
         return True
 
+    def add_audio_to_queue(self, audio_file: str) -> bool:
+        """Добавление аудио файла в очередь на воспроизведение"""
+        if not os.path.exists(audio_file):
+            logger.error(f"❌ Аудио файл не найден: {audio_file}")
+            return False
+
+        self.audio_queue.append(audio_file)
+        logger.info(f"📥 Аудио добавлено в очередь: {os.path.basename(audio_file)}")
+        logger.info(f"📊 Размер очереди аудио: {len(self.audio_queue)} файлов")
+        return True
+
+    def add_video_to_queue(self, video_file: str, duration: float = None) -> bool:
+        """Добавление видео файла в очередь на воспроизведение"""
+        if not os.path.exists(video_file):
+            logger.error(f"❌ Видео файл не найден: {video_file}")
+            return False
+
+        # Получаем информацию о видео
+        video_info = self._get_video_info(video_file)
+        if not video_info:
+            logger.error(f"❌ Не удалось получить информацию о видео: {video_file}")
+            return False
+
+        # Определяем длительность
+        actual_duration = duration or video_info.get('duration', 5.0)
+
+        self.video_queue.append({
+            'path': video_file,
+            'duration': actual_duration,
+            'info': video_info
+        })
+
+        logger.info(f"🎬 Видео добавлено в очередь: {os.path.basename(video_file)} ({actual_duration:.1f} сек)")
+        logger.info(f"📊 Размер очереди видео: {len(self.video_queue)} файлов")
+        return True
+
+    def _get_video_info(self, video_path: str) -> Optional[Dict[str, Any]]:
+        """Получение информации о видео файле"""
+        try:
+            cmd = [
+                'ffprobe',
+                '-v', 'error',
+                '-select_streams', 'v:0',
+                '-show_entries', 'stream=width,height,duration,r_frame_rate,codec_name',
+                '-show_entries', 'format=duration',
+                '-of', 'json',
+                video_path
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+
+            if result.returncode == 0:
+                info = json.loads(result.stdout)
+
+                # Извлекаем информацию
+                duration = 0.0
+                if 'format' in info and 'duration' in info['format']:
+                    duration = float(info['format']['duration'])
+                elif 'streams' in info and len(info['streams']) > 0:
+                    if 'duration' in info['streams'][0]:
+                        duration = float(info['streams'][0]['duration'])
+
+                # Получаем FPS
+                fps = self.video_fps
+                if 'streams' in info and len(info['streams']) > 0:
+                    if 'r_frame_rate' in info['streams'][0]:
+                        fps_str = info['streams'][0]['r_frame_rate']
+                        try:
+                            if '/' in fps_str:
+                                num, den = fps_str.split('/')
+                                fps = float(num) / float(den)
+                            else:
+                                fps = float(fps_str)
+                        except:
+                            pass
+
+                return {
+                    'duration': duration,
+                    'width': info.get('streams', [{}])[0].get('width', self.video_width),
+                    'height': info.get('streams', [{}])[0].get('height', self.video_height),
+                    'fps': fps,
+                    'codec': info.get('streams', [{}])[0].get('codec_name', 'h264')
+                }
+
+            return None
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения информации о видео: {e}")
+            return None
+
+    def _prepare_video_file(self, video_file: str) -> Optional[str]:
+        """Подготовка видео файла (конвертация если нужно)"""
+        if not os.path.exists(video_file):
+            return None
+
+        # Если видео уже в нужном формате, возвращаем как есть
+        video_info = self._get_video_info(video_file)
+        if not video_info:
+            return None
+
+        # Проверяем, нужно ли конвертировать
+        needs_conversion = (
+                video_info.get('codec') != 'h264' or
+                video_info.get('fps') != self.video_fps or
+                video_info.get('width') != self.video_width or
+                video_info.get('height') != self.video_height
+        )
+
+        if not needs_conversion:
+            return video_file
+
+        # Конвертируем видео в нужный формат
+        try:
+            temp_video = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
+            temp_video.close()
+
+            convert_cmd = [
+                'ffmpeg',
+                '-i', video_file,
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',
+                '-tune', 'zerolatency',
+                '-pix_fmt', 'yuv420p',
+                '-s', f'{self.video_width}x{self.video_height}',
+                '-r', str(self.video_fps),
+                '-b:v', self.video_bitrate,
+                '-maxrate', self.video_bitrate,
+                '-bufsize', f'{int(int(self.video_bitrate[:-1]) * 2)}k',
+                '-g', '60',
+                '-c:a', 'aac',
+                '-b:a', '128k',
+                '-ar', '44100',
+                '-ac', '2',
+                '-f', 'mp4',
+                '-y',
+                temp_video.name
+            ]
+
+            logger.info(f"🔄 Конвертация видео: {os.path.basename(video_file)}")
+
+            result = subprocess.run(
+                convert_cmd,
+                capture_output=True,
+                text=True,
+                timeout=60  # Даем больше времени для конвертации видео
+            )
+
+            if result.returncode != 0:
+                logger.error(f"❌ Ошибка конвертации видео: {result.stderr[:500]}")
+                os.unlink(temp_video.name)
+                return None
+
+            # Проверяем размер файла
+            if os.path.getsize(temp_video.name) < 1024:  # Минимум 1KB
+                logger.error("❌ Видео файл слишком маленький")
+                os.unlink(temp_video.name)
+                return None
+
+            logger.info(f"✅ Видео сконвертировано: {os.path.getsize(temp_video.name) / 1024 / 1024:.1f} MB")
+            return temp_video.name
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка подготовки видео: {e}", exc_info=True)
+            if os.path.exists(temp_video.name):
+                os.unlink(temp_video.name)
+            return None
+
     def _generate_silence_chunk(self) -> bytes:
         """Генерация чанка тишины (нулевые байты)"""
-        # Для формата s16le: 16-bit signed little-endian, значение 0 = тишина
         return b'\x00' * self.silence_chunk_size
 
     def _read_audio_chunk(self, audio_file: str, position: int = 0, chunk_size: int = 65536) -> tuple:
@@ -207,7 +385,7 @@ class FFmpegStreamManager:
             return None
 
     def _continuous_audio_processor(self):
-        """Непрерывный процессор аудио, всегда отправляющий данные"""
+        """Непрерывный процессор аудио"""
         logger.info("🚀 Запуск непрерывного аудио процессора")
 
         while self.is_streaming and self.ffmpeg_stdin:
@@ -216,38 +394,31 @@ class FFmpegStreamManager:
                 if self.audio_queue:
                     self.is_playing_audio = True
                     audio_file = self.audio_queue.pop(0)
-                    logger.info(f"🎵 Начинаем воспроизведение: {os.path.basename(audio_file)}")
+                    logger.info(f"🎵 Начинаем воспроизведение аудио: {os.path.basename(audio_file)}")
 
-                    # Подготавливаем файл (конвертируем в PCM если нужно)
+                    # Подготавливаем файл
                     prepared_file = self._prepare_audio_file(audio_file)
 
                     if prepared_file and self.ffmpeg_stdin:
                         # Отправляем аудио по чанкам
-                        chunk_size = 65536  # 64KB
+                        chunk_size = 65536
                         position = 0
                         total_bytes = os.path.getsize(prepared_file)
 
-                        # Вычисляем время для каждого чанка
                         bytes_per_second = self.audio_sample_rate * self.audio_channels * self.bytes_per_sample
                         chunk_duration = chunk_size / bytes_per_second
 
-                        logger.debug(
-                            f"Отправка {total_bytes} байт аудио, чанк: {chunk_size} байт, {chunk_duration:.3f} с")
-
                         while position < total_bytes and self.is_streaming:
-                            # Читаем чанк
                             chunk, bytes_read = self._read_audio_chunk(prepared_file, position, chunk_size)
 
                             if chunk and bytes_read > 0:
                                 try:
-                                    # Отправляем в FFmpeg
                                     self.ffmpeg_stdin.write(chunk)
                                     self.ffmpeg_stdin.flush()
                                     position += bytes_read
 
-                                    # Задержка для реального времени
                                     if bytes_read >= chunk_size:
-                                        time.sleep(chunk_duration * 0.95)  # 95% от реального времени
+                                        time.sleep(chunk_duration * 0.95)
 
                                 except BrokenPipeError:
                                     logger.error("❌ Broken pipe: FFmpeg процесс завершился")
@@ -276,14 +447,11 @@ class FFmpegStreamManager:
 
                 else:
                     # Если очередь пуста - отправляем тишину
-                    # Это критически важно для непрерывного стрима!
                     if self.ffmpeg_stdin:
                         try:
                             silence_chunk = self._generate_silence_chunk()
                             self.ffmpeg_stdin.write(silence_chunk)
                             self.ffmpeg_stdin.flush()
-
-                            # Пауза между чанками тишины
                             time.sleep(self.silence_chunk_duration * 0.9)
 
                         except BrokenPipeError:
@@ -302,19 +470,85 @@ class FFmpegStreamManager:
 
         logger.info("🛑 Аудио процессор остановлен")
 
-    def add_audio_to_queue(self, audio_file: str) -> bool:
-        """Добавление аудио файла в очередь на воспроизведение"""
-        if not os.path.exists(audio_file):
-            logger.error(f"❌ Аудио файл не найден: {audio_file}")
-            return False
+    def _video_stream_processor(self):
+        """Процессор для отправки видео файлов в стрим"""
+        logger.info("🎬 Запуск видео процессора")
 
-        self.audio_queue.append(audio_file)
-        logger.info(f"📥 Аудио добавлено в очередь: {os.path.basename(audio_file)}")
-        logger.info(f"📊 Размер очереди: {len(self.audio_queue)} файлов")
-        return True
+        while self.is_streaming:
+            try:
+                if self.video_queue and not self.is_playing_video:
+                    video_item = self.video_queue.pop(0)
+                    video_path = video_item['path']
+                    duration = video_item['duration']
 
-    def start_stream(self, use_audio: bool = True):
-        """Запуск FFmpeg стрима с поддержкой аудио через stdin"""
+                    self.is_playing_video = True
+                    logger.info(
+                        f"🎬 Начинаем воспроизведение видео: {os.path.basename(video_path)} ({duration:.1f} сек)")
+
+                    # Подготавливаем видео файл
+                    prepared_video = self._prepare_video_file(video_path)
+
+                    if prepared_video:
+                        # Создаем временный файл с командой FFmpeg для видео
+                        temp_script = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
+                        temp_script.write(f"file '{prepared_video}'\n")
+                        temp_script.close()
+
+                        # Запускаем FFmpeg для отправки видео
+                        video_cmd = [
+                            'ffmpeg',
+                            '-re',  # Реальное время
+                            '-f', 'concat',
+                            '-safe', '0',
+                            '-i', temp_script.name,
+                            '-c', 'copy',
+                            '-f', 'flv',
+                            '-flvflags', 'no_duration_filesize',
+                            self.rtmp_url
+                        ]
+
+                        logger.info(f"📤 Отправка видео в стрим: {os.path.basename(video_path)}")
+
+                        # Запускаем процесс отправки видео
+                        video_process = subprocess.Popen(
+                            video_cmd,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE,
+                            text=True
+                        )
+
+                        # Ждем завершения видео
+                        time.sleep(duration + 1)  # Даем дополнительную секунду
+
+                        # Завершаем процесс
+                        video_process.terminate()
+                        video_process.wait(timeout=5)
+
+                        # Очищаем временные файлы
+                        os.unlink(temp_script.name)
+                        if prepared_video != video_path:
+                            os.unlink(prepared_video)
+
+                        logger.info(f"✅ Видео отправлено в стрим")
+
+                    self.is_playing_video = False
+
+                    # Пауза между видео
+                    time.sleep(1)
+
+                else:
+                    # Если нет видео в очереди, ждем
+                    time.sleep(0.1)
+
+            except Exception as e:
+                logger.error(f"❌ Ошибка в видео процессоре: {e}", exc_info=True)
+                self.is_playing_video = False
+                time.sleep(1)
+
+        logger.info("🛑 Видео процессор остановлен")
+
+    def start_stream(self, use_audio: bool = True, use_video: bool = True):
+        """Запуск FFmpeg стрима с поддержкой видео"""
         if not self.stream_key:
             logger.error("❌ Stream Key не установлен!")
             return {'success': False, 'error': 'Stream Key не установлен'}
@@ -322,19 +556,21 @@ class FFmpegStreamManager:
         try:
             self.start_time = time.time()
 
-            # Инициализируем переменные
+            # Инициализируем очереди
             self.audio_queue = []
+            self.video_queue = []
             self.is_playing_audio = False
+            self.is_playing_video = False
 
             # Команда FFmpeg с непрерывным аудио
             ffmpeg_cmd = [
                 'ffmpeg',
                 '-re',  # Реальное время для видео
-                '-fflags', '+genpts',  # Генерация временных меток
+                '-fflags', '+genpts',
 
                 # Видео источник (непрерывный)
                 '-f', 'lavfi',
-                '-i', 'color=size=1920x1080:rate=30:color=black',
+                '-i', self.current_video_source,
 
                 # Аудио источник через stdin
                 '-f', 's16le',
@@ -368,8 +604,8 @@ class FFmpegStreamManager:
                 self.rtmp_url
             ]
 
-            logger.info(f"🚀 Запуск FFmpeg стрима")
-            logger.debug(f"Команда FFmpeg: {' '.join(ffmpeg_cmd)}")
+            logger.info(f"🚀 Запуск FFmpeg стрима с поддержкой видео")
+            logger.debug(f"Команда FFmpeg: {' '.join(ffmpeg_cmd[:10])}...")
 
             # Запускаем FFmpeg
             self.stream_process = subprocess.Popen(
@@ -391,14 +627,22 @@ class FFmpegStreamManager:
             threading.Thread(target=self._monitor_ffmpeg, daemon=True).start()
 
             # Запускаем непрерывный аудио процессор
-            self.audio_processor_thread = threading.Thread(
-                target=self._continuous_audio_processor,
-                daemon=True
-            )
-            self.audio_processor_thread.start()
+            if use_audio:
+                self.audio_processor_thread = threading.Thread(
+                    target=self._continuous_audio_processor,
+                    daemon=True
+                )
+                self.audio_processor_thread.start()
+                logger.info("🔊 Аудио процессор запущен")
 
-            # Начинаем отправку тишины сразу
-            logger.info("🔇 Начинаем отправку непрерывного аудио потока")
+            # Запускаем видео процессор
+            if use_video:
+                self.video_processor_thread = threading.Thread(
+                    target=self._video_stream_processor,
+                    daemon=True
+                )
+                self.video_processor_thread.start()
+                logger.info("🎬 Видео процессор запущен")
 
             socketio.emit('stream_started', {
                 'pid': self.ffmpeg_pid,
@@ -422,7 +666,6 @@ class FFmpegStreamManager:
 
                 # Отладочная информация
                 if 'frame=' in line and 'fps=' in line:
-                    # Логируем статистику каждые 5 секунд
                     current_time = time.time()
                     if hasattr(self, '_last_stats_log') and current_time - self._last_stats_log < 5:
                         continue
@@ -457,12 +700,16 @@ class FFmpegStreamManager:
 
         self.is_streaming = False
 
-        # Очищаем очередь
+        # Очищаем очереди
         self.audio_queue.clear()
+        self.video_queue.clear()
 
-        # Даем время аудио процессору завершиться
+        # Даем время процессорам завершиться
         if self.audio_processor_thread and self.audio_processor_thread.is_alive():
             self.audio_processor_thread.join(timeout=2.0)
+
+        if self.video_processor_thread and self.video_processor_thread.is_alive():
+            self.video_processor_thread.join(timeout=2.0)
 
         try:
             # Закрываем stdin
@@ -498,7 +745,9 @@ class FFmpegStreamManager:
             'rtmp_url': self.rtmp_url,
             'pid': self.ffmpeg_pid,
             'audio_queue_size': len(self.audio_queue),
+            'video_queue_size': len(self.video_queue),
             'is_playing_audio': self.is_playing_audio,
+            'is_playing_video': self.is_playing_video,
             'uptime': time.time() - self.start_time if self.start_time else 0
         }
 

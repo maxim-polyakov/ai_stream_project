@@ -634,29 +634,47 @@ class FFmpegStreamManager:
         return None
 
     def _create_default_video_file(self):
-        """Создание дефолтного видео файла (черный экран)"""
-        default_path = os.path.join(self.video_cache_dir, "default.mp4")
+        """Создание короткого дефолтного видео файла"""
+        default_path = os.path.join(self.video_cache_dir, 'default.mp4')
 
-        # Создаем простое видео с помощью FFmpeg
-        cmd = [
-            'ffmpeg',
-            '-f', 'lavfi',
-            '-i', 'color=size=1920x1080:rate=30:color=black:duration=3600',  # 1 час
-            '-c:v', 'libx264',
-            '-preset', 'ultrafast',
-            '-pix_fmt', 'yuv420p',
-            '-y',
-            default_path
-        ]
+        if not os.path.exists(default_path):
+            try:
+                # СОКРАТИТЕ ДЛИТЕЛЬНОСТЬ до 5 секунд
+                cmd = [
+                    'ffmpeg',
+                    '-f', 'lavfi',
+                    '-i', 'color=size=1920x1080:rate=30:color=black:duration=5',  # 5 секунд!
+                    '-c:v', 'libx264',
+                    '-preset', 'ultrafast',
+                    '-t', '5',  # Еще раз ограничиваем длительность
+                    '-pix_fmt', 'yuv420p',
+                    '-y',
+                    default_path
+                ]
 
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            if result.returncode == 0:
-                logger.info(f"✅ Создан дефолтный видео файл: {default_path}")
-            else:
-                logger.error(f"❌ Ошибка создания дефолтного видео: {result.stderr[:500]}")
-        except Exception as e:
-            logger.error(f"❌ Ошибка создания дефолтного видео: {e}")
+                logger.info("🎬 Создание короткого default.mp4 (5 сек)...")
+
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=10  # Увеличьте таймаут если нужно
+                )
+
+                if result.returncode == 0:
+                    logger.info(f"✅ Создан default.mp4 ({os.path.getsize(default_path) / 1024:.1f} KB)")
+                else:
+                    logger.error(f"❌ Ошибка создания default.mp4: {result.stderr[:200]}")
+                    return None
+
+            except subprocess.TimeoutExpired:
+                logger.error("❌ Таймаут при создании default.mp4")
+                return None
+            except Exception as e:
+                logger.error(f"❌ Ошибка создания default.mp4: {e}")
+                return None
+
+        return default_path
 
     def _create_video_source_filter(self, video_path: str = None) -> str:
         """Создание фильтра для видео источника"""

@@ -949,44 +949,39 @@ class FFmpegStreamManager:
             socketio.emit('stream_stopped', {'time': datetime.now().isoformat()})
 
     def stop_stream(self):
-        """Корректная остановка стрима"""
+        """Упрощенная остановка стрима"""
         logger.info("🛑 Остановка FFmpeg стрима...")
 
         self.is_streaming = False
 
-        # Очищаем очереди
-        self.audio_queue.clear()
-        self.video_queue.clear()
-
-        # Даем время процессорам завершиться
-        if self.audio_processor_thread and self.audio_processor_thread.is_alive():
-            self.audio_processor_thread.join(timeout=2.0)
-
-        if self.video_processor_thread and self.video_processor_thread.is_alive():
-            self.video_processor_thread.join(timeout=2.0)
+        # Просто ждем немного перед закрытием
+        time.sleep(0.5)
 
         try:
             # Закрываем stdin
-            if self.ffmpeg_stdin:
-                self.ffmpeg_stdin.close()
+            if hasattr(self, 'ffmpeg_stdin') and self.ffmpeg_stdin:
+                try:
+                    self.ffmpeg_stdin.close()
+                except:
+                    pass
 
-            # Graceful shutdown
-            if self.stream_process and self.stream_process.poll() is None:
-                self.stream_process.terminate()
-
-                # Ждем корректного завершения
-                for i in range(10):
-                    if self.stream_process.poll() is not None:
-                        break
+            # Останавливаем процесс FFmpeg
+            if hasattr(self, 'stream_process') and self.stream_process:
+                try:
+                    self.stream_process.terminate()
                     time.sleep(0.5)
-
-                # Принудительное завершение если нужно
-                if self.stream_process.poll() is None:
-                    self.stream_process.kill()
-                    self.stream_process.wait()
+                    if self.stream_process.poll() is None:
+                        self.stream_process.kill()
+                except:
+                    pass
 
         except Exception as e:
             logger.error(f"Ошибка при остановке: {e}")
+
+        # Сбрасываем атрибуты
+        self.stream_process = None
+        self.ffmpeg_stdin = None
+        self.ffmpeg_pid = None
 
         logger.info("✅ FFmpeg стрим остановлен")
         return True

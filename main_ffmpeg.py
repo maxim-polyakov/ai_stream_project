@@ -1443,8 +1443,9 @@ class FFmpegStreamManager:
                 '-channel_layout', 'stereo',
                 '-i', 'pipe:0',
 
-                # Простой фильтр overlay без лишних параметров
-                '-filter_complex', '[0:v][1:v]overlay[outv]',
+                # Ключевое изменение: overlay с eof_action=pass и shortest=0
+                '-filter_complex',
+                f"""[0:v][1:v]overlay=eof_action=pass:shortest=0[outv]""",
 
                 # Карты
                 '-map', '[outv]',
@@ -1460,6 +1461,7 @@ class FFmpegStreamManager:
                 '-maxrate', '4500k',
                 '-bufsize', '9000k',
                 '-r', str(self.video_fps),
+                '-x264-params', 'keyint=60:min-keyint=60:scenecut=0',
 
                 # Кодирование аудио
                 '-c:a', 'aac',
@@ -1470,6 +1472,9 @@ class FFmpegStreamManager:
                 # Формат вывода
                 '-f', 'flv',
                 '-flvflags', 'no_duration_filesize',
+
+                # Логирование для отладки
+                '-loglevel', 'verbose',
 
                 self.rtmp_url
             ]

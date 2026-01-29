@@ -1239,6 +1239,80 @@ class FFmpegStreamManager:
 
         logger.info("🛑 Видео файл апдейтер остановлен")
 
+    def _overlay_video_updater(self):
+        """Обновление активного видео для overlay"""
+        logger.info("🎬 Запуск overlay видео апдейтера")
+
+        # Ждем запуска FFmpeg
+        time.sleep(3)
+
+        while self.is_streaming:
+            try:
+                time.sleep(0.5)
+
+                # Если есть видео в очереди
+                if self.video_queue:
+                    self.is_playing_video = True
+                    video_item = self.video_queue.pop(0)
+                    video_path = video_item['path']
+                    duration = video_item.get('duration', 10.0)
+                    filename = video_item.get('filename', os.path.basename(video_path))
+
+                    logger.info(f"🎥 Заменяю активное видео: {filename} ({duration:.1f} сек)")
+
+                    # Подготавливаем видео файл
+                    prepared_video = self._prepare_video_file(video_path)
+                    if not prepared_video:
+                        logger.error(f"❌ Не удалось подготовить видео: {filename}")
+                        continue
+
+                    # АТОМАРНАЯ ЗАМЕНА файла current_video_file
+                    temp_file = self.current_video_file + '.tmp'
+
+                    try:
+                        import shutil
+                        shutil.copy2(prepared_video, temp_file)
+                        os.replace(temp_file, self.current_video_file)
+
+                        logger.info(f"✅ Активное видео заменено: {filename}")
+
+                        # FFmpeg начнет читать новый файл сразу
+                        # overlay=shortest=1 означает, что когда активное видео закончится,
+                        # будет показано только дефолтное видео
+
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка замены видео: {e}")
+                        if os.path.exists(temp_file):
+                            os.unlink(temp_file)
+                        continue
+
+                    # Отправляем уведомление
+                    socketio.emit('video_playing', {
+                        'filename': filename,
+                        'duration': duration,
+                        'timestamp': datetime.now().isoformat(),
+                        'queue_remaining': len(self.video_queue),
+                        'overlay_mode': True
+                    })
+
+                    # Ждем пока видео воспроизводится
+                    logger.info(f"⏳ Воспроизведение {duration:.1f} секунд...")
+                    time.sleep(duration)
+
+                    # После завершения видео, FFmpeg вернется к показу только дефолтного видео
+                    # благодаря shortest=1 в фильтре overlay
+
+                    self.is_playing_video = False
+
+                else:
+                    # Если очередь пуста, ждем
+                    time.sleep(1.0)
+
+            except Exception as e:
+                logger.error(f"❌ Ошибка в overlay видео апдейтере: {e}", exc_info=True)
+                time.sleep(1.0)
+
+        logger.info("🛑 Overlay видео апдейтер остановлен")
 
     def start_stream(self, use_audio: bool = True):
         """Запуск единого FFmpeg процесса с динамической сменой видео"""
@@ -1264,22 +1338,18 @@ class FFmpegStreamManager:
             # Создаем файл для активного видео
             self.current_video_file = os.path.join(self.video_cache_dir, 'current_video.mp4')
 
-            # Копируем дефолтное видео как текущее
+            # Копируем дефолтное видео как текущее (изначально)
             import shutil
             try:
                 shutil.copy2(default_video, self.current_video_file)
                 logger.info(f"📁 Текущий видео файл создан: {self.current_video_file}")
             except Exception as e:
                 logger.error(f"❌ Ошибка копирования видео: {e}")
-                # Создаем новый файл
-                self._create_default_video_file(self.current_video_file)
 
             logger.info(f"🚀 Запуск FFmpeg стрима на YouTube...")
             logger.info(f"🔗 RTMP URL: {self.rtmp_url}")
-            logger.info(f"🎬 Дефолтное видео: {os.path.basename(default_video)}")
-            logger.info(f"🎬 Активное видео: {os.path.basename(self.current_video_file)}")
 
-            # Команда FFmpeg с двумя входами и фильтром concat
+            # Ключевое изменение: используем фильтр overlay вместо concat
             ffmpeg_cmd = [
                 'ffmpeg',
 
@@ -1299,16 +1369,16 @@ class FFmpegStreamManager:
                 '-channel_layout', 'stereo',
                 '-i', 'pipe:0',
 
-                # ФИЛЬТР: Конкатенируем оба видео
-                # concat=n=2 - два видео, v=1 - один видеопоток, a=0 - без аудио
+                # ФИЛЬТР: Используем overlay для наложения активного видео поверх дефолтного
                 '-filter_complex',
                 f"""
-                [0:v][1:v]concat=n=2:v=1:a=0[outv];
-                [outv]setpts=PTS-STARTPTS[finalv]
+                [0:v]setpts=PTS-STARTPTS[bg];
+                [1:v]setpts=PTS-STARTPTS[fg];
+                [bg][fg]overlay=shortest=1:eof_action=pass[outv]
                 """,
 
                 # Карты
-                '-map', '[finalv]',
+                '-map', '[outv]',
                 '-map', '2:a:0',
 
                 # Кодирование видео
@@ -1340,8 +1410,9 @@ class FFmpegStreamManager:
             ]
 
             logger.info(f"🚀 Запуск FFmpeg процесса...")
-            logger.info(f"🎯 Фильтр: concat двух видео (дефолтное + активное)")
-            logger.info(f"🎮 Управление: замена файла {self.current_video_file}")
+            logger.info(f"🎬 Дефолтное видео: {os.path.basename(default_video)}")
+            logger.info(f"🎬 Активное видео: {os.path.basename(self.current_video_file)}")
+            logger.info(f"🎯 Фильтр: overlay (активное видео поверх дефолтного)")
 
             # Запускаем FFmpeg процесс
             self.stream_process = subprocess.Popen(
@@ -1358,7 +1429,6 @@ class FFmpegStreamManager:
             self.ffmpeg_stdin = self.stream_process.stdin
 
             logger.info(f"✅ FFmpeg запущен (PID: {self.ffmpeg_pid})")
-            logger.info("📡 Ожидание подключения к YouTube...")
 
             # Запускаем мониторинг
             threading.Thread(target=self._monitor_ffmpeg, daemon=True).start()
@@ -1369,9 +1439,9 @@ class FFmpegStreamManager:
                 daemon=True
             ).start()
 
-            # Запускаем видео контроллер для замены текущего видео
+            # Запускаем видео контроллер для замены активного видео
             threading.Thread(
-                target=self._video_file_updater,
+                target=self._overlay_video_updater,
                 daemon=True
             ).start()
 
@@ -1380,9 +1450,8 @@ class FFmpegStreamManager:
                 'rtmp_url': self.rtmp_url,
                 'has_video': True,
                 'has_audio': True,
-                'default_video': os.path.basename(default_video),
-                'current_video_file': self.current_video_file,
-                'video_switching': 'concat_two_streams'
+                'filter': 'overlay',
+                'current_video_file': self.current_video_file
             })
 
             return {'success': True, 'pid': self.ffmpeg_pid}

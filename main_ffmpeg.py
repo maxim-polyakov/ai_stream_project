@@ -1385,90 +1385,8 @@ class FFmpegStreamManager:
 
         logger.info("🛑 Простой видео свитчер остановлен")
 
-    def _overlay_video_controller(self):
-        """Контроллер видео для overlay режима"""
-        logger.info("🎬 Запуск overlay видео контроллера")
-
-        # Ждем запуска FFmpeg
-        time.sleep(3)
-
-        while self.is_streaming:
-            try:
-                time.sleep(0.5)
-
-                # Если есть видео в очереди
-                if self.video_queue:
-                    self.is_playing_video = True
-                    video_item = self.video_queue.pop(0)
-                    video_path = video_item['path']
-                    duration = video_item.get('duration', 10.0)
-                    filename = video_item.get('filename', os.path.basename(video_path))
-
-                    logger.info(f"🎥 Показываю видео из кэша: {filename} ({duration:.1f} сек)")
-
-                    # Подготавливаем видео файл
-                    prepared_video = self._prepare_video_file(video_path)
-                    if not prepared_video:
-                        logger.error(f"❌ Не удалось подготовить видео: {filename}")
-                        continue
-
-                    # Заменяем active_video.mp4
-                    try:
-                        import shutil
-                        # Создаем временный файл
-                        temp_file = self.current_video_file + '.tmp'
-                        shutil.copy2(prepared_video, temp_file)
-
-                        # Атомарная замена
-                        os.replace(temp_file, self.current_video_file)
-
-                        logger.info(f"✅ Активное видео заменено: {filename}")
-
-                        # FFmpeg overlay автоматически начнет показывать новое видео
-                        # Параметр shortest=1 гарантирует, что после окончания видео
-                        # будет показано только фоновое (дефолтное) видео
-
-                    except Exception as e:
-                        logger.error(f"❌ Ошибка замены видео: {e}")
-                        continue
-
-                    # Отправляем уведомление
-                    socketio.emit('video_playing', {
-                        'filename': filename,
-                        'duration': duration,
-                        'timestamp': datetime.now().isoformat(),
-                        'queue_remaining': len(self.video_queue),
-                        'method': 'overlay'
-                    })
-
-                    # Ждем пока видео воспроизводится
-                    logger.info(f"⏳ Воспроизведение {duration:.1f} секунд...")
-                    time.sleep(duration)
-
-                    # После завершения видео, overlay вернется к показу только фонового видео
-                    # благодаря параметру shortest=1
-
-                    # Очищаем временный файл если он был создан
-                    if prepared_video != video_path and os.path.exists(prepared_video):
-                        try:
-                            os.unlink(prepared_video)
-                        except:
-                            pass
-
-                    self.is_playing_video = False
-
-                else:
-                    # Если очередь пуста, ждем
-                    time.sleep(1.0)
-
-            except Exception as e:
-                logger.error(f"❌ Ошибка в overlay видео контроллере: {e}", exc_info=True)
-                time.sleep(1.0)
-
-        logger.info("🛑 Overlay видео контроллер остановлен")
-
     def start_stream(self, use_audio: bool = True):
-        """Запуск единого FFmpeg процесса с overlay фильтром"""
+        """Запуск FFmpeg с возможностью динамической замены видео во втором входе"""
         if not self.stream_key:
             logger.error("❌ Stream Key не установлен!")
             return {'success': False, 'error': 'Stream Key не установлен'}
@@ -1482,35 +1400,33 @@ class FFmpegStreamManager:
             self.is_playing_audio = False
             self.is_playing_video = False
 
-            # Создаем дефолтное видео
-            default_video = self._create_default_video_file()
-            if not default_video:
-                logger.error("❌ Не удалось создать дефолтное видео")
-                return {'success': False, 'error': 'Не удалось создать дефолтное видео'}
+            # Создаем FIFO (named pipe) для динамического видео
+            self.video_fifo_path = '/tmp/ffmpeg_video_fifo'
+            try:
+                os.mkfifo(self.video_fifo_path)
+            except FileExistsError:
+                os.unlink(self.video_fifo_path)
+                os.mkfifo(self.video_fifo_path)
 
-            # Создаем файл для активного видео
-            self.current_video_file = os.path.join(self.video_cache_dir, 'active_video.mp4')
-
-            # Изначально копируем дефолтное видео
-            import shutil
-            shutil.copy2(default_video, self.current_video_file)
-
-            logger.info(f"🚀 Запуск FFmpeg стрима на YouTube...")
+            logger.info(f"🚀 Запуск FFmpeg с FIFO для динамического видео...")
             logger.info(f"🔗 RTMP URL: {self.rtmp_url}")
+            logger.info(f"📁 FIFO для видео: {self.video_fifo_path}")
 
-            # Команда FFmpeg с двумя входами и overlay
+            # FFmpeg с FIFO для динамического видео
             ffmpeg_cmd = [
                 'ffmpeg',
 
-                # Вход 1: Дефолтное видео (фон)
+                # Вход 1: Дефолтное видео (зацикленное)
                 '-re',
                 '-stream_loop', '-1',
-                '-i', default_video,
+                '-i', self._create_default_video_file(),
 
-                # Вход 2: Активное видео (будет меняться)
-                '-re',
-                '-stream_loop', '1',  # Один раз
-                '-i', self.current_video_file,
+                # Вход 2: FIFO для динамических видео (сырое видео через pipe)
+                '-f', 'rawvideo',
+                '-pix_fmt', 'bgr24',
+                '-s', f'{self.video_width}x{self.video_height}',
+                '-r', str(self.video_fps),
+                '-i', self.video_fifo_path,
 
                 # Вход 3: Аудио через stdin
                 '-f', 's16le',
@@ -1519,10 +1435,14 @@ class FFmpegStreamManager:
                 '-channel_layout', 'stereo',
                 '-i', 'pipe:0',
 
-                # Фильтр: overlay короткого видео поверх фона
-                # shortest=1 - когда активное видео закончится, показывать только фон
+                # Фильтр для выбора активного видео
+                # Когда FIFO пустое - используем дефолтное видео
+                # Когда есть данные в FIFO - используем их
                 '-filter_complex',
-                '[0:v][1:v]overlay=shortest=1[outv]',
+                '[0:v]setpts=PTS-STARTPTS,format=bgr24[default];'
+                '[1:v]setpts=PTS-STARTPTS[dynamic];'
+                # Используем overlay с прозрачностью для переключения
+                '[default][dynamic]overlay=0:0:shortest=1[outv]',
 
                 # Карты
                 '-map', '[outv]',
@@ -1538,7 +1458,6 @@ class FFmpegStreamManager:
                 '-maxrate', '4500k',
                 '-bufsize', '9000k',
                 '-r', str(self.video_fps),
-                '-x264-params', 'keyint=60:min-keyint=60:scenecut=0',
 
                 # Кодирование аудио
                 '-c:a', 'aac',
@@ -1550,16 +1469,15 @@ class FFmpegStreamManager:
                 '-f', 'flv',
                 '-flvflags', 'no_duration_filesize',
 
-                # Логирование
-                '-loglevel', 'info',
-
                 self.rtmp_url
             ]
+
+            logger.info(f"🚀 Запуск FFmpeg с FIFO входом...")
 
             # Запускаем FFmpeg процесс
             self.stream_process = subprocess.Popen(
                 ffmpeg_cmd,
-                stdin=subprocess.PIPE,
+                stdin=subprocess.PIPE,  # Для аудио
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 bufsize=0,
@@ -1571,6 +1489,7 @@ class FFmpegStreamManager:
             self.ffmpeg_stdin = self.stream_process.stdin
 
             logger.info(f"✅ FFmpeg запущен (PID: {self.ffmpeg_pid})")
+            logger.info("📤 FIFO готов для отправки видео из очереди")
 
             # Запускаем мониторинг
             threading.Thread(target=self._monitor_ffmpeg, daemon=True).start()
@@ -1581,9 +1500,9 @@ class FFmpegStreamManager:
                 daemon=True
             ).start()
 
-            # Запускаем видео контроллер overlay
+            # Запускаем видео отправитель в FIFO
             threading.Thread(
-                target=self._overlay_video_controller,
+                target=self._video_fifo_sender,
                 daemon=True
             ).start()
 
@@ -1592,7 +1511,7 @@ class FFmpegStreamManager:
                 'rtmp_url': self.rtmp_url,
                 'has_video': True,
                 'has_audio': True,
-                'filter': 'overlay'
+                'video_fifo_ready': True
             })
 
             return {'success': True, 'pid': self.ffmpeg_pid}
@@ -1601,6 +1520,107 @@ class FFmpegStreamManager:
             logger.error(f"❌ Ошибка запуска FFmpeg: {e}", exc_info=True)
             self.is_streaming = False
             return {'success': False, 'error': str(e)}
+
+    def _send_video_to_fifo(self, fifo, video_path: str, duration: float) -> bool:
+        """Отправка видео в FIFO в сыром формате"""
+        try:
+            # Конвертируем видео в сырой формат bgr24
+            convert_cmd = [
+                'ffmpeg',
+                '-re',
+                '-i', video_path,
+                '-t', str(duration),
+                '-c:v', 'rawvideo',
+                '-pix_fmt', 'bgr24',
+                '-f', 'rawvideo',
+                '-'
+            ]
+
+            logger.debug(f"Конвертация видео в сырой формат: {os.path.basename(video_path)}")
+
+            # Запускаем конвертацию
+            convert_process = subprocess.Popen(
+                convert_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0
+            )
+
+            # Отправляем сырые данные в FIFO
+            bytes_per_frame = self.video_width * self.video_height * 3  # bgr24
+            total_frames = int(duration * self.video_fps)
+            frames_sent = 0
+
+            while frames_sent < total_frames:
+                frame_data = convert_process.stdout.read(bytes_per_frame)
+                if not frame_data:
+                    break
+
+                fifo.write(frame_data)
+                frames_sent += 1
+
+                # Небольшая пауза для синхронизации
+                time.sleep(1.0 / self.video_fps * 0.95)
+
+            fifo.flush()
+
+            # Завершаем процесс
+            convert_process.terminate()
+            if convert_process.poll() is None:
+                convert_process.kill()
+
+            logger.info(f"✅ Отправлено {frames_sent}/{total_frames} кадров в FIFO")
+            return frames_sent > 0
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка отправки видео в FIFO: {e}")
+            return False
+
+    def _video_fifo_sender(self):
+        """Отправка видео из очереди в FIFO"""
+        logger.info("🎬 Запуск отправителя видео в FIFO")
+
+        # Ждем пока FFmpeg откроет FIFO для чтения
+        time.sleep(2)
+
+        while self.is_streaming:
+            try:
+                # Проверяем очередь видео
+                if self.video_queue:
+                    video_item = self.video_queue.pop(0)
+                    video_path = video_item['path']
+                    duration = video_item.get('duration', 10.0)
+                    filename = video_item.get('filename', os.path.basename(video_path))
+
+                    logger.info(f"📤 Отправка видео в FIFO: {filename} ({duration:.1f} сек)")
+
+                    # Открываем FIFO для записи
+                    with open(self.video_fifo_path, 'wb') as fifo:
+                        # Конвертируем видео в сырой формат и отправляем в FIFO
+                        success = self._send_video_to_fifo(fifo, video_path, duration)
+
+                        if success:
+                            socketio.emit('video_playing', {
+                                'filename': filename,
+                                'duration': duration,
+                                'timestamp': datetime.now().isoformat(),
+                                'queue_remaining': len(self.video_queue)
+                            })
+
+                            # Ждем пока видео воспроизводится
+                            time.sleep(duration)
+                        else:
+                            logger.error(f"❌ Не удалось отправить видео в FIFO: {filename}")
+                            # Возвращаем в очередь
+                            self.video_queue.insert(0, video_item)
+                else:
+                    time.sleep(0.1)
+
+            except Exception as e:
+                logger.error(f"❌ Ошибка в отправителе видео: {e}", exc_info=True)
+                time.sleep(1)
+
+        logger.info("🛑 Отправитель видео остановлен")
 
     def _monitor_ffmpeg(self):
         """Мониторинг процесса FFmpeg"""
@@ -1641,29 +1661,32 @@ class FFmpegStreamManager:
             socketio.emit('stream_stopped', {'time': datetime.now().isoformat()})
 
     def stop_stream(self):
-        """Упрощенная остановка стрима"""
-        logger.info("🛑 Остановка FFmpeg стрима...")
+        """Остановка стрима с очисткой FIFO"""
+        logger.info("🛑 Остановка FFmpeg стрима и очистка FIFO...")
 
         self.is_streaming = False
 
-        # Ждем немного
+        # Очищаем FIFO если есть
+        if hasattr(self, 'video_fifo_path') and os.path.exists(self.video_fifo_path):
+            try:
+                # Отправляем EOF в FIFO
+                with open(self.video_fifo_path, 'wb') as fifo:
+                    fifo.write(b'')
+                os.unlink(self.video_fifo_path)
+                logger.info("🧹 FIFO очищен")
+            except:
+                pass
+
+        # Останавливаем процесс FFmpeg
         time.sleep(0.5)
 
         try:
-            # Закрываем stdin/stdout
             if hasattr(self, 'ffmpeg_stdin') and self.ffmpeg_stdin:
                 try:
                     self.ffmpeg_stdin.close()
                 except:
                     pass
 
-            if hasattr(self, 'ffmpeg_stdout') and self.ffmpeg_stdout:
-                try:
-                    self.ffmpeg_stdout.close()
-                except:
-                    pass
-
-            # Останавливаем процесс FFmpeg
             if hasattr(self, 'stream_process') and self.stream_process:
                 try:
                     self.stream_process.terminate()
@@ -1679,7 +1702,6 @@ class FFmpegStreamManager:
         # Сбрасываем атрибуты
         self.stream_process = None
         self.ffmpeg_stdin = None
-        self.ffmpeg_stdout = None
         self.ffmpeg_pid = None
 
         logger.info("✅ FFmpeg стрим остановлен")

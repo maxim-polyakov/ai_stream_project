@@ -8,10 +8,11 @@
 import os
 import sys
 import json
-import random
+import cv2
 import textwrap
 from PIL import Image, ImageDraw, ImageFont
-import cv2
+import numpy
+import random
 import asyncio
 import threading
 import logging
@@ -501,6 +502,7 @@ class FFmpegStreamManager:
             'uptime': time.time() - self.start_time if self.start_time else 0
         }
 
+
 class VideoGenerator:
     """Генератор видео для стрима"""
 
@@ -869,7 +871,6 @@ class VideoGenerator:
         except Exception as e:
             logger.error(f"❌ Ошибка получения информации о видео: {e}")
             return None
-
 # ========== EDGE TTS MANAGER ==========
 
 class EdgeTTSManager:
@@ -1067,7 +1068,7 @@ class AIAgent:
 # ========== AI STREAM MANAGER ==========
 
 class AIStreamManager:
-    """Обновленный менеджер стрима с поддержкой видео"""
+    """Менеджер стрима"""
 
     def __init__(self, ffmpeg_manager: FFmpegStreamManager = None):
         self.agents: List[AIAgent] = []
@@ -1084,6 +1085,19 @@ class AIStreamManager:
 
         self._init_agents()
         logger.info(f"AI Stream Manager инициализирован с {len(self.agents)} агентами")
+
+    def _init_agents(self):
+        """Инициализация агентов"""
+        for agent_config in Config.AGENTS:
+            agent = AIAgent(agent_config)
+            self.agents.append(agent)
+
+    def select_topic(self) -> str:
+        """Выбор темы"""
+        self.current_topic = random.choice(Config.TOPICS)
+        logger.info(f"📝 Выбрана тема: {self.current_topic}")
+        socketio.emit('topic_update', {'topic': self.current_topic})
+        return self.current_topic
 
     async def run_discussion_round(self):
         """Обновленный метод с поддержкой видео"""
@@ -1267,6 +1281,34 @@ class AIStreamManager:
         finally:
             self.is_discussion_active = False
             self.active_agent = None
+
+    def get_agents_state(self) -> List[Dict[str, Any]]:
+        """Состояние агентов"""
+        return [
+            {
+                'id': agent.id,
+                'name': agent.name,
+                'expertise': agent.expertise,
+                'avatar': agent.avatar,
+                'color': agent.color,
+                'is_speaking': agent.id == self.active_agent,
+                'message_count': len(agent.message_history)
+            }
+            for agent in self.agents
+        ]
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Статистика"""
+        return {
+            'message_count': self.message_count,
+            'discussion_round': self.discussion_round,
+            'current_topic': self.current_topic,
+            'is_active': self.is_discussion_active,
+            'active_agent': self.active_agent,
+            'agents_count': len(self.agents),
+            'conversation_history': len(self.conversation_history),
+            'ffmpeg_streaming': self.ffmpeg_manager.is_streaming if self.ffmpeg_manager else False
+        }
 
 
 # ========== ИНИЦИАЛИЗАЦИЯ ==========
@@ -1642,51 +1684,6 @@ def signal_handler(signum, frame):
 
     sys.exit(0)
 if __name__ == '__main__':
-
-    # Перед запуском проверяем наличие зависимостей для видео
-    print("=" * 70)
-    print("🤖 AI AGENTS STREAM - С ПОДДЕРЖКОЙ ВИДЕО")
-    print("=" * 70)
-
-    print("📦 Проверка зависимостей для видео:")
-
-    # Проверяем OpenCV
-    try:
-        cv2_version = cv2.__version__
-        print(f"   ✅ OpenCV {cv2_version} - доступен")
-    except:
-        print("   ❌ OpenCV - не установлен")
-        print("   Установите: pip install opencv-python")
-        sys.exit(1)
-
-    # Проверяем PIL/Pillow
-    try:
-        from PIL import Image
-
-        print("   ✅ PIL/Pillow - доступен")
-    except:
-        print("   ❌ PIL/Pillow - не установлен")
-        print("   Установите: pip install pillow")
-        sys.exit(1)
-
-    # Проверяем numpy
-    try:
-        numpy_version = numpy.__version__
-        print(f"   ✅ NumPy {numpy_version} - доступен")
-    except:
-        print("   ❌ NumPy - не установлен")
-        print("   Установите: pip install numpy")
-        sys.exit(1)
-
-    print("\n🎬 Видео возможности:")
-    print("   • Генерация видео-интро для агентов")
-    print("   • Анимированные переходы между темами")
-    print("   • Текстовые оверлеи в реальном времени")
-    print("   • Интеграция с FFmpeg стримом")
-
-    # Создаем директории
-    os.makedirs("video_cache", exist_ok=True)
-
     # Инициализируем event loop для дискуссий
     discussion_loop_event_loop = asyncio.new_event_loop()
 

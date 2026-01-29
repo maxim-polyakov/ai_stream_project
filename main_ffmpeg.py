@@ -1385,8 +1385,90 @@ class FFmpegStreamManager:
 
         logger.info("🛑 Простой видео свитчер остановлен")
 
+    def _overlay_video_controller(self):
+        """Контроллер видео для overlay режима"""
+        logger.info("🎬 Запуск overlay видео контроллера")
+
+        # Ждем запуска FFmpeg
+        time.sleep(3)
+
+        while self.is_streaming:
+            try:
+                time.sleep(0.5)
+
+                # Если есть видео в очереди
+                if self.video_queue:
+                    self.is_playing_video = True
+                    video_item = self.video_queue.pop(0)
+                    video_path = video_item['path']
+                    duration = video_item.get('duration', 10.0)
+                    filename = video_item.get('filename', os.path.basename(video_path))
+
+                    logger.info(f"🎥 Показываю видео из кэша: {filename} ({duration:.1f} сек)")
+
+                    # Подготавливаем видео файл
+                    prepared_video = self._prepare_video_file(video_path)
+                    if not prepared_video:
+                        logger.error(f"❌ Не удалось подготовить видео: {filename}")
+                        continue
+
+                    # Заменяем active_video.mp4
+                    try:
+                        import shutil
+                        # Создаем временный файл
+                        temp_file = self.current_video_file + '.tmp'
+                        shutil.copy2(prepared_video, temp_file)
+
+                        # Атомарная замена
+                        os.replace(temp_file, self.current_video_file)
+
+                        logger.info(f"✅ Активное видео заменено: {filename}")
+
+                        # FFmpeg overlay автоматически начнет показывать новое видео
+                        # Параметр shortest=1 гарантирует, что после окончания видео
+                        # будет показано только фоновое (дефолтное) видео
+
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка замены видео: {e}")
+                        continue
+
+                    # Отправляем уведомление
+                    socketio.emit('video_playing', {
+                        'filename': filename,
+                        'duration': duration,
+                        'timestamp': datetime.now().isoformat(),
+                        'queue_remaining': len(self.video_queue),
+                        'method': 'overlay'
+                    })
+
+                    # Ждем пока видео воспроизводится
+                    logger.info(f"⏳ Воспроизведение {duration:.1f} секунд...")
+                    time.sleep(duration)
+
+                    # После завершения видео, overlay вернется к показу только фонового видео
+                    # благодаря параметру shortest=1
+
+                    # Очищаем временный файл если он был создан
+                    if prepared_video != video_path and os.path.exists(prepared_video):
+                        try:
+                            os.unlink(prepared_video)
+                        except:
+                            pass
+
+                    self.is_playing_video = False
+
+                else:
+                    # Если очередь пуста, ждем
+                    time.sleep(1.0)
+
+            except Exception as e:
+                logger.error(f"❌ Ошибка в overlay видео контроллере: {e}", exc_info=True)
+                time.sleep(1.0)
+
+        logger.info("🛑 Overlay видео контроллер остановлен")
+
     def start_stream(self, use_audio: bool = True):
-        """Запуск единого FFmpeg процесса с динамической сменой видео"""
+        """Запуск единого FFmpeg процесса с overlay фильтром"""
         if not self.stream_key:
             logger.error("❌ Stream Key не установлен!")
             return {'success': False, 'error': 'Stream Key не установлен'}
@@ -1407,32 +1489,27 @@ class FFmpegStreamManager:
                 return {'success': False, 'error': 'Не удалось создать дефолтное видео'}
 
             # Создаем файл для активного видео
-            self.current_video_file = os.path.join(self.video_cache_dir, 'current_video.mp4')
+            self.current_video_file = os.path.join(self.video_cache_dir, 'active_video.mp4')
 
-            # Копируем дефолтное видео как текущее (изначально)
+            # Изначально копируем дефолтное видео
             import shutil
-            try:
-                shutil.copy2(default_video, self.current_video_file)
-                logger.info(f"📁 Текущий видео файл создан: {self.current_video_file}")
-            except Exception as e:
-                logger.error(f"❌ Ошибка копирования видео: {e}")
-                # Создаем новый файл
-                self._create_default_video_file(self.current_video_file)
+            shutil.copy2(default_video, self.current_video_file)
 
             logger.info(f"🚀 Запуск FFmpeg стрима на YouTube...")
             logger.info(f"🔗 RTMP URL: {self.rtmp_url}")
-            logger.info(f"Current_video_file: {self.current_video_file}")
-            # Команда FFmpeg с overlay фильтром
-            # Без сложных параметров, самый простой overlay
+
+            # Команда FFmpeg с двумя входами и overlay
             ffmpeg_cmd = [
                 'ffmpeg',
 
-                # Вход 1: Дефолтное видео (фон, зациклен)
+                # Вход 1: Дефолтное видео (фон)
                 '-re',
                 '-stream_loop', '-1',
                 '-i', default_video,
 
-                # Вход 2: Текущее активное видео (будет меняться)
+                # Вход 2: Активное видео (будет меняться)
+                '-re',
+                '-stream_loop', '1',  # Один раз
                 '-i', self.current_video_file,
 
                 # Вход 3: Аудио через stdin
@@ -1442,9 +1519,10 @@ class FFmpegStreamManager:
                 '-channel_layout', 'stereo',
                 '-i', 'pipe:0',
 
-                # Ключевое изменение: overlay с eof_action=pass и shortest=0
+                # Фильтр: overlay короткого видео поверх фона
+                # shortest=1 - когда активное видео закончится, показывать только фон
                 '-filter_complex',
-                f"""[0:v][1:v]overlay=eof_action=pass:shortest=0[outv]""",
+                '[0:v][1:v]overlay=shortest=1[outv]',
 
                 # Карты
                 '-map', '[outv]',
@@ -1472,21 +1550,16 @@ class FFmpegStreamManager:
                 '-f', 'flv',
                 '-flvflags', 'no_duration_filesize',
 
-                # Логирование для отладки
-                '-loglevel', 'verbose',
+                # Логирование
+                '-loglevel', 'info',
 
                 self.rtmp_url
             ]
 
-            logger.info(f"🚀 Запуск FFmpeg процесса...")
-            logger.info(f"🎬 Дефолтное видео (фон): {os.path.basename(default_video)}")
-            logger.info(f"🎬 Активное видео: {os.path.basename(self.current_video_file)}")
-            logger.info(f"🎯 Фильтр: overlay - активное видео поверх дефолтного")
-
             # Запускаем FFmpeg процесс
             self.stream_process = subprocess.Popen(
                 ffmpeg_cmd,
-                stdin=subprocess.PIPE,  # Для аудио
+                stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 bufsize=0,
@@ -1508,9 +1581,9 @@ class FFmpegStreamManager:
                 daemon=True
             ).start()
 
-            # Запускаем видео контроллер
+            # Запускаем видео контроллер overlay
             threading.Thread(
-                target=self._simple_video_switcher,
+                target=self._overlay_video_controller,
                 daemon=True
             ).start()
 

@@ -231,7 +231,7 @@ class FFmpegStreamManager:
             logger.error(f"   Тип ошибки: {type(e).__name__}")
             logger.error(f"   Детали: {str(e)}")
             return False
-        
+
     def set_stream_key(self, stream_key: str) -> bool:
         """Установка ключа стрима"""
         self.stream_key = stream_key
@@ -776,25 +776,23 @@ class FFmpegStreamManager:
 
             logger.info(f"🎬 Используем дефолтное видео: {os.path.basename(default_video)}")
 
-            # ЕДИНАЯ команда FFmpeg с двумя входами: видео + аудио через pipe
+            # ВАЖНО: ЕДИНАЯ команда FFmpeg с зацикленным видео и аудио через pipe
             ffmpeg_cmd = [
                 'ffmpeg',
 
-                # Вход 1: Видео через pipe (будем менять динамически)
-                '-f', 'rawvideo',
-                '-pix_fmt', 'bgr24',
-                '-s', f'{self.video_width}x{self.video_height}',
-                '-r', str(self.video_fps),
-                '-i', 'pipe:0',
+                # Вход 1: Видео файл (зацикленный)
+                '-re',
+                '-stream_loop', '-1',  # Бесконечный цикл
+                '-i', default_video,
 
                 # Вход 2: Аудио через stdin (сырой PCM)
                 '-f', 's16le',
                 '-ar', str(self.audio_sample_rate),
                 '-ac', str(self.audio_channels),
                 '-channel_layout', 'stereo',
-                '-i', 'pipe:1',
+                '-i', 'pipe:0',
 
-                # Карты
+                # Карты: берем видео с входа 1, аудио с входа 2
                 '-map', '0:v:0',
                 '-map', '1:a:0',
 
@@ -819,17 +817,23 @@ class FFmpegStreamManager:
                 # Формат вывода
                 '-f', 'flv',
                 '-flvflags', 'no_duration_filesize',
+
+                # Логирование
+                '-loglevel', 'info',
+
                 self.rtmp_url
             ]
 
             logger.info(f"🚀 Запуск единого FFmpeg процесса")
-            logger.debug(f"Команда: {' '.join(ffmpeg_cmd[:15])}...")
+            logger.info(f"🔗 RTMP: {self.rtmp_url}")
+            logger.info(f"🎬 Видео: {os.path.basename(default_video)} (зациклено)")
+            logger.info(f"🔊 Аудио: через pipe (PCM)")
 
             # Запускаем ЕДИНЫЙ FFmpeg процесс
             self.stream_process = subprocess.Popen(
                 ffmpeg_cmd,
                 stdin=subprocess.PIPE,  # Для аудио
-                stdout=subprocess.PIPE,  # Для видео
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 bufsize=0,
                 text=False
@@ -838,7 +842,6 @@ class FFmpegStreamManager:
             self.is_streaming = True
             self.ffmpeg_pid = self.stream_process.pid
             self.ffmpeg_stdin = self.stream_process.stdin
-            self.ffmpeg_stdout = self.stream_process.stdout
 
             logger.info(f"✅ FFmpeg запущен (PID: {self.ffmpeg_pid})")
 
@@ -851,9 +854,9 @@ class FFmpegStreamManager:
                 daemon=True
             ).start()
 
-            # Запускаем видео процессор
+            # Запускаем видео процессор для смены видео
             threading.Thread(
-                target=self._continuous_video_processor,
+                target=self._continuous_video_switcher,
                 daemon=True
             ).start()
 
@@ -861,7 +864,8 @@ class FFmpegStreamManager:
                 'pid': self.ffmpeg_pid,
                 'rtmp_url': self.rtmp_url,
                 'has_video': True,
-                'has_audio': True
+                'has_audio': True,
+                'default_video': os.path.basename(default_video)
             })
 
             return {'success': True, 'pid': self.ffmpeg_pid}

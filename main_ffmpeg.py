@@ -1314,6 +1314,77 @@ class FFmpegStreamManager:
 
         logger.info("🛑 Overlay видео апдейтер остановлен")
 
+    def _simple_video_switcher(self):
+        """Простой переключатель видео - заменяет файл current_video_file"""
+        logger.info("🎬 Запуск простого видео свитчера")
+
+        # Ждем запуска FFmpeg
+        time.sleep(3)
+
+        while self.is_streaming:
+            try:
+                time.sleep(0.5)
+
+                # Если есть видео в очереди
+                if self.video_queue:
+                    self.is_playing_video = True
+                    video_item = self.video_queue.pop(0)
+                    video_path = video_item['path']
+                    duration = video_item.get('duration', 10.0)
+                    filename = video_item.get('filename', os.path.basename(video_path))
+
+                    logger.info(f"🔄 Заменяю видео: {filename} ({duration:.1f} сек)")
+
+                    # Подготавливаем видео файл
+                    prepared_video = self._prepare_video_file(video_path)
+                    if not prepared_video:
+                        logger.error(f"❌ Не удалось подготовить видео: {filename}")
+                        continue
+
+                    # ПРОСТАЯ ЗАМЕНА файла
+                    try:
+                        import shutil
+                        # Создаем временный файл
+                        temp_file = self.current_video_file + '.tmp'
+                        shutil.copy2(prepared_video, temp_file)
+
+                        # Атомарная замена
+                        os.replace(temp_file, self.current_video_file)
+
+                        logger.info(f"✅ Видео заменено: {filename}")
+                        logger.info(f"📏 Размер файла: {os.path.getsize(self.current_video_file) / 1024:.1f} KB")
+
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка замены видео: {e}")
+                        continue
+
+                    # Отправляем уведомление
+                    socketio.emit('video_playing', {
+                        'filename': filename,
+                        'duration': duration,
+                        'timestamp': datetime.now().isoformat(),
+                        'queue_remaining': len(self.video_queue)
+                    })
+
+                    # Ждем пока видео воспроизводится
+                    logger.info(f"⏳ Воспроизведение {duration:.1f} секунд...")
+                    time.sleep(duration)
+
+                    # FFmpeg overlay будет показывать новое видео поверх дефолтного
+                    # Когда новое видео закончится, overlay продолжит показывать дефолтное видео
+
+                    self.is_playing_video = False
+
+                else:
+                    # Если очередь пуста, ждем
+                    time.sleep(1.0)
+
+            except Exception as e:
+                logger.error(f"❌ Ошибка в видео свитчере: {e}")
+                time.sleep(1.0)
+
+        logger.info("🛑 Простой видео свитчер остановлен")
+
     def start_stream(self, use_audio: bool = True):
         """Запуск единого FFmpeg процесса с динамической сменой видео"""
         if not self.stream_key:
@@ -1345,11 +1416,14 @@ class FFmpegStreamManager:
                 logger.info(f"📁 Текущий видео файл создан: {self.current_video_file}")
             except Exception as e:
                 logger.error(f"❌ Ошибка копирования видео: {e}")
+                # Создаем новый файл
+                self._create_default_video_file(self.current_video_file)
 
             logger.info(f"🚀 Запуск FFmpeg стрима на YouTube...")
             logger.info(f"🔗 RTMP URL: {self.rtmp_url}")
 
-            # Ключевое изменение: используем фильтр overlay вместо concat
+            # Команда FFmpeg с overlay фильтром
+            # Без сложных параметров, самый простой overlay
             ffmpeg_cmd = [
                 'ffmpeg',
 
@@ -1369,13 +1443,8 @@ class FFmpegStreamManager:
                 '-channel_layout', 'stereo',
                 '-i', 'pipe:0',
 
-                # ФИЛЬТР: Используем overlay для наложения активного видео поверх дефолтного
-                '-filter_complex',
-                f"""
-                [0:v]setpts=PTS-STARTPTS[bg];
-                [1:v]setpts=PTS-STARTPTS[fg];
-                [bg][fg]overlay=shortest=1:eof_action=pass[outv]
-                """,
+                # Простой фильтр overlay без лишних параметров
+                '-filter_complex', '[0:v][1:v]overlay[outv]',
 
                 # Карты
                 '-map', '[outv]',
@@ -1391,7 +1460,6 @@ class FFmpegStreamManager:
                 '-maxrate', '4500k',
                 '-bufsize', '9000k',
                 '-r', str(self.video_fps),
-                '-x264-params', 'keyint=60:min-keyint=60:scenecut=0',
 
                 # Кодирование аудио
                 '-c:a', 'aac',
@@ -1403,16 +1471,13 @@ class FFmpegStreamManager:
                 '-f', 'flv',
                 '-flvflags', 'no_duration_filesize',
 
-                # Логирование
-                '-loglevel', 'info',
-
                 self.rtmp_url
             ]
 
             logger.info(f"🚀 Запуск FFmpeg процесса...")
-            logger.info(f"🎬 Дефолтное видео: {os.path.basename(default_video)}")
+            logger.info(f"🎬 Дефолтное видео (фон): {os.path.basename(default_video)}")
             logger.info(f"🎬 Активное видео: {os.path.basename(self.current_video_file)}")
-            logger.info(f"🎯 Фильтр: overlay (активное видео поверх дефолтного)")
+            logger.info(f"🎯 Фильтр: overlay - активное видео поверх дефолтного")
 
             # Запускаем FFmpeg процесс
             self.stream_process = subprocess.Popen(
@@ -1439,9 +1504,9 @@ class FFmpegStreamManager:
                 daemon=True
             ).start()
 
-            # Запускаем видео контроллер для замены активного видео
+            # Запускаем видео контроллер
             threading.Thread(
-                target=self._overlay_video_updater,
+                target=self._simple_video_switcher,
                 daemon=True
             ).start()
 
@@ -1450,8 +1515,7 @@ class FFmpegStreamManager:
                 'rtmp_url': self.rtmp_url,
                 'has_video': True,
                 'has_audio': True,
-                'filter': 'overlay',
-                'current_video_file': self.current_video_file
+                'filter': 'overlay'
             })
 
             return {'success': True, 'pid': self.ffmpeg_pid}

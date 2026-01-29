@@ -1175,233 +1175,6 @@ class FFmpegStreamManager:
 
         logger.info("🛑 Динамический видео контроллер остановлен")
 
-    def _video_file_updater(self):
-        """Обновление текущего видео файла во время стрима"""
-        logger.info("🎬 Запуск видео файл апдейтера")
-
-        # Ждем запуска FFmpeg
-        time.sleep(3)
-
-        while self.is_streaming:
-            try:
-                time.sleep(0.5)  # Проверяем очередь чаще
-
-                # Если есть видео в очереди
-                if self.video_queue:
-                    self.is_playing_video = True
-                    video_item = self.video_queue.pop(0)
-                    video_path = video_item['path']
-                    duration = video_item.get('duration', 10.0)
-                    filename = video_item.get('filename', os.path.basename(video_path))
-
-                    logger.info(f"🔄 Переключаю на видео: {filename} ({duration:.1f} сек)")
-
-                    # Подготавливаем видео файл
-                    prepared_video = self._prepare_video_file(video_path)
-                    if not prepared_video:
-                        logger.error(f"❌ Не удалось подготовить видео: {filename}")
-                        continue
-
-                    # АТОМАРНАЯ ЗАМЕНА: создаем временный файл, затем переименовываем
-                    temp_video = self.current_video_file + '.tmp'
-
-                    try:
-                        # Копируем подготовленное видео во временный файл
-                        import shutil
-                        shutil.copy2(prepared_video, temp_video)
-
-                        # Атомарная замена (переименование)
-                        os.replace(temp_video, self.current_video_file)
-
-                        logger.info(f"✅ Видео файл заменен: {filename}")
-                        logger.info(f"📏 Размер: {os.path.getsize(self.current_video_file) / 1024:.1f} KB")
-
-                        # FFmpeg автоматически перечитает файл из-за stream_loop
-                        # и начнет показывать новое видео
-
-                    except Exception as copy_error:
-                        logger.error(f"❌ Ошибка копирования видео: {copy_error}")
-                        # Удаляем временный файл если остался
-                        if os.path.exists(temp_video):
-                            os.unlink(temp_video)
-                        continue
-
-                    # Отправляем уведомление
-                    socketio.emit('video_playing', {
-                        'filename': filename,
-                        'duration': duration,
-                        'timestamp': datetime.now().isoformat(),
-                        'file_replaced': self.current_video_file,
-                        'queue_remaining': len(self.video_queue)
-                    })
-
-                    # Ждем пока видео воспроизводится
-                    # FFmpeg будет зациклен на новом видео
-                    logger.info(f"⏳ Воспроизведение {duration:.1f} секунд...")
-                    time.sleep(duration)
-
-                    # После завершения видео возвращаем дефолтное видео
-                    # чтобы не зацикливаться на показанном видео
-                    self._restore_default_video()
-
-                    self.is_playing_video = False
-
-                else:
-                    # Если очередь пуста, ждем
-                    time.sleep(1.0)
-
-            except Exception as e:
-                logger.error(f"❌ Ошибка в видео файл апдейтере: {e}", exc_info=True)
-                time.sleep(1.0)
-
-        logger.info("🛑 Видео файл апдейтер остановлен")
-
-    def _overlay_video_updater(self):
-        """Обновление активного видео для overlay"""
-        logger.info("🎬 Запуск overlay видео апдейтера")
-
-        # Ждем запуска FFmpeg
-        time.sleep(3)
-
-        while self.is_streaming:
-            try:
-                time.sleep(0.5)
-
-                # Если есть видео в очереди
-                if self.video_queue:
-                    self.is_playing_video = True
-                    video_item = self.video_queue.pop(0)
-                    video_path = video_item['path']
-                    duration = video_item.get('duration', 10.0)
-                    filename = video_item.get('filename', os.path.basename(video_path))
-
-                    logger.info(f"🎥 Заменяю активное видео: {filename} ({duration:.1f} сек)")
-
-                    # Подготавливаем видео файл
-                    prepared_video = self._prepare_video_file(video_path)
-                    if not prepared_video:
-                        logger.error(f"❌ Не удалось подготовить видео: {filename}")
-                        continue
-
-                    # АТОМАРНАЯ ЗАМЕНА файла current_video_file
-                    temp_file = self.current_video_file + '.tmp'
-
-                    try:
-                        import shutil
-                        shutil.copy2(prepared_video, temp_file)
-                        os.replace(temp_file, self.current_video_file)
-
-                        logger.info(f"✅ Активное видео заменено: {filename}")
-
-                        # FFmpeg начнет читать новый файл сразу
-                        # overlay=shortest=1 означает, что когда активное видео закончится,
-                        # будет показано только дефолтное видео
-
-                    except Exception as e:
-                        logger.error(f"❌ Ошибка замены видео: {e}")
-                        if os.path.exists(temp_file):
-                            os.unlink(temp_file)
-                        continue
-
-                    # Отправляем уведомление
-                    socketio.emit('video_playing', {
-                        'filename': filename,
-                        'duration': duration,
-                        'timestamp': datetime.now().isoformat(),
-                        'queue_remaining': len(self.video_queue),
-                        'overlay_mode': True
-                    })
-
-                    # Ждем пока видео воспроизводится
-                    logger.info(f"⏳ Воспроизведение {duration:.1f} секунд...")
-                    time.sleep(duration)
-
-                    # После завершения видео, FFmpeg вернется к показу только дефолтного видео
-                    # благодаря shortest=1 в фильтре overlay
-
-                    self.is_playing_video = False
-
-                else:
-                    # Если очередь пуста, ждем
-                    time.sleep(1.0)
-
-            except Exception as e:
-                logger.error(f"❌ Ошибка в overlay видео апдейтере: {e}", exc_info=True)
-                time.sleep(1.0)
-
-        logger.info("🛑 Overlay видео апдейтер остановлен")
-
-    def _simple_video_switcher(self):
-        """Простой переключатель видео - заменяет файл current_video_file"""
-        logger.info("🎬 Запуск простого видео свитчера")
-
-        # Ждем запуска FFmpeg
-        time.sleep(3)
-
-        while self.is_streaming:
-            try:
-                time.sleep(0.5)
-
-                # Если есть видео в очереди
-                if self.video_queue:
-                    self.is_playing_video = True
-                    video_item = self.video_queue.pop(0)
-                    video_path = video_item['path']
-                    duration = video_item.get('duration', 10.0)
-                    filename = video_item.get('filename', os.path.basename(video_path))
-
-                    logger.info(f"🔄 Заменяю видео: {filename} ({duration:.1f} сек)")
-
-                    # Подготавливаем видео файл
-                    prepared_video = self._prepare_video_file(video_path)
-                    if not prepared_video:
-                        logger.error(f"❌ Не удалось подготовить видео: {filename}")
-                        continue
-
-                    # ПРОСТАЯ ЗАМЕНА файла
-                    try:
-                        import shutil
-                        # Создаем временный файл
-                        temp_file = self.current_video_file + '.tmp'
-                        shutil.copy2(prepared_video, temp_file)
-
-                        # Атомарная замена
-                        os.replace(temp_file, self.current_video_file)
-
-                        logger.info(f"✅ Видео заменено: {filename}")
-                        logger.info(f"📏 Размер файла: {os.path.getsize(self.current_video_file) / 1024:.1f} KB")
-
-                    except Exception as e:
-                        logger.error(f"❌ Ошибка замены видео: {e}")
-                        continue
-
-                    # Отправляем уведомление
-                    socketio.emit('video_playing', {
-                        'filename': filename,
-                        'duration': duration,
-                        'timestamp': datetime.now().isoformat(),
-                        'queue_remaining': len(self.video_queue)
-                    })
-
-                    # Ждем пока видео воспроизводится
-                    logger.info(f"⏳ Воспроизведение {duration:.1f} секунд...")
-                    time.sleep(duration)
-
-                    # FFmpeg overlay будет показывать новое видео поверх дефолтного
-                    # Когда новое видео закончится, overlay продолжит показывать дефолтное видео
-
-                    self.is_playing_video = False
-
-                else:
-                    # Если очередь пуста, ждем
-                    time.sleep(1.0)
-
-            except Exception as e:
-                logger.error(f"❌ Ошибка в видео свитчере: {e}")
-                time.sleep(1.0)
-
-        logger.info("🛑 Простой видео свитчер остановлен")
-
     def _video_pipe_sender(self):
         """Отправка видео в pipe для оверлея"""
         logger.info("📤 Запуск отправителя видео в pipe")
@@ -1627,8 +1400,406 @@ class FFmpegStreamManager:
             logger.error(f"❌ Критическая ошибка отправки видео: {e}", exc_info=True)
             return False
 
+    def _send_audio_as_mpegts(self, audio_file: str) -> bool:
+        """Создание MPEG-TS потока только с аудио"""
+        try:
+            # Создаем MPEG-TS с аудио и статичным изображением
+            temp_mpegts = tempfile.NamedTemporaryFile(suffix='.ts', delete=False)
+            temp_mpegts.close()
+
+            # Длительность аудио
+            audio_duration = self._get_audio_duration(audio_file)
+
+            # Команда для MPEG-TS с аудио и статичным видео
+            mpegts_cmd = [
+                'ffmpeg',
+                '-re',
+                '-f', 'lavfi',
+                '-i',
+                f'color=size={self.video_width}x{self.video_height}:rate={self.video_fps}:color=0x1a1a2e:duration={audio_duration}',
+                '-i', audio_file,
+                '-t', str(audio_duration),
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',
+                '-tune', 'zerolatency',
+                '-pix_fmt', 'yuv420p',
+                '-b:v', '1000k',
+                '-maxrate', '1000k',
+                '-bufsize', '2000k',
+                '-r', str(self.video_fps),
+                '-g', '30',
+                '-map', '0:v:0',
+                '-map', '1:a:0',
+                '-c:a', 'aac',
+                '-b:a', '128k',
+                '-ar', '44100',
+                '-ac', '2',
+                '-f', 'mpegts',
+                '-muxdelay', '0',
+                '-muxpreload', '0',
+                '-y',
+                temp_mpegts.name
+            ]
+
+            logger.info(f"🔊 Создание MPEG-TS для аудио: {os.path.basename(audio_file)} ({audio_duration:.1f} сек)")
+
+            timeout = min(audio_duration + 10, 30)
+
+            result = subprocess.run(
+                mpegts_cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+
+            if result.returncode != 0:
+                logger.error(f"❌ Ошибка MPEG-TS для аудио: {result.stderr[:300]}")
+                if os.path.exists(temp_mpegts.name):
+                    os.unlink(temp_mpegts.name)
+                return False
+
+            # Отправляем MPEG-TS файл
+            success = self._send_mpegts_file(temp_mpegts.name, audio_duration)
+
+            # Очищаем временный файл
+            if os.path.exists(temp_mpegts.name):
+                os.unlink(temp_mpegts.name)
+
+            return success
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка создания MPEG-TS для аудио: {e}")
+            return False
+
+    def _send_mpegts_file(self, mpegts_path: str, duration: float) -> bool:
+        """Отправка MPEG-TS файла в pipe"""
+        try:
+            if not self.is_streaming or not self.ffmpeg_stdin:
+                return False
+
+            file_size = os.path.getsize(mpegts_path)
+            logger.info(f"📤 Отправка MPEG-TS файла: {file_size / 1024:.1f} KB")
+
+            with open(mpegts_path, 'rb') as f:
+                start_time = time.time()
+                bytes_sent = 0
+
+                # Отправляем файл чанками
+                chunk_size = 65536  # 64KB
+
+                while bytes_sent < file_size and self.is_streaming:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+
+                    try:
+                        self.ffmpeg_stdin.write(chunk)
+                        self.ffmpeg_stdin.flush()
+                        bytes_sent += len(chunk)
+
+                        # Синхронизация: отправляем в реальном времени
+                        elapsed = time.time() - start_time
+                        expected_time = (bytes_sent / file_size) * duration
+
+                        if elapsed < expected_time:
+                            time.sleep(expected_time - elapsed)
+
+                    except BrokenPipeError:
+                        logger.error("❌ Broken pipe при отправке MPEG-TS")
+                        self.is_streaming = False
+                        break
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка отправки MPEG-TS: {e}")
+                        break
+
+                logger.info(f"✅ Отправлено {bytes_sent}/{file_size} байт MPEG-TS")
+                return bytes_sent >= file_size * 0.9  # Успех если >90%
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка отправки MPEG-TS файла: {e}")
+            return False
+
+    def _get_audio_duration(self, audio_file: str) -> float:
+        """Получение длительности аудио файла"""
+        try:
+            cmd = [
+                'ffprobe',
+                '-v', 'error',
+                '-show_entries', 'format=duration',
+                '-of', 'default=noprint_wrappers=1:nokey=1',
+                audio_file
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+
+            if result.returncode == 0:
+                return float(result.stdout.strip())
+            else:
+                return 5.0  # По умолчанию
+
+        except Exception as e:
+            logger.warning(f"Не удалось получить длительность аудио: {e}")
+            return 5.0
+
+    def _send_video_as_mpegts(self, video_path: str, duration: float) -> bool:
+        """Создание и отправка MPEG-TS потока с видео и аудио"""
+        try:
+            if not self.is_streaming or not self.ffmpeg_stdin:
+                return False
+
+            # Создаем временный MPEG-TS файл
+            temp_mpegts = tempfile.NamedTemporaryFile(suffix='.ts', delete=False)
+            temp_mpegts.close()
+
+            # Берем первое аудио из очереди если есть
+            audio_input = None
+            audio_map = []
+
+            if self.audio_queue:
+                audio_file = self.audio_queue[0]  # Берем, но не удаляем из очереди пока
+                audio_input = ['-i', audio_file]
+                audio_map = ['-map', '1:a:0']
+                logger.info(f"🎵 Добавляю аудио к видео: {os.path.basename(audio_file)}")
+
+            # Команда для создания MPEG-TS потока
+            mpegts_cmd = [
+                'ffmpeg',
+                '-re',  # Реальное время
+                '-i', video_path,
+            ]
+
+            if audio_input:
+                mpegts_cmd.extend(audio_input)
+
+            mpegts_cmd.extend([
+                '-t', str(duration),
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',
+                '-tune', 'zerolatency',
+                '-pix_fmt', 'yuv420p',
+                '-b:v', '3000k',
+                '-maxrate', '3000k',
+                '-bufsize', '6000k',
+                '-r', str(self.video_fps),
+                '-g', '30',
+            ])
+
+            # Карты: видео всегда с первого входа
+            mpegts_cmd.extend(['-map', '0:v:0'])
+
+            # Если есть аудио, добавляем его карту
+            if audio_map:
+                mpegts_cmd.extend(audio_map)
+                mpegts_cmd.extend([
+                    '-c:a', 'aac',
+                    '-b:a', '128k',
+                    '-ar', '44100',
+                    '-ac', '2',
+                ])
+            else:
+                # Или добавляем тишину
+                mpegts_cmd.extend([
+                    '-f', 'lavfi',
+                    '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+                    '-map', '1:a:0',
+                    '-c:a', 'aac',
+                    '-b:a', '128k',
+                ])
+
+            mpegts_cmd.extend([
+                '-f', 'mpegts',
+                '-muxdelay', '0',
+                '-muxpreload', '0',
+                '-y',
+                temp_mpegts.name
+            ])
+
+            logger.info(f"🔄 Создание MPEG-TS потока: {os.path.basename(video_path)}")
+
+            # Таймаут создания
+            timeout = min(duration + 10, 30)
+
+            result = subprocess.run(
+                mpegts_cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+
+            if result.returncode != 0:
+                logger.error(f"❌ Ошибка создания MPEG-TS: {result.stderr[:300]}")
+                if os.path.exists(temp_mpegts.name):
+                    os.unlink(temp_mpegts.name)
+                return False
+
+            # Отправляем MPEG-TS файл в pipe
+            success = self._send_mpegts_file(temp_mpegts.name, duration)
+
+            # Удаляем обработанное аудио если оно было использовано
+            if audio_input and success:
+                # Удаляем использованное аудио из очереди
+                if self.audio_queue:
+                    self.audio_queue.pop(0)
+
+            # Очищаем временный файл
+            if os.path.exists(temp_mpegts.name):
+                os.unlink(temp_mpegts.name)
+
+            return success
+
+        except subprocess.TimeoutExpired:
+            logger.error(f"❌ Таймаут создания MPEG-TS: {os.path.basename(video_path)}")
+            return False
+        except Exception as e:
+            logger.error(f"❌ Ошибка создания MPEG-TS: {e}")
+            return False
+
+    def _stream_controller(self):
+        """Главный контроллер потока - отправляет MPEG-TS данные"""
+        logger.info("🎬 Запуск контроллера MPEG-TS потока")
+
+        # Сначала отправляем тестовый MPEG-TS поток
+        self._send_test_mpegts(5.0)
+
+        while self.is_streaming:
+            try:
+                # Приоритет: сначала видео из очереди
+                if self.video_queue:
+                    self.is_playing_video = True
+                    video_item = self.video_queue.pop(0)
+                    video_path = video_item['path']
+                    duration = video_item.get('duration', 10.0)
+                    filename = video_item.get('filename', os.path.basename(video_path))
+
+                    logger.info(f"🎬 Отправка видео через MPEG-TS: {filename} ({duration:.1f} сек)")
+
+                    # Создаем MPEG-TS файл с видео и аудио (если есть)
+                    success = self._send_video_as_mpegts(video_path, duration)
+
+                    if success:
+                        socketio.emit('video_playing', {
+                            'filename': filename,
+                            'duration': duration,
+                            'timestamp': datetime.now().isoformat(),
+                            'queue_remaining': len(self.video_queue)
+                        })
+
+                        # Ждем пока видео воспроизводится
+                        time.sleep(duration)
+                    else:
+                        logger.error(f"❌ Не удалось отправить видео: {filename}")
+                        # Возвращаем в очередь
+                        self.video_queue.insert(0, video_item)
+                        time.sleep(1)
+
+                    self.is_playing_video = False
+
+                # Если нет видео, проверяем аудио
+                elif self.audio_queue:
+                    self.is_playing_audio = True
+                    audio_file = self.audio_queue.pop(0)
+
+                    logger.info(f"🔊 Отправка аудио через MPEG-TS: {os.path.basename(audio_file)}")
+
+                    # Создаем MPEG-TS только с аудио (и статичным изображением)
+                    success = self._send_audio_as_mpegts(audio_file)
+
+                    if success:
+                        # Ждем пока аудио воспроизводится
+                        audio_duration = self._get_audio_duration(audio_file)
+                        time.sleep(audio_duration)
+                    else:
+                        logger.error(f"❌ Не удалось отправить аудио: {audio_file}")
+                        self.audio_queue.insert(0, audio_file)
+                        time.sleep(1)
+
+                    self.is_playing_audio = False
+
+                else:
+                    # Если нет ни видео, ни аудио - отправляем статичное изображение
+                    self._send_static_image(1.0)
+                    time.sleep(0.5)
+
+            except Exception as e:
+                logger.error(f"❌ Ошибка в контроллере потока: {e}", exc_info=True)
+                time.sleep(1)
+
+        logger.info("🛑 Контроллер MPEG-TS потока остановлен")
+
+    def _send_static_image(self, duration: float):
+        """Отправка статичного изображения"""
+        try:
+            temp_mpegts = tempfile.NamedTemporaryFile(suffix='.ts', delete=False)
+            temp_mpegts.close()
+
+            static_cmd = [
+                'ffmpeg',
+                '-f', 'lavfi',
+                '-i', f'color=size={self.video_width}x{self.video_height}:rate=1:color=0x1a1a2e:duration={duration}',
+                '-f', 'lavfi',
+                '-i', f'anoisesrc=d={duration}:c=pink',
+                '-t', str(duration),
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',
+                '-pix_fmt', 'yuv420p',
+                '-b:v', '1000k',
+                '-r', '1',
+                '-c:a', 'aac',
+                '-b:a', '64k',
+                '-f', 'mpegts',
+                '-y',
+                temp_mpegts.name
+            ]
+
+            result = subprocess.run(static_cmd, capture_output=True, text=True, timeout=5)
+
+            if result.returncode == 0:
+                self._send_mpegts_file(temp_mpegts.name, duration)
+
+            if os.path.exists(temp_mpegts.name):
+                os.unlink(temp_mpegts.name)
+
+        except Exception as e:
+            logger.error(f"Ошибка статичного изображения: {e}")
+
+    def _send_test_mpegts(self, duration: float):
+        """Отправка тестового MPEG-TS потока"""
+        try:
+            temp_mpegts = tempfile.NamedTemporaryFile(suffix='.ts', delete=False)
+            temp_mpegts.close()
+
+            test_cmd = [
+                'ffmpeg',
+                '-f', 'lavfi',
+                '-i', f'testsrc=size={self.video_width}x{self.video_height}:rate={self.video_fps}:duration={duration}',
+                '-f', 'lavfi',
+                '-i', f'sine=frequency=1000:duration={duration}',
+                '-t', str(duration),
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',
+                '-pix_fmt', 'yuv420p',
+                '-b:v', '2000k',
+                '-c:a', 'aac',
+                '-b:a', '128k',
+                '-f', 'mpegts',
+                '-y',
+                temp_mpegts.name
+            ]
+
+            result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=10)
+
+            if result.returncode == 0:
+                self._send_mpegts_file(temp_mpegts.name, duration)
+                logger.info("✅ Тестовый MPEG-TS поток отправлен")
+
+            if os.path.exists(temp_mpegts.name):
+                os.unlink(temp_mpegts.name)
+
+        except Exception as e:
+            logger.error(f"Ошибка тестового MPEG-TS: {e}")
+
     def start_stream(self, use_audio: bool = True):
-        """Запуск FFmpeg с оверлеем для динамических видео поверх дефолтного"""
+        """Запуск единого FFmpeg процесса для видео и аудио"""
         if not self.stream_key:
             logger.error("❌ Stream Key не установлен!")
             return {'success': False, 'error': 'Stream Key не установлен'}
@@ -1642,53 +1813,18 @@ class FFmpegStreamManager:
             self.is_playing_audio = False
             self.is_playing_video = False
 
-            # Создаем дефолтное видео
-            default_video = self._create_default_video_file()
-
-            # Создаем именованный пайп для динамических видео
-            self.video_pipe_path = '/tmp/video_pipe.ts'
-            try:
-                os.mkfifo(self.video_pipe_path)
-            except FileExistsError:
-                os.unlink(self.video_pipe_path)
-                os.mkfifo(self.video_pipe_path)
-
-            logger.info(f"🚀 Запуск FFmpeg с оверлеем видео...")
+            logger.info(f"🚀 Запуск FFmpeg стрима на YouTube...")
             logger.info(f"🔗 RTMP URL: {self.rtmp_url}")
-            logger.info(f"📁 PIPE для видео: {self.video_pipe_path}")
 
-            # FFmpeg с overlay фильтром
+            # ВАЖНО: ОДИН PIPE для видео+аудио в формате MPEG-TS
             ffmpeg_cmd = [
                 'ffmpeg',
 
-                # Вход 1: Дефолтное видео (фон, зацикленное)
-                '-re',
-                '-stream_loop', '-1',
-                '-i', default_video,
-
-                # Вход 2: PIPE для динамических видео (MPEG-TS поток)
+                # Вход 0: MPEG-TS поток через stdin (содержит и видео, и аудио)
                 '-f', 'mpegts',
-                '-i', self.video_pipe_path,
-
-                # Вход 3: Аудио через stdin
-                '-f', 's16le',
-                '-ar', str(self.audio_sample_rate),
-                '-ac', str(self.audio_channels),
-                '-channel_layout', 'stereo',
                 '-i', 'pipe:0',
 
-                # OVERLAY фильтр: накладываем видео из pipe поверх фона
-                # Используем select для показа только когда есть данные в pipe
-                '-filter_complex',
-                f'[0:v]setpts=PTS-STARTPTS[bg];'
-                f'[1:v]setpts=PTS-STARTPTS,scale={self.video_width}:{self.video_height}[fg];'
-                f'[bg][fg]overlay=0:0:shortest=1[outv]',
-
-                # Карты
-                '-map', '[outv]',
-                '-map', '2:a:0',
-
-                # Кодирование видео
+                # Перекодируем для YouTube
                 '-c:v', 'libx264',
                 '-preset', 'veryfast',
                 '-tune', 'zerolatency',
@@ -1698,8 +1834,8 @@ class FFmpegStreamManager:
                 '-maxrate', '4500k',
                 '-bufsize', '9000k',
                 '-r', str(self.video_fps),
+                '-x264-params', 'keyint=60:min-keyint=60:scenecut=0',
 
-                # Кодирование аудио
                 '-c:a', 'aac',
                 '-b:a', '128k',
                 '-ar', '44100',
@@ -1709,19 +1845,16 @@ class FFmpegStreamManager:
                 '-f', 'flv',
                 '-flvflags', 'no_duration_filesize',
 
-                # Логирование
-                '-loglevel', 'info',
-
                 self.rtmp_url
             ]
 
-            logger.info(f"🚀 Запуск FFmpeg с overlay...")
-            logger.debug(f"Команда: {' '.join(ffmpeg_cmd[:15])}...")
+            logger.info(f"🚀 Запуск FFmpeg с MPEG-TS pipe...")
+            logger.info("📡 Отправка видео+аудио через единый MPEG-TS поток")
 
             # Запускаем FFmpeg процесс
             self.stream_process = subprocess.Popen(
                 ffmpeg_cmd,
-                stdin=subprocess.PIPE,  # Для аудио
+                stdin=subprocess.PIPE,  # Для MPEG-TS потока
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 bufsize=0,
@@ -1730,23 +1863,16 @@ class FFmpegStreamManager:
 
             self.is_streaming = True
             self.ffmpeg_pid = self.stream_process.pid
-            self.ffmpeg_stdin = self.stream_process.stdin
+            self.ffmpeg_stdin = self.stream_process.stdin  # Для MPEG-TS потока
 
             logger.info(f"✅ FFmpeg запущен (PID: {self.ffmpeg_pid})")
-            logger.info("🎬 Overlay готов: видео из pipe будет накладываться поверх фона")
 
             # Запускаем мониторинг
             threading.Thread(target=self._monitor_ffmpeg, daemon=True).start()
 
-            # Запускаем аудио процессор
+            # Запускаем главный контроллер потока
             threading.Thread(
-                target=self._continuous_audio_processor,
-                daemon=True
-            ).start()
-
-            # Запускаем видео отправитель в pipe
-            threading.Thread(
-                target=self._video_pipe_sender,
+                target=self._stream_controller,
                 daemon=True
             ).start()
 
@@ -1755,8 +1881,7 @@ class FFmpegStreamManager:
                 'rtmp_url': self.rtmp_url,
                 'has_video': True,
                 'has_audio': True,
-                'overlay_ready': True,
-                'video_pipe': self.video_pipe_path
+                'mode': 'mpegts_pipe'
             })
 
             return {'success': True, 'pid': self.ffmpeg_pid}
@@ -1821,51 +1946,6 @@ class FFmpegStreamManager:
             logger.error(f"❌ Ошибка отправки видео в FIFO: {e}")
             return False
 
-    def _video_fifo_sender(self):
-        """Отправка видео из очереди в FIFO"""
-        logger.info("🎬 Запуск отправителя видео в FIFO")
-
-        # Ждем пока FFmpeg откроет FIFO для чтения
-        time.sleep(2)
-
-        while self.is_streaming:
-            try:
-                # Проверяем очередь видео
-                if self.video_queue:
-                    video_item = self.video_queue.pop(0)
-                    video_path = video_item['path']
-                    duration = video_item.get('duration', 10.0)
-                    filename = video_item.get('filename', os.path.basename(video_path))
-
-                    logger.info(f"📤 Отправка видео в FIFO: {filename} ({duration:.1f} сек)")
-
-                    # Открываем FIFO для записи
-                    with open(self.video_fifo_path, 'wb') as fifo:
-                        # Конвертируем видео в сырой формат и отправляем в FIFO
-                        success = self._send_video_to_fifo(fifo, video_path, duration)
-
-                        if success:
-                            socketio.emit('video_playing', {
-                                'filename': filename,
-                                'duration': duration,
-                                'timestamp': datetime.now().isoformat(),
-                                'queue_remaining': len(self.video_queue)
-                            })
-
-                            # Ждем пока видео воспроизводится
-                            time.sleep(duration)
-                        else:
-                            logger.error(f"❌ Не удалось отправить видео в FIFO: {filename}")
-                            # Возвращаем в очередь
-                            self.video_queue.insert(0, video_item)
-                else:
-                    time.sleep(0.1)
-
-            except Exception as e:
-                logger.error(f"❌ Ошибка в отправителе видео: {e}", exc_info=True)
-                time.sleep(1)
-
-        logger.info("🛑 Отправитель видео остановлен")
 
     def _monitor_ffmpeg(self):
         """Мониторинг процесса FFmpeg"""

@@ -684,11 +684,6 @@ class FFmpegStreamManager:
             self.is_playing_audio = False
             self.active_video_source = None
 
-            # Создаем дефолтное видео перед запуском
-            default_video = os.path.join(self.video_cache_dir, "default.mp4")
-            if not os.path.exists(default_video):
-                self._create_default_video_file()
-
             # Устанавливаем дефолтное видео как активное
             with self.video_source_lock:
                 self.active_video_source = default_video

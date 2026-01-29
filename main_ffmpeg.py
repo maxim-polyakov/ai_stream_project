@@ -552,6 +552,41 @@ class FFmpegStreamManager:
 
         logger.info("🛑 Видео процессор остановлен")
 
+    def switch_video_source(self, video_path: str, duration: float = 10.0) -> bool:
+        """Динамическая смена видео источника"""
+        if not self.is_streaming or not self.ffmpeg_stdin:
+            logger.error("❌ Стрим не активен")
+            return False
+
+        if not os.path.exists(video_path):
+            logger.error(f"❌ Видео файл не найден: {video_path}")
+            return False
+
+        try:
+            logger.info(f"🎬 Переключение на видео: {os.path.basename(video_path)}")
+
+            # Отправляем команду смены источника в FFmpeg
+            # Это сложно сделать без перезапуска процесса
+
+            # Вместо этого, добавляем видео в очередь
+            self.video_queue.append({
+                'path': video_path,
+                'duration': duration,
+                'switch_at': time.time() + 1.0  # Переключить через 1 секунду
+            })
+
+            socketio.emit('video_source_changed', {
+                'video_file': os.path.basename(video_path),
+                'duration': duration,
+                'timestamp': datetime.now().isoformat()
+            })
+
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка смены видео: {e}")
+            return False
+
     def start_stream(self, use_audio: bool = True):
         """Запуск FFmpeg стрима с поддержкой видео файлов"""
         if not self.stream_key:
@@ -1367,7 +1402,7 @@ class AIStreamManager:
         return self.current_topic
 
     async def run_discussion_round(self):
-        """Обновленный метод с поддержкой видео"""
+        """Обновленный метод с поддержкой видео через switch_video_source"""
         if self.is_discussion_active:
             return
 
@@ -1387,35 +1422,66 @@ class AIStreamManager:
                 if not self.is_discussion_active:
                     break
 
-                # ПОКАЗ ВИДЕО-ИНТРО (если включено)
-                if self.show_video_intros and self.video_generator:
-                    # Создаем видео-интро для агента
-                    intro_message = f"Сейчас выступает: {agent.name}"
+                # ПОКАЗ ВИДЕО-ИНТРО агента (через switch_video_source)
+                if self.show_video_intros and hasattr(self.ffmpeg_manager, 'switch_video_source'):
+                    # Создаем временное видео с именем агента
+                    video_filename = f"intro_{agent.name}_{int(time.time())}.mp4"
+                    video_path = os.path.join('video_cache', video_filename)
 
-                    # Генерируем видео-интро
-                    intro_video = self.video_generator.create_agent_intro_video(
-                        agent_name=agent.name,
-                        expertise=agent.expertise,
-                        avatar_color=agent.color,
-                        message=intro_message,
-                        duration=5.0  # 5 секунд
+                    # Создаем простое видео с помощью ffmpeg
+                    text_filter = (
+                        f"drawtext=text='{agent.name}':fontcolor=white:fontsize=72:"
+                        f"x=(w-text_w)/2:y=(h-text_h)/2-50,"
+                        f"drawtext=text='{agent.expertise}':fontcolor=#CCCCCC:fontsize=48:"
+                        f"x=(w-text_w)/2:y=(h-text_h)/2+50"
                     )
 
-                    if intro_video:
-                        # Показываем видео перед началом речи агента
-                        socketio.emit('video_start', {
-                            'agent_id': agent.id,
-                            'video_type': 'intro',
-                            'duration': 5.0
-                        })
+                    # Создаем видео командой ffmpeg
+                    create_cmd = [
+                        'ffmpeg',
+                        '-f', 'lavfi',
+                        '-i', f"color=c={agent.color[1:]}:size=1920x1080:duration=5",
+                        '-vf', text_filter,
+                        '-c:v', 'libx264',
+                        '-preset', 'ultrafast',
+                        '-pix_fmt', 'yuv420p',
+                        '-y',
+                        video_path
+                    ]
 
-                        # Отправляем видео в стрим
-                        success = self.video_generator.add_video_to_stream(intro_video)
+                    try:
+                        subprocess.run(create_cmd, capture_output=True, timeout=10)
+                        if os.path.exists(video_path):
+                            # Показываем видео перед началом речи агента
+                            socketio.emit('video_start', {
+                                'agent_id': agent.id,
+                                'agent_name': agent.name,
+                                'video_type': 'intro',
+                                'duration': 5.0
+                            })
 
-                        if success:
-                            await asyncio.sleep(5.0)  # Ждем завершения видео
+                            # ПЕРЕКЛЮЧАЕМ ВИДЕО В СТРИМЕ
+                            logger.info(f"🔄 Переключаем видео на {agent.name}")
+                            success = self.ffmpeg_manager.switch_video_source(
+                                video_path=video_path,
+                                duration=5.0
+                            )
 
-                    socketio.emit('video_end', {'agent_id': agent.id})
+                            if success:
+                                logger.info(f"⏱️  Показываем видео-интро {agent.name} (5 сек)")
+                                await asyncio.sleep(5.0)
+                            else:
+                                logger.warning(f"⚠️ Не удалось переключить видео для {agent.name}")
+
+                            # Удаляем временное видео
+                            try:
+                                os.unlink(video_path)
+                            except:
+                                pass
+
+                            socketio.emit('video_end', {'agent_id': agent.id})
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка создания видео: {e}")
 
                 # Агент начинает говорить
                 self.active_agent = agent.id
@@ -1449,6 +1515,55 @@ class AIStreamManager:
 
                 logger.info(f"💬 {agent.name}: {message[:80]}...")
 
+                # Показываем видео с текстом сообщения во время речи
+                if self.show_video_intros and hasattr(self.ffmpeg_manager, 'switch_video_source') and len(
+                        message) < 500:
+                    # Создаем видео с текстом сообщения
+                    message_filename = f"message_{agent.name}_{int(time.time())}.mp4"
+                    message_path = os.path.join('video_cache', message_filename)
+
+                    # Обрезаем сообщение для видео
+                    short_message = message[:200] + "..." if len(message) > 200 else message
+
+                    # Создаем видео с сообщением
+                    text_lines = textwrap.fill(short_message, width=50).split('\n')
+                    drawtext_parts = []
+                    for i, line in enumerate(text_lines[:8]):  # Максимум 8 строк
+                        y_pos = 200 + i * 60
+                        drawtext_parts.append(f"drawtext=text='{line}':fontcolor=white:fontsize=36:x=100:y={y_pos}")
+
+                    text_filter = ','.join(drawtext_parts)
+
+                    # Оцениваем длительность видео по длине сообщения
+                    estimated_duration = min(max(len(message.split()) * 0.3, 5), 30)
+
+                    create_msg_cmd = [
+                        'ffmpeg',
+                        '-f', 'lavfi',
+                        '-i', f"color=c=#1a1a2e:size=1920x1080:duration={estimated_duration}",
+                        '-vf', text_filter,
+                        '-c:v', 'libx264',
+                        '-preset', 'ultrafast',
+                        '-pix_fmt', 'yuv420p',
+                        '-y',
+                        message_path
+                    ]
+
+                    try:
+                        subprocess.run(create_msg_cmd, capture_output=True, timeout=15)
+                        if os.path.exists(message_path):
+                            # Переключаем на видео с текстом сообщения
+                            success = self.ffmpeg_manager.switch_video_source(
+                                video_path=message_path,
+                                duration=estimated_duration
+                            )
+
+                            if success:
+                                logger.info(
+                                    f"📺 Показываем видео с сообщением {agent.name} ({estimated_duration:.1f} сек)")
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка создания видео сообщения: {e}")
+
                 # Генерация аудио файла
                 logger.info(f"🔊 Генерация TTS для {agent.name}...")
 
@@ -1469,6 +1584,38 @@ class AIStreamManager:
 
                         # Ждем пока аудио должно воспроизвестись
                         await asyncio.sleep(audio_duration + 0.5)  # Небольшой буфер
+
+                        # После окончания речи возвращаем стандартное видео
+                        if self.show_video_intros and hasattr(self.ffmpeg_manager, 'switch_video_source'):
+                            # Создаем нейтральное видео
+                            neutral_filename = f"neutral_{int(time.time())}.mp4"
+                            neutral_path = os.path.join('video_cache', neutral_filename)
+
+                            create_neutral_cmd = [
+                                'ffmpeg',
+                                '-f', 'lavfi',
+                                '-i', f"color=c=#2d2d2d:size=1920x1080:duration=3",
+                                '-vf',
+                                f"drawtext=text='Тема: {self.current_topic}':fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2",
+                                '-c:v', 'libx264',
+                                '-preset', 'ultrafast',
+                                '-pix_fmt', 'yuv420p',
+                                '-y',
+                                neutral_path
+                            ]
+
+                            try:
+                                subprocess.run(create_neutral_cmd, capture_output=True, timeout=10)
+                                if os.path.exists(neutral_path):
+                                    self.ffmpeg_manager.switch_video_source(
+                                        video_path=neutral_path,
+                                        duration=3.0
+                                    )
+                                    # Удаляем через некоторое время
+                                    threading.Timer(5, lambda p=neutral_path: os.unlink(p) if os.path.exists(
+                                        p) else None).start()
+                            except Exception as e:
+                                logger.error(f"❌ Ошибка создания нейтрального видео: {e}")
                     else:
                         logger.warning(f"⚠️ Не удалось добавить аудио в очередь")
                         # Ждем по количеству слов
@@ -1486,18 +1633,44 @@ class AIStreamManager:
                 socketio.emit('agent_stop_speaking', {'agent_id': agent.id})
                 self.active_agent = None
 
-                # Пауза между агентами
+                # Пауза между агентами (показываем нейтральное видео)
                 if agent != speaking_order[-1]:
-                    pause = random.uniform(1.5, 3.0)
+                    pause = random.uniform(2.0, 4.0)
                     logger.debug(f"⏸️  Пауза между агентами: {pause:.1f} сек")
 
-                    # Создаем короткое переходное видео между агентами
-                    if self.show_video_intros and self.video_generator:
+                    # Создаем переходное видео между агентами
+                    if self.show_video_intros and hasattr(self.ffmpeg_manager, 'switch_video_source'):
                         next_agent = speaking_order[speaking_order.index(agent) + 1]
-                        transition_message = f"Далее: {next_agent.name}"
 
-                        # Можно добавить короткое переходное видео
-                        # transition_video = self.video_generator.create_transition_video(...)
+                        # Создаем переходное видео
+                        transition_filename = f"transition_{int(time.time())}.mp4"
+                        transition_path = os.path.join('video_cache', transition_filename)
+
+                        create_transition_cmd = [
+                            'ffmpeg',
+                            '-f', 'lavfi',
+                            '-i', f"color=c=#3a3a3a:size=1920x1080:duration={pause}",
+                            '-vf',
+                            f"drawtext=text='Далее: {next_agent.name}':fontcolor=white:fontsize=60:x=(w-text_w)/2:y=(h-text_h)/2",
+                            '-c:v', 'libx264',
+                            '-preset', 'ultrafast',
+                            '-pix_fmt', 'yuv420p',
+                            '-y',
+                            transition_path
+                        ]
+
+                        try:
+                            subprocess.run(create_transition_cmd, capture_output=True, timeout=10)
+                            if os.path.exists(transition_path):
+                                self.ffmpeg_manager.switch_video_source(
+                                    video_path=transition_path,
+                                    duration=pause
+                                )
+                                # Удаляем через некоторое время
+                                threading.Timer(pause + 2, lambda p=transition_path: os.unlink(p) if os.path.exists(
+                                    p) else None).start()
+                        except Exception as e:
+                            logger.error(f"❌ Ошибка создания переходного видео: {e}")
 
                     await asyncio.sleep(pause)
 
@@ -1512,30 +1685,55 @@ class AIStreamManager:
             # Пауза перед следующим раундом
             await asyncio.sleep(Config.DISCUSSION_INTERVAL)
 
-            # Случайная смена темы
+            # Случайная смена темы с видео-переходом
             if random.random() > 0.7:
                 old_topic = self.current_topic
                 self.select_topic()
 
                 # Показываем видео-переход при смене темы
-                if self.show_video_intros and self.video_generator:
-                    transition_video = self.video_generator.create_transition_video(
-                        from_topic=old_topic,
-                        to_topic=self.current_topic,
-                        duration=5.0
-                    )
+                if self.show_video_intros and hasattr(self.ffmpeg_manager, 'switch_video_source'):
+                    # Создаем переходное видео
+                    topic_transition_filename = f"topic_transition_{int(time.time())}.mp4"
+                    topic_transition_path = os.path.join('video_cache', topic_transition_filename)
 
-                    if transition_video:
-                        socketio.emit('topic_change_video', {
-                            'old_topic': old_topic,
-                            'new_topic': self.current_topic,
-                            'duration': 5.0
-                        })
+                    create_topic_cmd = [
+                        'ffmpeg',
+                        '-f', 'lavfi',
+                        '-i', f"color=c=#4a4a8a:size=1920x1080:duration=5",
+                        '-vf', (
+                            f"drawtext=text='Новая тема':fontcolor=white:fontsize=72:x=(w-text_w)/2:y=(h-text_h)/2-100,"
+                            f"drawtext=text='{self.current_topic}':fontcolor=#aaccff:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2+50"
+                        ),
+                        '-c:v', 'libx264',
+                        '-preset', 'ultrafast',
+                        '-pix_fmt', 'yuv420p',
+                        '-y',
+                        topic_transition_path
+                    ]
 
-                        success = self.video_generator.add_video_to_stream(transition_video)
+                    try:
+                        subprocess.run(create_topic_cmd, capture_output=True, timeout=10)
+                        if os.path.exists(topic_transition_path):
+                            socketio.emit('topic_change_video', {
+                                'old_topic': old_topic,
+                                'new_topic': self.current_topic,
+                                'duration': 5.0
+                            })
 
-                        if success:
-                            await asyncio.sleep(5.0)
+                            success = self.ffmpeg_manager.switch_video_source(
+                                video_path=topic_transition_path,
+                                duration=5.0
+                            )
+
+                            if success:
+                                await asyncio.sleep(5.0)
+                                # Удаляем видео
+                                try:
+                                    os.unlink(topic_transition_path)
+                                except:
+                                    pass
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка создания тематического видео: {e}")
 
         except Exception as e:
             logger.error(f"❌ Ошибка в раунде дискуссии: {e}", exc_info=True)

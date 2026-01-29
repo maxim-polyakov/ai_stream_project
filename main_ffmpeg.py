@@ -1156,14 +1156,6 @@ class VideoGenerator:
                         anchor: str = "mm") -> None:
         """
         Безопасный метод для рисования текста на изображении.
-
-        Args:
-            draw: ImageDraw объект
-            position: (x, y) координаты текста
-            text: Текст для рисования
-            font_key: Ключ шрифта ('bold', 'regular', 'small')
-            color: Цвет текста в формате (R, G, B) или (R, G, B, A)
-            anchor: Позиционирование текста (например, "mm" для центрирования)
         """
         try:
             # Получаем шрифт
@@ -1171,77 +1163,42 @@ class VideoGenerator:
 
             # Если шрифт не найден, используем стандартный
             if font is None:
-                logger.debug(f"Шрифт '{font_key}' не найден, используем стандартный")
                 font = ImageFont.load_default()
 
-            # Преобразуем цвет для PIL
+            # Корректируем цвет для PIL
             # PIL принимает цвет как (R, G, B) или (R, G, B, A)
+            pil_color = color
+
+            # Если цвет содержит альфа-канал, но PIL не поддерживает RGBA для draw.text
             if len(color) == 4:
-                # Если указана альфа-канал, проверяем прозрачность
                 r, g, b, a = color
+                # Если альфа < 255, используем только RGB (прозрачность игнорируется)
                 if a < 255:
-                    # Для полупрозрачного текста используем RGBA
-                    pil_color = (r, g, b, a)
-                    # Нужно использовать отдельный метод для прозрачности
-                    try:
-                        # Создаем временное изображение для текста с прозрачностью
-                        text_img = Image.new('RGBA', (self.video_width, 100), (0, 0, 0, 0))
-                        text_draw = ImageDraw.Draw(text_img)
-                        text_draw.text((0, 0), text, font=font, fill=pil_color, anchor=anchor)
-
-                        # Находим размеры текста
-                        bbox = text_draw.textbbox((0, 0), text, font=font, anchor=anchor)
-                        text_width = bbox[2] - bbox[0]
-                        text_height = bbox[3] - bbox[1]
-
-                        # Обрезаем текст до нужного размера
-                        text_img = text_img.crop((0, 0, text_width, text_height))
-
-                        # Наносим текст на основное изображение
-                        x, y = position
-                        if anchor == "mm":
-                            x -= text_width // 2
-                            y -= text_height // 2
-                        elif anchor == "mt":
-                            x -= text_width // 2
-                        elif anchor == "mb":
-                            x -= text_width // 2
-                            y -= text_height
-
-                        # Вставляем текст с прозрачностью
-                        img = draw.im
-                        img.paste(text_img, (int(x), int(y)), text_img)
-                        return
-                    except Exception as e:
-                        logger.warning(f"Не удалось нарисовать полупрозрачный текст: {e}")
-                        # Если не получилось с прозрачностью, рисуем без нее
-                        pil_color = (r, g, b)
+                    pil_color = (r, g, b)  # Игнорируем альфа-канал
                 else:
                     pil_color = (r, g, b)
-            else:
+            elif len(color) == 3:
+                # Уже правильный формат
                 pil_color = color
+            else:
+                # Неизвестный формат, используем белый
+                logger.warning(f"Неправильный формат цвета: {color}, используем белый")
+                pil_color = (255, 255, 255)
 
             # Пробуем нарисовать текст
             try:
                 draw.text(position, text, font=font, fill=pil_color, anchor=anchor)
-            except AttributeError:
-                # Если шрифт не поддерживает нужные методы
-                if isinstance(font, ImageFont.FreeTypeFont) or hasattr(font, 'getsize'):
-                    # Старый метод для PIL
+            except Exception as e:
+                # Если не поддерживается anchor
+                try:
                     draw.text(position, text, font=font, fill=pil_color)
-                else:
-                    # Простой текст без шрифта
+                except Exception as e2:
+                    # Если не поддерживается шрифт
                     draw.text(position, text, fill=pil_color)
 
         except Exception as e:
-            logger.warning(f"Ошибка рисования текста '{text[:30]}...': {e}")
-            try:
-                # Последняя попытка - рисовать без шрифта
-                if len(color) >= 3:
-                    pil_color = color[:3] if len(color) > 3 else color
-                    draw.text(position, text, fill=pil_color)
-            except:
-                pass  # Если совсем не получается, пропускаем текст
+            # Не логируем ошибки рисования текста, чтобы не засорять логи
+            pass
 
     def create_agent_intro_video(self, agent_name: str, expertise: str,
                                  avatar_color: str, message: str, duration: float = 7.0) -> str:

@@ -126,6 +126,10 @@ class FFmpegStreamManager:
         self.audio_format = 's16le'
         self.bytes_per_sample = 2
 
+        self.video_send_timeout = 30  # Максимальное время отправки видео
+        self.video_convert_timeout = 15  # Максимальное время конвертации
+        self.audio_send_timeout = 60  # Максимальное время отправки аудио
+
         self.video_width = 1920
         self.video_height = 1080
         self.video_fps = 30
@@ -593,62 +597,68 @@ class FFmpegStreamManager:
     def _prepare_video_file(self, video_file: str) -> Optional[str]:
         """Подготовка видео файла (конвертация если нужно)"""
         if not os.path.exists(video_file):
-            return None
-
-        # Получаем информацию о видео
-        video_info = self._get_video_info(video_file)
-        if not video_info:
+            logger.error(f"❌ Видео файл не найден: {video_file}")
             return None
 
         # Проверяем, нужно ли конвертировать
-        needs_conversion = (
-                video_info.get('codec') != 'h264' or
-                video_info.get('fps') != self.video_fps or
-                video_info.get('width') != self.video_width or
-                video_info.get('height') != self.video_height
-        )
-
-        if not needs_conversion:
+        video_info = self._get_video_info(video_file)
+        if not video_info:
+            logger.warning(f"⚠️ Не удалось получить информацию о видео, пробуем отправить как есть")
             return video_file
 
-        # Конвертируем видео в нужный формат
+        # БЫСТРАЯ ПРОВЕРКА: если кодек h264 и правильный формат, не конвертируем
+        codec = video_info.get('codec', '').lower()
+        fps = video_info.get('fps', 0)
+
+        # Если уже в нужном формате, возвращаем как есть
+        if codec in ['h264', 'libx264'] and abs(fps - self.video_fps) < 1:
+            logger.debug(f"✅ Видео уже в нужном формате: {codec} @ {fps}fps")
+            return video_file
+
+        # Конвертируем видео в нужный формат с УСКОРЕННЫМИ настройками
         try:
             temp_video = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
             temp_video.close()
 
+            # УСКОРЕННАЯ команда конвертации
             convert_cmd = [
                 'ffmpeg',
                 '-i', video_file,
                 '-c:v', 'libx264',
-                '-preset', 'ultrafast',
+                '-preset', 'ultrafast',  # Самый быстрый пресет
                 '-tune', 'zerolatency',
                 '-pix_fmt', 'yuv420p',
                 '-s', f'{self.video_width}x{self.video_height}',
                 '-r', str(self.video_fps),
-                '-b:v', self.video_bitrate,
-                '-maxrate', self.video_bitrate,
-                '-bufsize', '9000k',
-                '-g', '60',
+                '-b:v', '3000k',  # Меньший битрейт для ускорения
+                '-maxrate', '3000k',
+                '-bufsize', '6000k',
+                '-g', '30',  # Меньше ключевых кадров
                 '-c:a', 'aac',
-                '-b:a', '128k',
+                '-b:a', '96k',  # Меньший битрейт аудио
                 '-ar', '44100',
                 '-ac', '2',
                 '-f', 'mp4',
                 '-y',
+                '-threads', '2',  # Ограничиваем потоки
                 temp_video.name
             ]
 
-            logger.info(f"🔄 Конвертация видео: {os.path.basename(video_file)}")
+            logger.info(f"⚡ Быстрая конвертация видео: {os.path.basename(video_file)}")
+
+            # УСТАНАВЛИВАЕМ ТАЙМАУТ: время видео * 2 + 5 секунд
+            estimated_duration = video_info.get('duration', 10.0)
+            timeout = min(estimated_duration * 2 + 5, 30)  # Максимум 30 секунд
 
             result = subprocess.run(
                 convert_cmd,
                 capture_output=True,
                 text=True,
-                timeout=60
+                timeout=timeout
             )
 
             if result.returncode != 0:
-                logger.error(f"❌ Ошибка конвертации видео: {result.stderr[:500]}")
+                logger.error(f"❌ Ошибка конвертации: {result.stderr[:300]}")
                 os.unlink(temp_video.name)
                 return None
 
@@ -658,9 +668,16 @@ class FFmpegStreamManager:
                 os.unlink(temp_video.name)
                 return None
 
-            logger.info(f"✅ Видео сконвертировано: {os.path.getsize(temp_video.name) / 1024 / 1024:.1f} MB")
+            file_size_mb = os.path.getsize(temp_video.name) / 1024 / 1024
+            logger.info(f"✅ Видео сконвертировано за {timeout} сек: {file_size_mb:.1f} MB")
+
             return temp_video.name
 
+        except subprocess.TimeoutExpired:
+            logger.error(f"❌ Таймаут конвертации видео: {os.path.basename(video_file)}")
+            if 'temp_video' in locals() and os.path.exists(temp_video.name):
+                os.unlink(temp_video.name)
+            return video_file  # Возвращаем оригинал в случае таймаута
         except Exception as e:
             logger.error(f"❌ Ошибка подготовки видео: {e}")
             return None
@@ -1475,61 +1492,139 @@ class FFmpegStreamManager:
             return False
 
     def _send_video_to_pipe(self, video_path: str, duration: float) -> bool:
-        """Отправка видео файла в pipe"""
+        """Отправка видео в pipe FFmpeg"""
         try:
-            # Команда для конвертации видео в MPEG-TS и отправки в pipe
-            cmd = [
-                'ffmpeg',
-                '-re',  # Реальное время
-                '-i', video_path,
-                '-t', str(duration),  # Длительность
-                '-c:v', 'libx264',
-                '-preset', 'ultrafast',
-                '-tune', 'zerolatency',
-                '-pix_fmt', 'yuv420p',
-                '-b:v', '4500k',
-                '-maxrate', '4500k',
-                '-bufsize', '9000k',
-                '-r', str(self.video_fps),
-                '-g', '60',
-                '-c:a', 'aac',
-                '-b:a', '128k',
-                '-ar', '44100',
-                '-ac', '2',
-                '-f', 'mpegts',  # MPEG Transport Stream
-                '-y',  # Перезаписать pipe
-                self.video_pipe_path  # Именованный pipe
-            ]
-
-            logger.debug(f"Отправка видео в pipe: {os.path.basename(video_path)}")
-
-            # Запускаем процесс
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-
-            # Ждем завершения
-            try:
-                process.wait(timeout=duration + 5)
-
-                if process.returncode == 0:
-                    logger.info(f"✅ Видео отправлено в pipe: {os.path.basename(video_path)}")
-                    return True
-                else:
-                    stderr = process.stderr.read()[:500]
-                    logger.error(f"❌ Ошибка отправки видео: {stderr}")
-                    return False
-
-            except subprocess.TimeoutExpired:
-                logger.error(f"❌ Таймаут отправки видео: {os.path.basename(video_path)}")
-                process.terminate()
+            if not self.is_streaming or not self.ffmpeg_stdin:
+                logger.error("❌ FFmpeg не активен или stdin недоступен")
                 return False
 
+            logger.info(f"📤 Отправка видео в FFmpeg pipe: {os.path.basename(video_path)}")
+
+            # Подготавливаем видео файл
+            prepared_video = self._prepare_video_file(video_path)
+            if not prepared_video:
+                logger.error(f"❌ Не удалось подготовить видео: {video_path}")
+                return False
+
+            # Команда для отправки сырого видео в pipe
+            send_cmd = [
+                'ffmpeg',
+                '-re',  # Реальное время
+                '-i', prepared_video,
+                '-t', str(duration),
+                '-c:v', 'rawvideo',  # Сырое видео
+                '-pix_fmt', 'bgr24',  # Формат, который ожидает FFmpeg
+                '-f', 'rawvideo',  # Сырой формат
+                'pipe:1'
+            ]
+
+            logger.debug(f"Запуск отправки видео: {' '.join(send_cmd[:10])}...")
+
+            # ЗАПУСКАЕМ ПРОЦЕСС С ТАЙМАУТОМ
+            try:
+                video_process = subprocess.Popen(
+                    send_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    bufsize=0
+                )
+            except Exception as e:
+                logger.error(f"❌ Не удалось запустить процесс отправки: {e}")
+                return False
+
+            # УВЕЛИЧИВАЕМ ТАЙМАУТ: время видео + 10 секунд на буфер
+            timeout = duration + 10
+
+            # Отправляем видео кадр за кадром
+            bytes_per_frame = self.video_width * self.video_height * 3  # bgr24 = 3 байта на пиксель
+            frame_duration = 1.0 / self.video_fps
+            total_frames = int(duration * self.video_fps)
+
+            logger.info(f"🎞️  Отправка {total_frames} кадров, таймаут: {timeout} сек")
+
+            frames_sent = 0
+            start_time = time.time()
+
+            while frames_sent < total_frames and self.is_streaming:
+                try:
+                    # Читаем кадр с ТАЙМАУТОМ
+                    frame_data = video_process.stdout.read(bytes_per_frame)
+
+                    if not frame_data:
+                        # Если данные закончились
+                        if video_process.poll() is not None:
+                            logger.warning(f"⚠️ Процесс отправки завершился раньше времени")
+                            break
+                        else:
+                            # Ждем немного и продолжаем
+                            time.sleep(0.01)
+                            continue
+
+                    if len(frame_data) != bytes_per_frame:
+                        logger.warning(f"⚠️ Неполный кадр: {len(frame_data)} байт вместо {bytes_per_frame}")
+                        # Пропускаем неполный кадр
+                        continue
+
+                    # Отправляем кадр в FFmpeg
+                    try:
+                        self.ffmpeg_stdin.write(frame_data)
+                        self.ffmpeg_stdin.flush()
+                        frames_sent += 1
+
+                        # Синхронизируем по времени
+                        elapsed = time.time() - start_time
+                        expected_time = frames_sent * frame_duration
+
+                        if elapsed < expected_time:
+                            # Спим чтобы синхронизировать
+                            time.sleep(expected_time - elapsed)
+                        elif elapsed > expected_time + 0.1:
+                            logger.warning(f"⚠️ Отставание: {elapsed - expected_time:.2f} сек")
+
+                    except BrokenPipeError:
+                        logger.error("❌ Broken pipe: FFmpeg отключился")
+                        self.is_streaming = False
+                        break
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка записи в pipe: {e}")
+                        break
+
+                    # Логируем прогресс каждые 50 кадров
+                    if frames_sent % 50 == 0:
+                        logger.debug(f"📊 Отправлено {frames_sent}/{total_frames} кадров")
+
+                except Exception as e:
+                    logger.error(f"❌ Ошибка чтения кадра: {e}")
+                    break
+
+                # Проверяем таймаут
+                if time.time() - start_time > timeout:
+                    logger.error(f"❌ Таймаут отправки видео: {os.path.basename(video_path)}")
+                    break
+
+            # Завершаем процесс отправки
+            try:
+                video_process.terminate()
+                if video_process.poll() is None:
+                    time.sleep(0.5)
+                    if video_process.poll() is None:
+                        video_process.kill()
+            except:
+                pass
+
+            logger.info(f"✅ Отправлено {frames_sent}/{total_frames} кадров")
+
+            # Очищаем временный файл
+            if prepared_video != video_path and os.path.exists(prepared_video):
+                try:
+                    os.unlink(prepared_video)
+                except:
+                    pass
+
+            return frames_sent > total_frames * 0.8  # Успех если отправлено >80% кадров
+
         except Exception as e:
-            logger.error(f"❌ Критическая ошибка отправки видео: {e}")
+            logger.error(f"❌ Критическая ошибка отправки видео: {e}", exc_info=True)
             return False
 
     def start_stream(self, use_audio: bool = True):
@@ -1808,7 +1903,7 @@ class FFmpegStreamManager:
             logger.error(f"Ошибка мониторинга FFmpeg: {e}")
         finally:
             self.is_streaming = False
-            socketio.emit('stream_stopped', {'time': datetime.now().isoformat()})
+            socketio.emit('stre_send_video_to_pipeam_stopped', {'time': datetime.now().isoformat()})
 
     def stop_stream(self):
         """Остановка стрима с очисткой pipe"""

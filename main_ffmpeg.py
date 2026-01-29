@@ -113,6 +113,11 @@ class FFmpegStreamManager:
         self.is_playing_video = False
         self.video_processor_thread = None
 
+        self.current_video_file = None
+        self.video_position = 0
+        self.video_duration = 0
+        self.video_start_time = 0
+
         # Конфигурация аудио
         self.audio_sample_rate = 44100
         self.audio_channels = 2
@@ -547,8 +552,8 @@ class FFmpegStreamManager:
 
         logger.info("🛑 Видео процессор остановлен")
 
-    def start_stream(self, use_audio: bool = True, use_video: bool = True):
-        """Запуск FFmpeg стрима с поддержкой видео"""
+    def start_stream(self, use_audio: bool = True):
+        """Запуск FFmpeg стрима с поддержкой видео файлов"""
         if not self.stream_key:
             logger.error("❌ Stream Key не установлен!")
             return {'success': False, 'error': 'Stream Key не установлен'}
@@ -561,16 +566,32 @@ class FFmpegStreamManager:
             self.video_queue = []
             self.is_playing_audio = False
             self.is_playing_video = False
+            self.current_video_file = None
 
-            # Команда FFmpeg с непрерывным аудио
+            # Определяем основной источник видео
+            # Если есть видео в очереди - используем его, иначе черный экран
+            video_source = "color=size=1920x1080:rate=30:color=black"
+
+            if self.video_queue:
+                video_item = self.video_queue[0]
+                video_path = video_item['path']
+
+                # Используем видео как основной источник
+                video_source = f"movie='{video_path}':loop=0:setpts=N/FRAME_RATE/TB"
+                self.current_video_file = video_path
+                self.video_duration = video_item['duration']
+                self.video_start_time = time.time()
+                logger.info(f"🎬 Используем видео как источник: {os.path.basename(video_path)}")
+
+            # Команда FFmpeg с динамическим видео источником
             ffmpeg_cmd = [
                 'ffmpeg',
-                '-re',  # Реальное время для видео
+                '-re',  # Реальное время
                 '-fflags', '+genpts',
 
-                # Видео источник (непрерывный)
+                # ДИНАМИЧЕСКИЙ ВИДЕО ИСТОЧНИК
                 '-f', 'lavfi',
-                '-i', self.current_video_source,
+                '-i', video_source,
 
                 # Аудио источник через stdin
                 '-f', 's16le',
@@ -604,8 +625,8 @@ class FFmpegStreamManager:
                 self.rtmp_url
             ]
 
-            logger.info(f"🚀 Запуск FFmpeg стрима с поддержкой видео")
-            logger.debug(f"Команда FFmpeg: {' '.join(ffmpeg_cmd[:10])}...")
+            logger.info(f"🚀 Запуск FFmpeg стрима")
+            logger.debug(f"Видео источник: {video_source}")
 
             # Запускаем FFmpeg
             self.stream_process = subprocess.Popen(
@@ -627,26 +648,23 @@ class FFmpegStreamManager:
             threading.Thread(target=self._monitor_ffmpeg, daemon=True).start()
 
             # Запускаем непрерывный аудио процессор
-            if use_audio:
-                self.audio_processor_thread = threading.Thread(
-                    target=self._continuous_audio_processor,
-                    daemon=True
-                )
-                self.audio_processor_thread.start()
-                logger.info("🔊 Аудио процессор запущен")
+            self.audio_processor_thread = threading.Thread(
+                target=self._continuous_audio_processor,
+                daemon=True
+            )
+            self.audio_processor_thread.start()
 
             # Запускаем видео процессор
-            if use_video:
-                self.video_processor_thread = threading.Thread(
-                    target=self._video_stream_processor,
-                    daemon=True
-                )
-                self.video_processor_thread.start()
-                logger.info("🎬 Видео процессор запущен")
+            self.video_processor_thread = threading.Thread(
+                target=self._video_stream_processor,
+                daemon=True
+            )
+            self.video_processor_thread.start()
 
             socketio.emit('stream_started', {
                 'pid': self.ffmpeg_pid,
-                'rtmp_url': self.rtmp_url
+                'rtmp_url': self.rtmp_url,
+                'has_video': bool(self.current_video_file)
             })
 
             return {'success': True, 'pid': self.ffmpeg_pid}

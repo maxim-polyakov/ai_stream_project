@@ -1385,92 +1385,147 @@ class FFmpegStreamManager:
 
         logger.info("🛑 Простой видео свитчер остановлен")
 
-    def start_stream(self) -> Dict[str, Any]:
-        """Запуск стрима с комбинированным видео+аудио потоком"""
-        try:
-            if self.is_streaming:
-                logger.warning("❌ Стрим уже запущен")
-                return {'success': False, 'error': 'Stream already running'}
+    def start_stream(self, use_audio: bool = True):
+        """Запуск единого FFmpeg процесса с динамической сменой видео"""
+        if not self.stream_key:
+            logger.error("❌ Stream Key не установлен!")
+            return {'success': False, 'error': 'Stream Key не установлен'}
 
-            if not self.stream_key:
-                logger.error("❌ Stream key не установлен")
-                return {'success': False, 'error': 'No stream key'}
+        try:
+            self.start_time = time.time()
+
+            # Инициализируем очереди
+            self.audio_queue = []
+            self.video_queue = []
+            self.is_playing_audio = False
+            self.is_playing_video = False
 
             # Создаем дефолтное видео
             default_video = self._create_default_video_file()
             if not default_video:
                 logger.error("❌ Не удалось создать дефолтное видео")
-                return {'success': False, 'error': 'Failed to create default video'}
+                return {'success': False, 'error': 'Не удалось создать дефолтное видео'}
 
-            # Создаем временный файл для текущего видео
-            self.current_video_file = os.path.join(self.video_cache_dir, 'current_stream_video.mp4')
+            # Создаем файл для активного видео
+            self.current_video_file = os.path.join(self.video_cache_dir, 'current_video.mp4')
 
-            # Формируем команду FFmpeg
+            # Копируем дефолтное видео как текущее (изначально)
+            import shutil
+            try:
+                shutil.copy2(default_video, self.current_video_file)
+                logger.info(f"📁 Текущий видео файл создан: {self.current_video_file}")
+            except Exception as e:
+                logger.error(f"❌ Ошибка копирования видео: {e}")
+                # Создаем новый файл
+                self._create_default_video_file(self.current_video_file)
+
+            logger.info(f"🚀 Запуск FFmpeg стрима на YouTube...")
+            logger.info(f"🔗 RTMP URL: {self.rtmp_url}")
+            logger.info(f"Current_video_file: {self.current_video_file}")
+            # Команда FFmpeg с overlay фильтром
+            # Без сложных параметров, самый простой overlay
             ffmpeg_cmd = [
                 'ffmpeg',
+
+                # Вход 1: Дефолтное видео (фон, зациклен)
                 '-re',
                 '-stream_loop', '-1',
                 '-i', default_video,
+
+                # Вход 2: Текущее активное видео (будет меняться)
+                '-i', self.current_video_file,
+
+                # Вход 3: Аудио через stdin
                 '-f', 's16le',
                 '-ar', str(self.audio_sample_rate),
                 '-ac', str(self.audio_channels),
                 '-channel_layout', 'stereo',
-                '-i', 'pipe:0',  # Аудио из stdin
+                '-i', 'pipe:0',
+
+                # Ключевое изменение: overlay с eof_action=pass и shortest=0
                 '-filter_complex',
-                '[0:v][1:v]overlay=eof_action=pass:shortest=1[outv]',
+                f"""[0:v][1:v]overlay=eof_action=pass:shortest=0[outv]""",
+
+                # Карты
                 '-map', '[outv]',
                 '-map', '2:a:0',
+
+                # Кодирование видео
                 '-c:v', 'libx264',
                 '-preset', 'veryfast',
                 '-tune', 'zerolatency',
                 '-pix_fmt', 'yuv420p',
                 '-g', '60',
-                '-b:v', self.video_bitrate,
-                '-maxrate', self.video_bitrate,
+                '-b:v', '4500k',
+                '-maxrate', '4500k',
                 '-bufsize', '9000k',
                 '-r', str(self.video_fps),
                 '-x264-params', 'keyint=60:min-keyint=60:scenecut=0',
+
+                # Кодирование аудио
                 '-c:a', 'aac',
                 '-b:a', '128k',
                 '-ar', '44100',
                 '-ac', '2',
+
+                # Формат вывода
                 '-f', 'flv',
                 '-flvflags', 'no_duration_filesize',
+
+                # Логирование для отладки
                 '-loglevel', 'verbose',
+
                 self.rtmp_url
             ]
 
-            logger.info("🚀 Запуск FFmpeg стрима...")
-            logger.debug(f"Команда: {' '.join(ffmpeg_cmd)}")
+            logger.info(f"🚀 Запуск FFmpeg процесса...")
+            logger.info(f"🎬 Дефолтное видео (фон): {os.path.basename(default_video)}")
+            logger.info(f"🎬 Активное видео: {os.path.basename(self.current_video_file)}")
+            logger.info(f"🎯 Фильтр: overlay - активное видео поверх дефолтного")
 
             # Запускаем FFmpeg процесс
             self.stream_process = subprocess.Popen(
                 ffmpeg_cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
+                stdin=subprocess.PIPE,  # Для аудио
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
-                bufsize=0
+                bufsize=0,
+                text=False
             )
 
-            self.ffmpeg_stdin = self.stream_process.stdin
             self.is_streaming = True
-            self.start_time = datetime.now()
+            self.ffmpeg_pid = self.stream_process.pid
+            self.ffmpeg_stdin = self.stream_process.stdin
 
-            # Запускаем аудио процессор в отдельном потоке
-            audio_thread = threading.Thread(target=self._continuous_audio_processor)
-            audio_thread.daemon = True
-            audio_thread.start()
+            logger.info(f"✅ FFmpeg запущен (PID: {self.ffmpeg_pid})")
 
-            # Запускаем видео процессор в отдельном потоке
-            video_thread = threading.Thread(target=self._continuous_video_processor)
-            video_thread.daemon = True
-            video_thread.start()
+            # Запускаем мониторинг
+            threading.Thread(target=self._monitor_ffmpeg, daemon=True).start()
 
-            logger.info("✅ Стрим успешно запущен")
-            return {'success': True, 'stream_id': 'active_stream'}
+            # Запускаем аудио процессор
+            threading.Thread(
+                target=self._continuous_audio_processor,
+                daemon=True
+            ).start()
+
+            # Запускаем видео контроллер
+            threading.Thread(
+                target=self._simple_video_switcher,
+                daemon=True
+            ).start()
+
+            socketio.emit('stream_started', {
+                'pid': self.ffmpeg_pid,
+                'rtmp_url': self.rtmp_url,
+                'has_video': True,
+                'has_audio': True,
+                'filter': 'overlay'
+            })
+
+            return {'success': True, 'pid': self.ffmpeg_pid}
 
         except Exception as e:
-            logger.error(f"❌ Ошибка запуска стрима: {e}")
+            logger.error(f"❌ Ошибка запуска FFmpeg: {e}", exc_info=True)
             self.is_streaming = False
             return {'success': False, 'error': str(e)}
 

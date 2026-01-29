@@ -1215,6 +1215,148 @@ class FFmpegStreamManager:
 
         logger.info("🛑 Динамический видео контроллер остановлен")
 
+    def _switch_concat_file(self, video_path: str, duration: float):
+        """Подмена concat файла новым видео"""
+        try:
+            if not hasattr(self, 'concat_file') or not self.concat_file:
+                logger.error("❌ Concat файл не инициализирован")
+                return
+
+            # Полный путь к видео
+            abs_video_path = os.path.abspath(video_path)
+
+            # Перезаписываем concat файл
+            with open(self.concat_file, 'w') as f:
+                f.write(f"file '{abs_video_path}'\n")
+                f.write(f"duration {duration}\n")
+
+            logger.info(f"📝 Concat файл обновлен: {os.path.basename(video_path)}")
+
+            # FFmpeg должен автоматически переключиться на новое видео
+            # из-за stream_loop=-1 он будет зациклен на этом видео
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка подмены concat файла: {e}")
+
+    def _simple_video_controller(self):
+        """Простой контроллер смены видео через перезапись concat файла"""
+        logger.info("🎬 Запуск простого видео контроллера")
+
+        # Ждем запуска FFmpeg
+        time.sleep(3)
+
+        while self.is_streaming:
+            try:
+                time.sleep(0.5)
+
+                # Если есть видео в очереди
+                if self.video_queue:
+                    self.is_playing_video = True
+                    video_item = self.video_queue.pop(0)
+                    video_path = video_item['path']
+                    duration = video_item.get('duration', 10.0)
+                    filename = video_item.get('filename', os.path.basename(video_path))
+
+                    logger.info(f"🎥 Показываю видео: {filename} ({duration:.1f} сек)")
+
+                    # ПОДМЕНЯЕМ concat файл новым видео
+                    self._switch_concat_file(video_path, duration)
+
+                    # Отправляем уведомление
+                    socketio.emit('video_playing', {
+                        'filename': filename,
+                        'duration': duration,
+                        'timestamp': datetime.now().isoformat(),
+                        'method': 'concat_replace'
+                    })
+
+                    # Ждем пока видео воспроизводится
+                    time.sleep(duration)
+
+                    # ВОЗВРАЩАЕМ дефолтное видео
+                    self._restore_default_concat()
+
+                    self.is_playing_video = False
+
+                else:
+                    # Если очередь пуста, ждем
+                    time.sleep(1.0)
+
+            except Exception as e:
+                logger.error(f"❌ Ошибка в видео контроллере: {e}", exc_info=True)
+                time.sleep(1.0)
+
+        logger.info("🛑 Простой видео контроллер остановлен")
+
+        def _simple_video_controller(self):
+            """Простой контроллер смены видео через перезапись concat файла"""
+            logger.info("🎬 Запуск простого видео контроллера")
+
+            # Ждем запуска FFmpeg
+            time.sleep(3)
+
+            while self.is_streaming:
+                try:
+                    time.sleep(0.5)
+
+                    # Если есть видео в очереди
+                    if self.video_queue:
+                        self.is_playing_video = True
+                        video_item = self.video_queue.pop(0)
+                        video_path = video_item['path']
+                        duration = video_item.get('duration', 10.0)
+                        filename = video_item.get('filename', os.path.basename(video_path))
+
+                        logger.info(f"🎥 Показываю видео: {filename} ({duration:.1f} сек)")
+
+                        # ПОДМЕНЯЕМ concat файл новым видео
+                        self._switch_concat_file(video_path, duration)
+
+                        # Отправляем уведомление
+                        socketio.emit('video_playing', {
+                            'filename': filename,
+                            'duration': duration,
+                            'timestamp': datetime.now().isoformat(),
+                            'method': 'concat_replace'
+                        })
+
+                        # Ждем пока видео воспроизводится
+                        time.sleep(duration)
+
+                        # ВОЗВРАЩАЕМ дефолтное видео
+                        self._restore_default_concat()
+
+                        self.is_playing_video = False
+
+                    else:
+                        # Если очередь пуста, ждем
+                        time.sleep(1.0)
+
+                except Exception as e:
+                    logger.error(f"❌ Ошибка в видео контроллере: {e}", exc_info=True)
+                    time.sleep(1.0)
+
+            logger.info("🛑 Простой видео контроллер остановлен")
+
+    def _restore_default_concat(self):
+        """Восстановление дефолтного видео в concat файле"""
+        try:
+            if not hasattr(self, 'concat_file') or not self.concat_file:
+                return
+
+            if not hasattr(self, 'default_video') or not self.default_video:
+                self.default_video = self._create_default_video_file()
+
+            # Возвращаем дефолтное видео
+            with open(self.concat_file, 'w') as f:
+                f.write(f"file '{os.path.abspath(self.default_video)}'\n")
+                f.write("duration 99999\n")
+
+            logger.info("🔄 Восстановлено дефолтное видео в concat файле")
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка восстановления concat файла: {e}")
+
     def start_stream(self, use_audio: bool = True):
         """Запуск единого FFmpeg процесса с динамической сменой видео"""
         if not self.stream_key:
@@ -1230,23 +1372,27 @@ class FFmpegStreamManager:
             self.is_playing_audio = False
             self.is_playing_video = False
 
-            # Создаем именованный канал для управления
-            self.control_fifo = os.path.join(self.video_cache_dir, 'ffmpeg_control.fifo')
-            if os.path.exists(self.control_fifo):
-                os.unlink(self.control_fifo)
-            os.mkfifo(self.control_fifo)
-
             # Создаем дефолтное видео
             default_video = self._create_default_video_file()
 
-            # ВАЖНО: Создаем сложный фильтр с динамической сменой видео
+            # Создаем ПЕРМАНЕНТНЫЙ concat файл
+            concat_file = os.path.join(self.video_cache_dir, 'current_stream.txt')
+
+            # Записываем дефолтное видео в concat файл
+            with open(concat_file, 'w') as f:
+                f.write(f"file '{os.path.abspath(default_video)}'\n")
+                f.write("duration 99999\n")  # Очень длинное дефолтное видео
+
+            # ПРОСТАЯ команда FFmpeg
             ffmpeg_cmd = [
                 'ffmpeg',
 
-                # Вход 1: Дефолтное видео (фон)
+                # Вход 1: Concat файл
                 '-re',
+                '-f', 'concat',
+                '-safe', '0',
                 '-stream_loop', '-1',
-                '-i', default_video,
+                '-i', concat_file,
 
                 # Вход 2: Аудио через stdin
                 '-f', 's16le',
@@ -1255,25 +1401,8 @@ class FFmpegStreamManager:
                 '-channel_layout', 'stereo',
                 '-i', 'pipe:0',
 
-                # Фильтры для динамической смены видео
-                '-filter_complex', f"""
-                    color=size={self.video_width}x{self.video_height}:color=black:duration=99999 [bg];
-
-                    // Источник для дефолтного видео (фон)
-                    [0:v]setpts=PTS-STARTPTS, scale={self.video_width}x{self.video_height} [default];
-
-                    // Источник для overlay видео
-                    [bg]null[overlay_src];
-
-                    // Смешиваем видео
-                    [default][overlay_src]blend=all_mode=overlay:all_opacity=0.0 [mixed];
-
-                    // Выход
-                    [mixed]format=yuv420p [outv]
-                """,
-
                 # Карты
-                '-map', '[outv]',
+                '-map', '0:v:0',
                 '-map', '1:a:0',
 
                 # Кодирование видео
@@ -1286,7 +1415,6 @@ class FFmpegStreamManager:
                 '-maxrate', '4500k',
                 '-bufsize', '9000k',
                 '-r', str(self.video_fps),
-                '-x264-params', 'keyint=60:min-keyint=60:scenecut=0',
 
                 # Кодирование аудио
                 '-c:a', 'aac',
@@ -1298,15 +1426,12 @@ class FFmpegStreamManager:
                 '-f', 'flv',
                 '-flvflags', 'no_duration_filesize',
 
-                # Управляющий файл
-                '-vf', f"sendcmd=f={self.control_fifo}",
-
                 self.rtmp_url
             ]
 
-            logger.info(f"🚀 Запуск единого FFmpeg процесса с динамическими видео")
-            logger.info(f"🎬 Дефолтное видео: {os.path.basename(default_video)}")
-            logger.info(f"🎮 Control FIFO: {self.control_fifo}")
+            logger.info(f"🚀 Запуск FFmpeg процесса")
+            logger.info(f"🎬 Concat файл: {concat_file}")
+            logger.info(f"🔗 RTMP: {self.rtmp_url}")
 
             # Запускаем FFmpeg процесс
             self.stream_process = subprocess.Popen(
@@ -1321,6 +1446,8 @@ class FFmpegStreamManager:
             self.is_streaming = True
             self.ffmpeg_pid = self.stream_process.pid
             self.ffmpeg_stdin = self.stream_process.stdin
+            self.concat_file = concat_file
+            self.default_video = default_video
 
             logger.info(f"✅ FFmpeg запущен (PID: {self.ffmpeg_pid})")
 
@@ -1335,7 +1462,7 @@ class FFmpegStreamManager:
 
             # Запускаем видео контроллер
             threading.Thread(
-                target=self._dynamic_video_controller,
+                target=self._simple_video_controller,
                 daemon=True
             ).start()
 
@@ -1343,8 +1470,7 @@ class FFmpegStreamManager:
                 'pid': self.ffmpeg_pid,
                 'rtmp_url': self.rtmp_url,
                 'has_video': True,
-                'has_audio': True,
-                'dynamic_video': True
+                'has_audio': True
             })
 
             return {'success': True, 'pid': self.ffmpeg_pid}

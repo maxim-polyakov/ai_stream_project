@@ -2029,8 +2029,8 @@ class AIStreamManager:
                             # Создаем нейтральное видео через VideoGenerator
                             neutral_video = await asyncio.to_thread(
                                 self.video_generator.create_transition_video,
-                                from_topic=f"{agent.name} закончил(а)",
-                                to_topic=self.current_topic,
+                                from_text=f"{agent.name} закончил(а)",
+                                to_text=self.current_topic,
                                 duration=3.0
                             )
 

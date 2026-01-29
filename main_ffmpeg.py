@@ -1290,7 +1290,6 @@ class FFmpegStreamManager:
 
                 # Вход 2: Текущее активное видео (будет меняться)
                 '-re',
-                '-stream_loop', '-1',
                 '-i', self.current_video_file,
 
                 # Вход 3: Аудио через stdin

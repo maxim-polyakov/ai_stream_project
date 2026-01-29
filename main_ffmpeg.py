@@ -122,6 +122,7 @@ class FFmpegStreamManager:
         self.video_height = 1080
         self.video_fps = 30
         self.video_bitrate = '4500k'
+        self.video_queue = []
 
         # Для генерации тишины
         self.silence_chunk_duration = 0.1
@@ -148,29 +149,22 @@ class FFmpegStreamManager:
         logger.info(f"📊 Размер очереди аудио: {len(self.audio_queue)} файлов")
         return True
 
-    def add_video_to_queue(self, video_file: str, duration: float = None) -> bool:
-        """Добавление видео файла в очередь на воспроизведение"""
-        if not os.path.exists(video_file):
-            logger.error(f"❌ Видео файл не найден: {video_file}")
+    def add_video_to_queue(self, video_path: str, duration: float = None) -> bool:
+        """Добавление видео в очередь на показ"""
+        if not os.path.exists(video_path):
             return False
 
         # Получаем информацию о видео
-        video_info = self._get_video_info(video_file)
-        if not video_info:
-            logger.error(f"❌ Не удалось получить информацию о видео: {video_file}")
-            return False
-
-        # Определяем длительность
-        actual_duration = duration or video_info.get('duration', 5.0)
+        video_info = self._get_video_info(video_path)
+        actual_duration = duration or video_info.get('duration', 10.0)
 
         self.video_queue.append({
-            'path': video_file,
+            'path': video_path,
             'duration': actual_duration,
             'info': video_info
         })
 
-        logger.info(f"🎬 Видео добавлено в очередь: {os.path.basename(video_file)} ({actual_duration:.1f} сек)")
-        logger.info(f"📊 Размер очереди видео: {len(self.video_queue)} файлов")
+        logger.info(f"📥 Видео добавлено в очередь: {os.path.basename(video_path)}")
         return True
 
     def _get_video_info(self, video_path: str) -> Optional[Dict[str, Any]]:
@@ -462,30 +456,22 @@ class FFmpegStreamManager:
 
         logger.info("🛑 Аудио процессор остановлен")
 
-
-
     def switch_video_source(self, video_path: str, duration: float = 10.0) -> bool:
-        """Динамическая смена видео источника"""
-        if not self.is_streaming or not self.ffmpeg_stdin:
-            logger.error("❌ Стрим не активен")
-            return False
-
-        if not os.path.exists(video_path):
-            logger.error(f"❌ Видео файл не найден: {video_path}")
-            return False
-
+        """Динамическая смена видео источника БЕЗ перезапуска FFmpeg"""
         try:
-            logger.info(f"🎬 Переключение на видео: {os.path.basename(video_path)}")
+            if not self.is_streaming:
+                logger.error("❌ Стрим не активен")
+                return False
 
-            # Отправляем команду смены источника в FFmpeg
-            # Это сложно сделать без перезапуска процесса
+            if not os.path.exists(video_path):
+                logger.error(f"❌ Видео файл не найден: {video_path}")
+                return False
 
-            # Вместо этого, добавляем видео в очередь
-            self.video_queue.append({
-                'path': video_path,
-                'duration': duration,
-                'switch_at': time.time() + 1.0  # Переключить через 1 секунду
-            })
+            logger.info(f"🎬 Видео установлено как активное: {os.path.basename(video_path)}")
+
+            # Просто устанавливаем активное видео
+            with self.video_source_lock:
+                self.active_video_source = video_path
 
             socketio.emit('video_source_changed', {
                 'video_file': os.path.basename(video_path),
@@ -893,8 +879,36 @@ class FFmpegStreamManager:
             logger.error(f"❌ Ошибка сканирования кэша: {e}")
 
     def show_video_from_cache(self, filename: str) -> bool:
-        """Немедленный показ видео из кэша"""
-        return self.add_video_from_cache(filename)
+        """Показ видео из кэша БЕЗ перезапуска FFmpeg"""
+        try:
+            video_path = os.path.join(self.video_cache_dir, filename)
+
+            if not os.path.exists(video_path):
+                logger.error(f"❌ Видео не найдено: {filename}")
+                return False
+
+            # Просто логируем, но не перезапускаем FFmpeg
+            logger.info(f"📺 Видео доступно для показа: {filename}")
+
+            # Можно сохранить в очередь на будущее
+            if not hasattr(self, 'video_queue'):
+                self.video_queue = []
+
+            self.video_queue.append({
+                'path': video_path,
+                'filename': filename
+            })
+
+            socketio.emit('video_available', {
+                'filename': filename,
+                'timestamp': datetime.now().isoformat()
+            })
+
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка показа видео: {e}")
+            return False
 
     def _monitor_ffmpeg(self):
         """Мониторинг процесса FFmpeg"""

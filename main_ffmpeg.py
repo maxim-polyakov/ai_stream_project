@@ -1614,7 +1614,8 @@ class FFmpegStreamManager:
                 temp_mpegts.name
             ])
 
-            logger.info(f"🔄 Создание MPEG-TS потока: {os.path.basename(video_path)}")
+            # ЛОГИРОВАНИЕ КОМАНДЫ ДЛЯ ОТЛАДКИ
+            logger.info(f"🔧 Команда FFmpeg: {' '.join(mpegts_cmd)}")
 
             # Таймаут создания
             timeout = min(duration + 10, 30)
@@ -1623,14 +1624,35 @@ class FFmpegStreamManager:
                 mpegts_cmd,
                 capture_output=True,
                 text=True,
+                encoding='utf-8',  # Явно указываем кодировку
                 timeout=timeout
             )
 
             if result.returncode != 0:
-                logger.error(f"❌ Ошибка создания MPEG-TS: {result.stderr[:300]}")
+                # ПОЛНЫЙ ВЫВОД ОШИБКИ
+                logger.error(f"❌ Ошибка FFmpeg (код {result.returncode}):")
+                logger.error(f"STDOUT: {result.stdout}")
+                logger.error(f"STDERR: {result.stderr}")
+
+                # Также можно сохранить в файл для анализа
+                error_log_path = f"ffmpeg_error_{int(time.time())}.log"
+                with open(error_log_path, 'w', encoding='utf-8') as f:
+                    f.write(f"Команда: {' '.join(mpegts_cmd)}\n")
+                    f.write(f"Return code: {result.returncode}\n")
+                    f.write("=" * 50 + "\n")
+                    f.write("STDOUT:\n")
+                    f.write(result.stdout)
+                    f.write("\n" + "=" * 50 + "\n")
+                    f.write("STDERR:\n")
+                    f.write(result.stderr)
+
+                logger.info(f"📄 Полный лог ошибки сохранен в: {error_log_path}")
+
                 if os.path.exists(temp_mpegts.name):
                     os.unlink(temp_mpegts.name)
                 return False
+
+            logger.info(f"✅ MPEG-TS создан успешно: {temp_mpegts.name}")
 
             # Отправляем MPEG-TS файл в pipe
             success = self._send_mpegts_file(temp_mpegts.name, duration)
@@ -1647,11 +1669,15 @@ class FFmpegStreamManager:
 
             return success
 
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as e:
             logger.error(f"❌ Таймаут создания MPEG-TS: {os.path.basename(video_path)}")
+            logger.error(f"Таймаут: {e}")
             return False
         except Exception as e:
             logger.error(f"❌ Ошибка создания MPEG-TS: {e}")
+            logger.error(f"Тип ошибки: {type(e)}")
+            import traceback
+            logger.error(f"Трейсбек: {traceback.format_exc()}")
             return False
 
     def _stream_controller(self):

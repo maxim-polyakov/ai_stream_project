@@ -307,9 +307,6 @@ class FFmpegStreamManager:
 
         except Exception as e:
             logger.error(f"❌ Ошибка подготовки видео: {e}", exc_info=True)
-            if os.path.exists(temp_video.name):
-                os.unlink(temp_video.name)
-            return None
 
     def _generate_silence_chunk(self) -> bytes:
         """Генерация чанка тишины (нулевые байты)"""
@@ -1020,6 +1017,107 @@ class VideoGenerator:
 
         logger.info(f"✅ Video Generator инициализирован. Кэш: {self.video_cache_dir}")
 
+    def _load_fonts(self):
+        """Загрузка шрифтов"""
+        fonts = {}
+
+        # Список путей к шрифтам
+        font_paths = [
+            # Linux
+            '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+            '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf',
+            '/usr/share/fonts/ubuntu/Ubuntu-B.ttf',
+
+            # macOS
+            '/System/Library/Fonts/Supplemental/Arial Bold.ttf',
+            '/System/Library/Fonts/Arial.ttf',
+            '/Library/Fonts/Arial Bold.ttf',
+
+            # Windows
+            'C:/Windows/Fonts/arialbd.ttf',
+            'C:/Windows/Fonts/arial.ttf',
+            'C:/Windows/Fonts/Arial.ttf',
+
+            # Текущая директория
+            './fonts/arial.ttf',
+            './fonts/Arial.ttf',
+            'arial.ttf',
+            'Arial.ttf',
+
+            # Популярные шрифты
+            '/usr/share/fonts/truetype/msttcorefonts/Arial_Bold.ttf',
+            '/usr/share/fonts/truetype/msttcorefonts/arialbd.ttf'
+        ]
+
+        # Сканируем системные директории шрифтов
+        system_font_dirs = [
+            '/usr/share/fonts',
+            '/usr/local/share/fonts',
+            '/Library/Fonts',
+            'C:/Windows/Fonts',
+            '/System/Library/Fonts',
+            os.path.expanduser('~/.fonts')
+        ]
+
+        # Добавляем найденные шрифты Arial
+        for font_dir in system_font_dirs:
+            if os.path.exists(font_dir):
+                try:
+                    for root, dirs, files in os.walk(font_dir):
+                        for file in files:
+                            file_lower = file.lower()
+                            # Ищем шрифты Arial или похожие
+                            if ('arial' in file_lower or
+                                'dejavu' in file_lower or
+                                'liberation' in file_lower) and file_lower.endswith(('.ttf', '.otf')):
+                                font_paths.append(os.path.join(root, file))
+                except Exception as e:
+                    logger.debug(f"Не удалось просканировать {font_dir}: {e}")
+
+        # Убираем дубликаты
+        font_paths = list(set(font_paths))
+
+        # Пробуем загрузить шрифты
+        loaded = False
+        for path in font_paths:
+            try:
+                if os.path.exists(path):
+                    # Пробуем загрузить все три размера
+                    fonts['bold'] = ImageFont.truetype(path, 40)
+                    fonts['regular'] = ImageFont.truetype(path, 32)
+                    fonts['small'] = ImageFont.truetype(path, 24)
+
+                    logger.info(f"✅ Загружен шрифт: {path}")
+                    loaded = True
+                    break
+            except Exception as e:
+                continue
+
+        if not loaded:
+            logger.warning("⚠️ Не удалось загрузить TTF шрифты, используем стандартные PIL шрифты")
+            try:
+                # Пробуем загрузить стандартные PIL шрифты
+                fonts['bold'] = ImageFont.load_default()
+                fonts['regular'] = ImageFont.load_default()
+                fonts['small'] = ImageFont.load_default()
+
+                # Пробуем создать шрифт по размеру
+                try:
+                    fonts['bold'] = ImageFont.truetype(ImageFont.load_default().path, 40)
+                except:
+                    pass
+
+            except Exception as e:
+                logger.error(f"❌ Не удалось загрузить даже стандартные шрифты: {e}")
+                # Создаем заглушки
+                fonts = {
+                    'bold': None,
+                    'regular': None,
+                    'small': None
+                }
+
+        return fonts
+
     def _clean_old_cache_files(self, max_age_hours: int = 24):
         """Очистка старых файлов из кэша"""
         try:
@@ -1053,6 +1151,98 @@ class VideoGenerator:
         except Exception as e:
             logger.error(f"Ошибка очистки кэша: {e}")
 
+    def _safe_draw_text(self, draw: ImageDraw.Draw, position: tuple, text: str,
+                        font_key: str = 'regular', color: tuple = (255, 255, 255),
+                        anchor: str = "mm") -> None:
+        """
+        Безопасный метод для рисования текста на изображении.
+
+        Args:
+            draw: ImageDraw объект
+            position: (x, y) координаты текста
+            text: Текст для рисования
+            font_key: Ключ шрифта ('bold', 'regular', 'small')
+            color: Цвет текста в формате (R, G, B) или (R, G, B, A)
+            anchor: Позиционирование текста (например, "mm" для центрирования)
+        """
+        try:
+            # Получаем шрифт
+            font = self.fonts.get(font_key)
+
+            # Если шрифт не найден, используем стандартный
+            if font is None:
+                logger.debug(f"Шрифт '{font_key}' не найден, используем стандартный")
+                font = ImageFont.load_default()
+
+            # Преобразуем цвет для PIL
+            # PIL принимает цвет как (R, G, B) или (R, G, B, A)
+            if len(color) == 4:
+                # Если указана альфа-канал, проверяем прозрачность
+                r, g, b, a = color
+                if a < 255:
+                    # Для полупрозрачного текста используем RGBA
+                    pil_color = (r, g, b, a)
+                    # Нужно использовать отдельный метод для прозрачности
+                    try:
+                        # Создаем временное изображение для текста с прозрачностью
+                        text_img = Image.new('RGBA', (self.video_width, 100), (0, 0, 0, 0))
+                        text_draw = ImageDraw.Draw(text_img)
+                        text_draw.text((0, 0), text, font=font, fill=pil_color, anchor=anchor)
+
+                        # Находим размеры текста
+                        bbox = text_draw.textbbox((0, 0), text, font=font, anchor=anchor)
+                        text_width = bbox[2] - bbox[0]
+                        text_height = bbox[3] - bbox[1]
+
+                        # Обрезаем текст до нужного размера
+                        text_img = text_img.crop((0, 0, text_width, text_height))
+
+                        # Наносим текст на основное изображение
+                        x, y = position
+                        if anchor == "mm":
+                            x -= text_width // 2
+                            y -= text_height // 2
+                        elif anchor == "mt":
+                            x -= text_width // 2
+                        elif anchor == "mb":
+                            x -= text_width // 2
+                            y -= text_height
+
+                        # Вставляем текст с прозрачностью
+                        img = draw.im
+                        img.paste(text_img, (int(x), int(y)), text_img)
+                        return
+                    except Exception as e:
+                        logger.warning(f"Не удалось нарисовать полупрозрачный текст: {e}")
+                        # Если не получилось с прозрачностью, рисуем без нее
+                        pil_color = (r, g, b)
+                else:
+                    pil_color = (r, g, b)
+            else:
+                pil_color = color
+
+            # Пробуем нарисовать текст
+            try:
+                draw.text(position, text, font=font, fill=pil_color, anchor=anchor)
+            except AttributeError:
+                # Если шрифт не поддерживает нужные методы
+                if isinstance(font, ImageFont.FreeTypeFont) or hasattr(font, 'getsize'):
+                    # Старый метод для PIL
+                    draw.text(position, text, font=font, fill=pil_color)
+                else:
+                    # Простой текст без шрифта
+                    draw.text(position, text, fill=pil_color)
+
+        except Exception as e:
+            logger.warning(f"Ошибка рисования текста '{text[:30]}...': {e}")
+            try:
+                # Последняя попытка - рисовать без шрифта
+                if len(color) >= 3:
+                    pil_color = color[:3] if len(color) > 3 else color
+                    draw.text(position, text, fill=pil_color)
+            except:
+                pass  # Если совсем не получается, пропускаем текст
+
     def create_agent_intro_video(self, agent_name: str, expertise: str,
                                  avatar_color: str, message: str, duration: float = 7.0) -> str:
         """Создание видео-интро для агента и сохранение в кэш"""
@@ -1064,7 +1254,103 @@ class VideoGenerator:
 
             logger.info(f"🎬 Создание видео-интро для {agent_name}...")
 
-            # ... (основной код создания видео остается без изменений) ...
+            # Параметры видео
+            fps = self.fps
+            total_frames = int(duration * fps)
+
+            # Создаем VideoWriter
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # или 'avc1' для H.264
+            video_writer = cv2.VideoWriter(
+                video_path,
+                fourcc,
+                fps,
+                (self.video_width, self.video_height)
+            )
+
+            if not video_writer.isOpened():
+                logger.error(f"❌ Не удалось создать VideoWriter для {video_path}")
+                return None
+
+            # Конвертируем цвет из hex в RGB
+            if avatar_color.startswith('#'):
+                color_hex = avatar_color.lstrip('#')
+                rgb = tuple(int(color_hex[i:i + 2], 16) for i in (0, 2, 4))
+            else:
+                rgb = (100, 149, 237)  # Cornflower blue
+
+            # Анимация появления
+            for frame_num in range(total_frames):
+                # Создаем изображение с фоном
+                img = Image.new('RGB', (self.video_width, self.video_height),
+                                (20, 20, 30))  # Темный фон
+                draw = ImageDraw.Draw(img)
+
+                # Эффект появления
+                progress = min(1.0, frame_num / (fps * 1.0))  # Анимация за 1 секунду
+
+                # Рисуем круг агента
+                center_x = self.video_width // 2
+                center_y = self.video_height // 3
+                radius = int(150 * progress)
+
+                # Градиент для круга
+                for r in range(radius, 0, -5):
+                    alpha = int(255 * (r / radius) * progress)
+                    color = (*rgb, alpha)
+                    draw.ellipse([center_x - r, center_y - r,
+                                  center_x + r, center_y + r],
+                                 fill=rgb, outline=(255, 255, 255, 100))
+
+                # Имя агента
+                if frame_num > fps * 0.5:  # Появляется через 0.5 секунды
+                    name_progress = min(1.0, (frame_num - fps * 0.5) / (fps * 0.5))
+                    name_alpha = int(255 * name_progress)
+                    self._safe_draw_text(draw, (center_x, center_y + 180), agent_name,
+                                         font_key='bold',
+                                         color=(255, 255, 255, name_alpha),
+                                         anchor="mm")
+
+                # Экспертиза
+                if frame_num > fps * 0.8:
+                    exp_progress = min(1.0, (frame_num - fps * 0.8) / (fps * 0.5))
+                    exp_alpha = int(200 * exp_progress)
+                    self._safe_draw_text(draw, (center_x, center_y + 230), expertise,
+                                         font_key='small',
+                                         color=(200, 200, 255, exp_alpha),
+                                         anchor="mm")
+
+                # Сообщение (постепенно появляется)
+                if frame_num > fps * 1.5 and message:
+                    msg_progress = min(1.0, (frame_num - fps * 1.5) / (fps * 1.0))
+
+                    # Разбиваем текст на строки
+                    max_chars = 60
+                    wrapped_text = textwrap.fill(message, width=max_chars)
+                    lines = wrapped_text.split('\n')
+
+                    # Рисуем фон для текста
+                    text_height = len(lines) * 40
+                    bg_top = self.video_height * 2 // 3 - 20
+                    bg_bottom = bg_top + text_height + 40
+                    bg_alpha = int(30 * msg_progress)
+
+                    # Полупрозрачный фон
+                    bg = Image.new('RGBA', (self.video_width, bg_bottom - bg_top),
+                                   (0, 0, 0, bg_alpha))
+                    img.paste(bg, (0, bg_top), bg)
+
+                    # Текст сообщения
+                    for i, line in enumerate(lines[:8]):  # Максимум 8 строк
+                        text_y = bg_top + 20 + i * 40
+                        text_alpha = int(255 * msg_progress)
+                        self._safe_draw_text(draw, (center_x, text_y), line,
+                                             font_key='regular',
+                                             color=(255, 255, 255, text_alpha),
+                                             anchor="mm")
+
+                # Конвертируем PIL в OpenCV
+                cv_img = cv2.cvtColor(numpy.array(img), cv2.COLOR_RGB2BGR)
+                video_writer.write(cv_img)
 
             video_writer.release()
 
@@ -1073,7 +1359,7 @@ class VideoGenerator:
                 file_size = os.path.getsize(video_path) / 1024 / 1024  # MB
                 logger.info(f"✅ Видео сохранено в кэш: {video_filename} ({file_size:.1f} MB, {duration} сек)")
 
-                # НОВОЕ: Автоматически добавляем в очередь стрима
+                # Автоматически добавляем в очередь стрима
                 if self.ffmpeg_manager and hasattr(self.ffmpeg_manager, 'add_video_from_cache'):
                     success = self.ffmpeg_manager.add_video_from_cache(video_filename, duration)
                     if success:
@@ -1179,6 +1465,186 @@ class VideoGenerator:
         if os.path.exists(video_path):
             return video_path
         return None
+
+    def create_transition_video(self, from_text: str, to_text: str,
+                                duration: float = 5.0) -> str:
+        """Создание переходного видео и сохранение в кэш"""
+        try:
+            timestamp = int(time.time())
+            video_filename = f"transition_{timestamp}.mp4"
+            video_path = os.path.join(self.video_cache_dir, video_filename)
+
+            logger.info(f"🎬 Создание переходного видео: {from_text} → {to_text}")
+
+            fps = self.fps
+            total_frames = int(duration * fps)
+
+            # Создаем VideoWriter
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            video_writer = cv2.VideoWriter(
+                video_path,
+                fourcc,
+                fps,
+                (self.video_width, self.video_height)
+            )
+
+            if not video_writer.isOpened():
+                logger.error(f"❌ Не удалось открыть VideoWriter для {video_path}")
+                return None
+
+            # Цвета для перехода
+            color_from = (30, 60, 120)  # Синий
+            color_to = (120, 60, 30)  # Коричневый
+            bg_color = (20, 20, 30)  # Темный фон
+
+            for frame_num in range(total_frames):
+                progress = frame_num / total_frames
+
+                # Создаем изображение с фоном
+                img = Image.new('RGB', (self.video_width, self.video_height), bg_color)
+                draw = ImageDraw.Draw(img)
+
+                # Анимация смены текста
+                if progress < 0.3:
+                    # Показываем первый текст (исчезает)
+                    text_alpha = int(255 * (1 - progress / 0.3))
+                    self._safe_draw_text(
+                        draw,
+                        (self.video_width // 2, self.video_height // 2 - 80),
+                        from_text,
+                        font_key='bold',
+                        color=(*color_from, text_alpha),
+                        anchor="mm"
+                    )
+
+                    # Подпись "Завершение"
+                    caption_alpha = int(200 * (1 - progress / 0.3))
+                    self._safe_draw_text(
+                        draw,
+                        (self.video_width // 2, self.video_height // 2 - 150),
+                        "↘ Завершение",
+                        font_key='small',
+                        color=(180, 180, 255, caption_alpha),
+                        anchor="mm"
+                    )
+
+                elif progress < 0.7:
+                    # Промежуточное состояние
+                    mid_progress = (progress - 0.3) / 0.4
+
+                    # Анимационная линия между текстами
+                    line_y = self.video_height // 2
+                    line_x1 = self.video_width * 0.3
+                    line_x2 = self.video_width * 0.7
+                    line_alpha = int(150 * (1 - abs(mid_progress - 0.5) * 2))
+
+                    # Рисуем анимированную линию
+                    line_points = []
+                    for i in range(20):
+                        x = line_x1 + (line_x2 - line_x1) * (i / 19)
+                        y = line_y + numpy.sin(mid_progress * 20 + i * 0.5) * 15
+                        line_points.append((x, y))
+
+                    if len(line_points) > 1:
+                        for i in range(len(line_points) - 1):
+                            draw.line(
+                                [line_points[i], line_points[i + 1]],
+                                fill=(100, 200, 255, line_alpha),
+                                width=3
+                            )
+
+                    # Минимальные версии текстов
+                    from_alpha = int(100 * (1 - mid_progress))
+                    to_alpha = int(100 * mid_progress)
+
+                    self._safe_draw_text(
+                        draw,
+                        (self.video_width // 4, self.video_height // 2),
+                        from_text[:30] + ("..." if len(from_text) > 30 else ""),
+                        font_key='small',
+                        color=(*color_from, from_alpha),
+                        anchor="mm"
+                    )
+
+                    self._safe_draw_text(
+                        draw,
+                        (self.video_width * 3 // 4, self.video_height // 2),
+                        to_text[:30] + ("..." if len(to_text) > 30 else ""),
+                        font_key='small',
+                        color=(*color_to, to_alpha),
+                        anchor="mm"
+                    )
+
+                else:
+                    # Показываем второй текст (появляется)
+                    text_progress = (progress - 0.7) / 0.3
+                    text_alpha = int(255 * text_progress)
+
+                    self._safe_draw_text(
+                        draw,
+                        (self.video_width // 2, self.video_height // 2 - 80),
+                        to_text,
+                        font_key='bold',
+                        color=(*color_to, text_alpha),
+                        anchor="mm"
+                    )
+
+                    # Подпись "Начало"
+                    caption_alpha = int(200 * text_progress)
+                    self._safe_draw_text(
+                        draw,
+                        (self.video_width // 2, self.video_height // 2 - 150),
+                        "↗ Начало",
+                        font_key='small',
+                        color=(255, 200, 180, caption_alpha),
+                        anchor="mm"
+                    )
+
+                # Визуальные элементы (частицы)
+                for i in range(15):
+                    particle_x = (progress * 1.5 + i * 0.1) % 1.0 * self.video_width
+                    particle_y = self.video_height * 0.8 + numpy.sin(progress * 10 + i) * 20
+                    particle_size = 3 + numpy.sin(progress * 8 + i * 0.7) * 2
+                    particle_alpha = int(150 + numpy.sin(progress * 5 + i) * 100)
+
+                    # Цвет частицы меняется от color_from к color_to
+                    mix_factor = progress
+                    r = int(color_from[0] * (1 - mix_factor) + color_to[0] * mix_factor)
+                    g = int(color_from[1] * (1 - mix_factor) + color_to[1] * mix_factor)
+                    b = int(color_from[2] * (1 - mix_factor) + color_to[2] * mix_factor)
+
+                    draw.ellipse([
+                        particle_x - particle_size,
+                        particle_y - particle_size,
+                        particle_x + particle_size,
+                        particle_y + particle_size
+                    ], fill=(r, g, b, particle_alpha))
+
+                # Конвертируем PIL в OpenCV
+                cv_img = cv2.cvtColor(numpy.array(img), cv2.COLOR_RGB2BGR)
+                video_writer.write(cv_img)
+
+            video_writer.release()
+
+            # Проверяем что файл создан
+            if os.path.exists(video_path):
+                file_size = os.path.getsize(video_path) / 1024 / 1024  # MB
+                logger.info(
+                    f"✅ Переходное видео сохранено в кэш: {video_filename} ({file_size:.1f} MB, {duration} сек)")
+
+                # Автоматически добавляем в очередь стрима
+                if self.ffmpeg_manager and hasattr(self.ffmpeg_manager, 'add_video_from_cache'):
+                    success = self.ffmpeg_manager.add_video_from_cache(video_filename, duration)
+                    if success:
+                        logger.info(f"📥 Переходное видео добавлено в очередь стрима")
+
+                return video_path
+
+            return None
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка создания переходного видео: {e}", exc_info=True)
+            return None
 
     def list_cached_videos(self) -> List[Dict[str, Any]]:
         """Список всех видео в кэше"""
@@ -1993,12 +2459,6 @@ def get_stream_status():
     return jsonify(ffmpeg_manager.get_status())
 
 
-@app.route('/api/stream_health')
-def get_stream_health():
-    """Получение здоровья стрима"""
-    return jsonify(ffmpeg_manager.get_stream_health())
-
-
 @app.route('/api/change_topic', methods=['POST'])
 def api_change_topic():
     """Смена темы"""
@@ -2007,19 +2467,6 @@ def api_change_topic():
 
 
 # ========== SOCKET.IO HANDLERS ==========
-
-@socketio.on('connect')
-def handle_connect():
-    """Обработчик подключения клиента"""
-    logger.info(f"📡 Клиент подключен: {request.sid}")
-
-    emit('connected', {
-        'agents': stream_manager.get_agents_state(),
-        'topic': stream_manager.current_topic or "Не выбрана",
-        'stats': stream_manager.get_stats(),
-        'stream_status': ffmpeg_manager.get_status(),
-        'time': datetime.now().isoformat()
-    })
 
 
 @socketio.on('request_update')
@@ -2032,10 +2479,6 @@ def handle_request_update():
         'stream_status': ffmpeg_manager.get_status()
     })
 
-
-@socketio.on('disconnect')
-def handle_disconnect():
-    logger.info(f"📡 Клиент отключен: {request.sid}")
 
 
 @socketio.on('stream_started')

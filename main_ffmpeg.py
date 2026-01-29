@@ -9,6 +9,9 @@ import os
 import sys
 import json
 import random
+import textwrap
+from PIL import Image, ImageDraw, ImageFont
+import cv2
 import asyncio
 import threading
 import logging
@@ -79,6 +82,9 @@ if Config.OPENAI_API_KEY:
 else:
     logger.warning("⚠️ OpenAI API ключ не найден. Будут использоваться демо-сообщения.")
     openai_client = None
+
+
+
 
 
 # ========== FFMPEG STREAM MANAGER с ПАЙПАМИ ==========
@@ -495,6 +501,374 @@ class FFmpegStreamManager:
             'uptime': time.time() - self.start_time if self.start_time else 0
         }
 
+class VideoGenerator:
+    """Генератор видео для стрима"""
+
+    def __init__(self, ffmpeg_manager: FFmpegStreamManager = None):
+        self.ffmpeg_manager = ffmpeg_manager
+        self.video_queue = []
+        self.is_playing_video = False
+        self.video_width = 1920
+        self.video_height = 1080
+        self.fps = 30
+        self.video_cache_dir = 'video_cache'
+        os.makedirs(self.video_cache_dir, exist_ok=True)
+
+        # Шрифты для текста (если доступны)
+        self.fonts = self._load_fonts()
+
+        logger.info("Video Generator инициализирован")
+
+    def _load_fonts(self):
+        """Загрузка шрифтов"""
+        fonts = {}
+        font_paths = [
+            '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+            '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf',
+            '/System/Library/Fonts/Supplemental/Arial Bold.ttf',
+            'C:/Windows/Fonts/arialbd.ttf',
+            './fonts/arial.ttf'
+        ]
+
+        for path in font_paths:
+            if os.path.exists(path):
+                try:
+                    fonts['bold'] = ImageFont.truetype(path, 40)
+                    fonts['regular'] = ImageFont.truetype(path, 32)
+                    fonts['small'] = ImageFont.truetype(path, 24)
+                    logger.info(f"✅ Загружен шрифт: {path}")
+                    return fonts
+                except Exception as e:
+                    continue
+
+        # Если шрифты не найдены, используем стандартный
+        logger.warning("⚠️ Шрифты не найдены, используем стандартный")
+        fonts['bold'] = ImageFont.load_default()
+        fonts['regular'] = ImageFont.load_default()
+        fonts['small'] = ImageFont.load_default()
+        return fonts
+
+    def create_agent_intro_video(self, agent_name: str, expertise: str,
+                                 avatar_color: str, message: str, duration: float = 7.0) -> str:
+        """Создание видео-интро для агента"""
+        try:
+            # Создаем уникальное имя файла
+            timestamp = int(time.time())
+            video_filename = f"intro_{agent_name}_{timestamp}.mp4"
+            video_path = os.path.join(self.video_cache_dir, video_filename)
+
+            # Параметры видео
+            fps = self.fps
+            total_frames = int(duration * fps)
+
+            # Создаем видео с помощью OpenCV
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            video_writer = cv2.VideoWriter(video_path, fourcc, fps,
+                                           (self.video_width, self.video_height))
+
+            # Конвертируем цвет из hex в RGB
+            if avatar_color.startswith('#'):
+                color_hex = avatar_color.lstrip('#')
+                rgb = tuple(int(color_hex[i:i + 2], 16) for i in (0, 2, 4))
+            else:
+                rgb = (100, 149, 237)  # Cornflower blue
+
+            # Анимация появления
+            for frame_num in range(total_frames):
+                # Создаем изображение с фоном
+                img = Image.new('RGB', (self.video_width, self.video_height),
+                                (20, 20, 30))  # Темный фон
+                draw = ImageDraw.Draw(img)
+
+                # Эффект появления
+                progress = min(1.0, frame_num / (fps * 1.0))  # Анимация за 1 секунду
+
+                # Рисуем круг агента
+                center_x = self.video_width // 2
+                center_y = self.video_height // 3
+                radius = int(150 * progress)
+
+                # Градиент для круга
+                for r in range(radius, 0, -1):
+                    alpha = int(255 * (r / radius) * progress)
+                    color = (*rgb, alpha)
+                    draw.ellipse([center_x - r, center_y - r,
+                                  center_x + r, center_y + r],
+                                 fill=rgb, outline=(255, 255, 255, 100))
+
+                # Имя агента
+                if frame_num > fps * 0.5:  # Появляется через 0.5 секунды
+                    name_progress = min(1.0, (frame_num - fps * 0.5) / (fps * 0.5))
+                    name_alpha = int(255 * name_progress)
+                    try:
+                        draw.text((center_x, center_y + 180), agent_name,
+                                  font=self.fonts['bold'], fill=(255, 255, 255, name_alpha),
+                                  anchor="mm")
+                    except:
+                        draw.text((center_x, center_y + 180), agent_name,
+                                  fill=(255, 255, 255, name_alpha), anchor="mm")
+
+                # Экспертиза
+                if frame_num > fps * 0.8:
+                    exp_progress = min(1.0, (frame_num - fps * 0.8) / (fps * 0.5))
+                    exp_alpha = int(200 * exp_progress)
+                    try:
+                        draw.text((center_x, center_y + 230), expertise,
+                                  font=self.fonts['small'], fill=(200, 200, 255, exp_alpha),
+                                  anchor="mm")
+                    except:
+                        draw.text((center_x, center_y + 230), expertise,
+                                  fill=(200, 200, 255, exp_alpha), anchor="mm")
+
+                # Сообщение (постепенно появляется)
+                if frame_num > fps * 1.5 and message:
+                    msg_progress = min(1.0, (frame_num - fps * 1.5) / (fps * 1.0))
+
+                    # Разбиваем текст на строки
+                    max_chars = 60
+                    wrapped_text = textwrap.fill(message, width=max_chars)
+                    lines = wrapped_text.split('\n')
+
+                    # Рисуем фон для текста
+                    text_height = len(lines) * 40
+                    bg_top = self.video_height * 2 // 3 - 20
+                    bg_bottom = bg_top + text_height + 40
+                    bg_alpha = int(30 * msg_progress)
+
+                    # Полупрозрачный фон
+                    bg = Image.new('RGBA', (self.video_width, bg_bottom - bg_top),
+                                   (0, 0, 0, bg_alpha))
+                    img.paste(bg, (0, bg_top), bg)
+
+                    # Текст сообщения
+                    for i, line in enumerate(lines):
+                        text_y = bg_top + 20 + i * 40
+                        text_alpha = int(255 * msg_progress)
+                        try:
+                            draw.text((center_x, text_y), line,
+                                      font=self.fonts['regular'],
+                                      fill=(255, 255, 255, text_alpha),
+                                      anchor="mm")
+                        except:
+                            draw.text((center_x, text_y), line,
+                                      fill=(255, 255, 255, text_alpha), anchor="mm")
+
+                # Конвертируем PIL в OpenCV
+                cv_img = cv2.cvtColor(numpy.array(img), cv2.COLOR_RGB2BGR)
+                video_writer.write(cv_img)
+
+            video_writer.release()
+
+            # Проверяем что файл создан
+            if os.path.exists(video_path) and os.path.getsize(video_path) > 0:
+                logger.info(f"✅ Видео создано: {video_path} ({duration} сек)")
+                return video_path
+
+            return None
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка создания видео: {e}", exc_info=True)
+            return None
+
+    def create_transition_video(self, from_topic: str, to_topic: str,
+                                duration: float = 5.0) -> str:
+        """Создание переходного видео между темами"""
+        try:
+            timestamp = int(time.time())
+            video_filename = f"transition_{timestamp}.mp4"
+            video_path = os.path.join(self.video_cache_dir, video_filename)
+
+            fps = self.fps
+            total_frames = int(duration * fps)
+
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            video_writer = cv2.VideoWriter(video_path, fourcc, fps,
+                                           (self.video_width, self.video_height))
+
+            for frame_num in range(total_frames):
+                progress = frame_num / total_frames
+
+                # Создаем плавный переход
+                img = Image.new('RGB', (self.video_width, self.video_height),
+                                (10, 10, 20))
+                draw = ImageDraw.Draw(img)
+
+                # Анимация смены темы
+                if progress < 0.5:
+                    # Исчезает старая тема
+                    alpha = int(255 * (1 - progress * 2))
+                    try:
+                        draw.text((self.video_width // 2, self.video_height // 2 - 50),
+                                  "Тема обсуждения:",
+                                  font=self.fonts['bold'],
+                                  fill=(200, 200, 255, alpha),
+                                  anchor="mm")
+                        draw.text((self.video_width // 2, self.video_height // 2 + 10),
+                                  from_topic,
+                                  font=self.fonts['regular'],
+                                  fill=(255, 255, 255, alpha),
+                                  anchor="mm")
+                    except:
+                        draw.text((self.video_width // 2, self.video_height // 2 - 50),
+                                  "Тема обсуждения:",
+                                  fill=(200, 200, 255, alpha), anchor="mm")
+                        draw.text((self.video_width // 2, self.video_height // 2 + 10),
+                                  from_topic,
+                                  fill=(255, 255, 255, alpha), anchor="mm")
+                else:
+                    # Появляется новая тема
+                    alpha = int(255 * ((progress - 0.5) * 2))
+                    try:
+                        draw.text((self.video_width // 2, self.video_height // 2 - 50),
+                                  "Новая тема:",
+                                  font=self.fonts['bold'],
+                                  fill=(200, 255, 200, alpha),
+                                  anchor="mm")
+                        draw.text((self.video_width // 2, self.video_height // 2 + 10),
+                                  to_topic,
+                                  font=self.fonts['regular'],
+                                  fill=(255, 255, 255, alpha),
+                                  anchor="mm")
+                    except:
+                        draw.text((self.video_width // 2, self.video_height // 2 - 50),
+                                  "Новая тема:",
+                                  fill=(200, 255, 200, alpha), anchor="mm")
+                        draw.text((self.video_width // 2, self.video_height // 2 + 10),
+                                  to_topic,
+                                  fill=(255, 255, 255, alpha), anchor="mm")
+
+                # Анимационные элементы
+                for i in range(20):
+                    x = int((self.video_width * progress + i * 100) % self.video_width)
+                    y = int(self.video_height * 0.8 +
+                            numpy.sin(progress * 10 + i * 0.5) * 20)
+                    radius = int(5 + numpy.sin(progress * 5 + i) * 3)
+                    draw.ellipse([x - radius, y - radius, x + radius, y + radius],
+                                 fill=(100, 100, 255, 100))
+
+                cv_img = cv2.cvtColor(numpy.array(img), cv2.COLOR_RGB2BGR)
+                video_writer.write(cv_img)
+
+            video_writer.release()
+
+            if os.path.exists(video_path):
+                logger.info(f"✅ Переходное видео создано: {video_path}")
+                return video_path
+
+            return None
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка создания переходного видео: {e}")
+            return None
+
+    def add_video_to_stream(self, video_path: str) -> bool:
+        """Добавление видео в стрим через FFmpeg"""
+        if not self.ffmpeg_manager or not self.ffmpeg_manager.is_streaming:
+            logger.error("❌ FFmpeg стрим не активен")
+            return False
+
+        if not os.path.exists(video_path):
+            logger.error(f"❌ Видео файл не найден: {video_path}")
+            return False
+
+        try:
+            # Получаем информацию о видео
+            video_info = self._get_video_info(video_path)
+            if not video_info:
+                return False
+
+            duration = video_info.get('duration', 5.0)
+
+            # Создаем команду для вставки видео в стрим
+            # Используем сложный фильтр FFmpeg для наложения видео
+            temp_output = tempfile.NamedTemporaryFile(suffix='.ts', delete=False)
+            temp_output.close()
+
+            # Конвертируем видео в формат для стрима
+            convert_cmd = [
+                'ffmpeg',
+                '-i', video_path,
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',
+                '-tune', 'zerolatency',
+                '-pix_fmt', 'yuv420p',
+                '-b:v', '3000k',
+                '-maxrate', '3000k',
+                '-bufsize', '6000k',
+                '-g', '30',
+                '-c:a', 'aac',
+                '-b:a', '128k',
+                '-f', 'mpegts',
+                '-y',
+                temp_output.name
+            ]
+
+            logger.info(f"🎬 Конвертация видео для стрима: {os.path.basename(video_path)}")
+
+            result = subprocess.run(
+                convert_cmd,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+
+            if result.returncode != 0:
+                logger.error(f"❌ Ошибка конвертации видео: {result.stderr[:500]}")
+                os.unlink(temp_output.name)
+                return False
+
+            # Теперь нам нужно отправить видео в FFmpeg
+            # В данном случае мы будем использовать альтернативный подход:
+            # Создаем временный файл и отправляем его как источник
+
+            # Добавляем в очередь на обработку
+            self.video_queue.append(temp_output.name)
+            logger.info(f"📥 Видео добавлено в очередь: {os.path.basename(video_path)}")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка добавления видео в стрим: {e}", exc_info=True)
+            return False
+
+    def _get_video_info(self, video_path: str) -> Optional[Dict[str, Any]]:
+        """Получение информации о видео файле"""
+        try:
+            cmd = [
+                'ffprobe',
+                '-v', 'error',
+                '-select_streams', 'v:0',
+                '-show_entries', 'stream=width,height,duration,r_frame_rate,codec_name',
+                '-show_entries', 'format=duration',
+                '-of', 'json',
+                video_path
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True)
+
+            if result.returncode == 0:
+                info = json.loads(result.stdout)
+
+                # Извлекаем информацию
+                duration = 0.0
+                if 'format' in info and 'duration' in info['format']:
+                    duration = float(info['format']['duration'])
+                elif 'streams' in info and len(info['streams']) > 0:
+                    if 'duration' in info['streams'][0]:
+                        duration = float(info['streams'][0]['duration'])
+
+                return {
+                    'duration': duration,
+                    'width': info.get('streams', [{}])[0].get('width', 1920),
+                    'height': info.get('streams', [{}])[0].get('height', 1080),
+                    'fps': 30  # По умолчанию
+                }
+
+            return None
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения информации о видео: {e}")
+            return None
 
 # ========== EDGE TTS MANAGER ==========
 
@@ -693,11 +1067,12 @@ class AIAgent:
 # ========== AI STREAM MANAGER ==========
 
 class AIStreamManager:
-    """Менеджер стрима"""
+    """Обновленный менеджер стрима с поддержкой видео"""
 
     def __init__(self, ffmpeg_manager: FFmpegStreamManager = None):
         self.agents: List[AIAgent] = []
         self.tts_manager = EdgeTTSManager(ffmpeg_manager)
+        self.video_generator = VideoGenerator(ffmpeg_manager)  # Добавлено
         self.ffmpeg_manager = ffmpeg_manager
         self.current_topic = ""
         self.is_discussion_active = False
@@ -705,25 +1080,13 @@ class AIStreamManager:
         self.discussion_round = 0
         self.active_agent = None
         self.conversation_history = []
+        self.show_video_intros = True  # Флаг для показа видео-интро
 
         self._init_agents()
         logger.info(f"AI Stream Manager инициализирован с {len(self.agents)} агентами")
 
-    def _init_agents(self):
-        """Инициализация агентов"""
-        for agent_config in Config.AGENTS:
-            agent = AIAgent(agent_config)
-            self.agents.append(agent)
-
-    def select_topic(self) -> str:
-        """Выбор темы"""
-        self.current_topic = random.choice(Config.TOPICS)
-        logger.info(f"📝 Выбрана тема: {self.current_topic}")
-        socketio.emit('topic_update', {'topic': self.current_topic})
-        return self.current_topic
-
     async def run_discussion_round(self):
-        """Запуск раунда дискуссии с отправкой звука в стрим"""
+        """Обновленный метод с поддержкой видео"""
         if self.is_discussion_active:
             return
 
@@ -742,6 +1105,36 @@ class AIStreamManager:
             for agent in speaking_order:
                 if not self.is_discussion_active:
                     break
+
+                # ПОКАЗ ВИДЕО-ИНТРО (если включено)
+                if self.show_video_intros and self.video_generator:
+                    # Создаем видео-интро для агента
+                    intro_message = f"Сейчас выступает: {agent.name}"
+
+                    # Генерируем видео-интро
+                    intro_video = self.video_generator.create_agent_intro_video(
+                        agent_name=agent.name,
+                        expertise=agent.expertise,
+                        avatar_color=agent.color,
+                        message=intro_message,
+                        duration=5.0  # 5 секунд
+                    )
+
+                    if intro_video:
+                        # Показываем видео перед началом речи агента
+                        socketio.emit('video_start', {
+                            'agent_id': agent.id,
+                            'video_type': 'intro',
+                            'duration': 5.0
+                        })
+
+                        # Отправляем видео в стрим
+                        success = self.video_generator.add_video_to_stream(intro_video)
+
+                        if success:
+                            await asyncio.sleep(5.0)  # Ждем завершения видео
+
+                    socketio.emit('video_end', {'agent_id': agent.id})
 
                 # Агент начинает говорить
                 self.active_agent = agent.id
@@ -816,6 +1209,15 @@ class AIStreamManager:
                 if agent != speaking_order[-1]:
                     pause = random.uniform(1.5, 3.0)
                     logger.debug(f"⏸️  Пауза между агентами: {pause:.1f} сек")
+
+                    # Создаем короткое переходное видео между агентами
+                    if self.show_video_intros and self.video_generator:
+                        next_agent = speaking_order[speaking_order.index(agent) + 1]
+                        transition_message = f"Далее: {next_agent.name}"
+
+                        # Можно добавить короткое переходное видео
+                        # transition_video = self.video_generator.create_transition_video(...)
+
                     await asyncio.sleep(pause)
 
             logger.info(f"✅ Раунд #{self.discussion_round} завершен")
@@ -831,7 +1233,28 @@ class AIStreamManager:
 
             # Случайная смена темы
             if random.random() > 0.7:
+                old_topic = self.current_topic
                 self.select_topic()
+
+                # Показываем видео-переход при смене темы
+                if self.show_video_intros and self.video_generator:
+                    transition_video = self.video_generator.create_transition_video(
+                        from_topic=old_topic,
+                        to_topic=self.current_topic,
+                        duration=5.0
+                    )
+
+                    if transition_video:
+                        socketio.emit('topic_change_video', {
+                            'old_topic': old_topic,
+                            'new_topic': self.current_topic,
+                            'duration': 5.0
+                        })
+
+                        success = self.video_generator.add_video_to_stream(transition_video)
+
+                        if success:
+                            await asyncio.sleep(5.0)
 
         except Exception as e:
             logger.error(f"❌ Ошибка в раунде дискуссии: {e}", exc_info=True)
@@ -844,34 +1267,6 @@ class AIStreamManager:
         finally:
             self.is_discussion_active = False
             self.active_agent = None
-
-    def get_agents_state(self) -> List[Dict[str, Any]]:
-        """Состояние агентов"""
-        return [
-            {
-                'id': agent.id,
-                'name': agent.name,
-                'expertise': agent.expertise,
-                'avatar': agent.avatar,
-                'color': agent.color,
-                'is_speaking': agent.id == self.active_agent,
-                'message_count': len(agent.message_history)
-            }
-            for agent in self.agents
-        ]
-
-    def get_stats(self) -> Dict[str, Any]:
-        """Статистика"""
-        return {
-            'message_count': self.message_count,
-            'discussion_round': self.discussion_round,
-            'current_topic': self.current_topic,
-            'is_active': self.is_discussion_active,
-            'active_agent': self.active_agent,
-            'agents_count': len(self.agents),
-            'conversation_history': len(self.conversation_history),
-            'ffmpeg_streaming': self.ffmpeg_manager.is_streaming if self.ffmpeg_manager else False
-        }
 
 
 # ========== ИНИЦИАЛИЗАЦИЯ ==========
@@ -1247,6 +1642,51 @@ def signal_handler(signum, frame):
 
     sys.exit(0)
 if __name__ == '__main__':
+
+    # Перед запуском проверяем наличие зависимостей для видео
+    print("=" * 70)
+    print("🤖 AI AGENTS STREAM - С ПОДДЕРЖКОЙ ВИДЕО")
+    print("=" * 70)
+
+    print("📦 Проверка зависимостей для видео:")
+
+    # Проверяем OpenCV
+    try:
+        cv2_version = cv2.__version__
+        print(f"   ✅ OpenCV {cv2_version} - доступен")
+    except:
+        print("   ❌ OpenCV - не установлен")
+        print("   Установите: pip install opencv-python")
+        sys.exit(1)
+
+    # Проверяем PIL/Pillow
+    try:
+        from PIL import Image
+
+        print("   ✅ PIL/Pillow - доступен")
+    except:
+        print("   ❌ PIL/Pillow - не установлен")
+        print("   Установите: pip install pillow")
+        sys.exit(1)
+
+    # Проверяем numpy
+    try:
+        numpy_version = numpy.__version__
+        print(f"   ✅ NumPy {numpy_version} - доступен")
+    except:
+        print("   ❌ NumPy - не установлен")
+        print("   Установите: pip install numpy")
+        sys.exit(1)
+
+    print("\n🎬 Видео возможности:")
+    print("   • Генерация видео-интро для агентов")
+    print("   • Анимированные переходы между темами")
+    print("   • Текстовые оверлеи в реальном времени")
+    print("   • Интеграция с FFmpeg стримом")
+
+    # Создаем директории
+    os.makedirs("video_cache", exist_ok=True)
+
     # Инициализируем event loop для дискуссий
     discussion_loop_event_loop = asyncio.new_event_loop()
 

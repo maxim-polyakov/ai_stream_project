@@ -113,32 +113,29 @@ class FFmpegStreamManager:
         self.is_playing_video = False
         self.video_processor_thread = None
 
-        self.current_video_file = None
-        self.video_position = 0
-        self.video_duration = 0
-        self.video_start_time = 0
+        # Видео из кэша
+        self.video_cache_dir = 'video_cache'
+        os.makedirs(self.video_cache_dir, exist_ok=True)
+        self.active_video_source = None
+        self.video_source_lock = threading.Lock()
 
-        # Конфигурация аудио
+        # Конфигурация
         self.audio_sample_rate = 44100
         self.audio_channels = 2
         self.audio_format = 's16le'
         self.bytes_per_sample = 2
 
-        # Конфигурация видео
         self.video_width = 1920
         self.video_height = 1080
         self.video_fps = 30
         self.video_bitrate = '4500k'
 
         # Для генерации тишины
-        self.silence_chunk_duration = 0.1  # 100ms
+        self.silence_chunk_duration = 0.1
         self.silence_chunk_size = int(self.audio_sample_rate * self.audio_channels *
                                       self.bytes_per_sample * self.silence_chunk_duration)
 
-        # Текущий источник видео
-        self.current_video_source = "color=size=1920x1080:rate=30:color=black"
-
-        logger.info("FFmpeg Stream Manager с поддержкой видео инициализирован")
+        logger.info("FFmpeg Stream Manager с загрузкой видео из кэша инициализирован")
 
     def set_stream_key(self, stream_key: str) -> bool:
         """Установка ключа стрима"""
@@ -395,11 +392,10 @@ class FFmpegStreamManager:
 
         while self.is_streaming and self.ffmpeg_stdin:
             try:
-                # Если есть аудио в очереди - воспроизводим его
                 if self.audio_queue:
                     self.is_playing_audio = True
                     audio_file = self.audio_queue.pop(0)
-                    logger.info(f"🎵 Начинаем воспроизведение аудио: {os.path.basename(audio_file)}")
+                    logger.info(f"🎵 Воспроизведение аудио: {os.path.basename(audio_file)}")
 
                     # Подготавливаем файл
                     prepared_file = self._prepare_audio_file(audio_file)
@@ -587,8 +583,80 @@ class FFmpegStreamManager:
             logger.error(f"❌ Ошибка смены видео: {e}")
             return False
 
+    def _get_dynamic_video_source(self) -> str:
+        """Получение динамического видео источника"""
+        with self.video_source_lock:
+            if self.active_video_source and os.path.exists(self.active_video_source):
+                video_info = self._get_video_info(self.active_video_source)
+                if video_info and video_info.get('duration', 0) > 0:
+                    # Используем активное видео
+                    return self.active_video_source
+
+        # Если нет активного видео, используем динамический фильтр
+        with self.video_source_lock:
+            current_video = self.active_video_source
+            filter_str = self._create_video_source_filter(current_video)
+
+        return f"lavfi -i {filter_str}"
+
+    def add_video_from_cache(self, video_filename: str, duration: float = None) -> bool:
+        """Добавление видео из кэша в стрим"""
+        video_path = os.path.join(self.video_cache_dir, video_filename)
+
+        if not os.path.exists(video_path):
+            logger.error(f"❌ Видео файл не найден в кэше: {video_filename}")
+            return False
+
+        # Получаем информацию о видео
+        video_info = self._get_video_info(video_path)
+        if not video_info:
+            logger.error(f"❌ Не удалось получить информацию о видео: {video_filename}")
+            return False
+
+        # Определяем длительность
+        actual_duration = duration or video_info.get('duration', 5.0)
+
+        with self.video_source_lock:
+            # Устанавливаем активное видео
+            self.active_video_source = video_path
+            logger.info(f"🎬 Видео из кэша установлено: {video_filename} ({actual_duration:.1f} сек)")
+
+            # Отправляем событие в WebSocket
+            socketio.emit('video_changed', {
+                'video_file': video_filename,
+                'duration': actual_duration,
+                'timestamp': datetime.now().isoformat()
+            })
+
+        return True
+
+    def _get_video_from_cache(self, filename: str) -> Optional[str]:
+        """Получение видео файла из кэша"""
+        cache_path = os.path.join(self.video_cache_dir, filename)
+        if os.path.exists(cache_path):
+            return cache_path
+        return None
+
+    def _create_video_source_filter(self, video_path: str = None) -> str:
+        """Создание фильтра для видео источника"""
+        if not video_path:
+            # Черный экран с текстом по умолчанию
+            return (
+                "color=size=1920x1080:rate=30:color=black,"
+                "drawtext=text='AI Agents Discussion':fontcolor=white:fontsize=48:x=(w-text_w)/2:y=50,"
+                "format=yuv420p"
+            )
+        else:
+            # Видео из файла с возможностью циклического воспроизведения
+            return (
+                f"movie='{video_path}':loop=0:setpts=N/FRAME_RATE/TB[vid];"
+                "color=size=1920x1080:rate=30:color=black[bg];"
+                "[bg][vid]overlay=(W-w)/2:(H-h)/2:shortest=1,"
+                "format=yuv420p"
+            )
+
     def start_stream(self, use_audio: bool = True):
-        """Запуск FFmpeg стрима с поддержкой видео файлов"""
+        """Запуск FFmpeg стрима с динамической загрузкой видео из кэша"""
         if not self.stream_key:
             logger.error("❌ Stream Key не установлен!")
             return {'success': False, 'error': 'Stream Key не установлен'}
@@ -601,41 +669,37 @@ class FFmpegStreamManager:
             self.video_queue = []
             self.is_playing_audio = False
             self.is_playing_video = False
-            self.current_video_file = None
+            self.active_video_source = None
 
-            # Определяем основной источник видео
-            # Если есть видео в очереди - используем его, иначе черный экран
-            video_source = "color=size=1920x1080:rate=30:color=black"
-
-            if self.video_queue:
-                video_item = self.video_queue[0]
-                video_path = video_item['path']
-
-                # Используем видео как основной источник
-                video_source = f"movie='{video_path}':loop=0:setpts=N/FRAME_RATE/TB"
-                self.current_video_file = video_path
-                self.video_duration = video_item['duration']
-                self.video_start_time = time.time()
-                logger.info(f"🎬 Используем видео как источник: {os.path.basename(video_path)}")
+            # Получаем динамический видео источник
+            video_source = self._get_dynamic_video_source()
 
             # Команда FFmpeg с динамическим видео источником
             ffmpeg_cmd = [
                 'ffmpeg',
-                '-re',  # Реальное время
+                '-re',
                 '-fflags', '+genpts',
+            ]
 
-                # ДИНАМИЧЕСКИЙ ВИДЕО ИСТОЧНИК
-                '-f', 'lavfi',
-                '-i', video_source,
+            # Если video_source это путь к файлу
+            if video_source and os.path.exists(video_source):
+                ffmpeg_cmd.extend(['-i', video_source])
+            else:
+                # Или фильтр lavfi
+                ffmpeg_cmd.extend(['-f', 'lavfi', '-i', video_source])
 
-                # Аудио источник через stdin
+            # Аудио источник через stdin
+            ffmpeg_cmd.extend([
                 '-f', 's16le',
                 '-ar', str(self.audio_sample_rate),
                 '-ac', str(self.audio_channels),
                 '-channel_layout', 'stereo',
                 '-i', 'pipe:0',
+            ])
 
-                # Видео настройки
+            # Видео настройки
+            ffmpeg_cmd.extend([
+                '-map', '0:v',
                 '-c:v', 'libx264',
                 '-preset', 'veryfast',
                 '-tune', 'zerolatency',
@@ -646,22 +710,27 @@ class FFmpegStreamManager:
                 '-bufsize', '9000k',
                 '-r', '30',
                 '-x264-params', 'keyint=60:min-keyint=60:scenecut=0',
+            ])
 
-                # Аудио настройки
+            # Аудио настройки
+            ffmpeg_cmd.extend([
+                '-map', '1:a',
                 '-c:a', 'aac',
                 '-b:a', '128k',
                 '-ar', '44100',
                 '-ac', '2',
                 '-acodec', 'aac',
+            ])
 
-                # Вывод
+            # Вывод
+            ffmpeg_cmd.extend([
                 '-f', 'flv',
                 '-flvflags', 'no_duration_filesize',
                 self.rtmp_url
-            ]
+            ])
 
             logger.info(f"🚀 Запуск FFmpeg стрима")
-            logger.debug(f"Видео источник: {video_source}")
+            logger.debug(f"Команда: {' '.join(ffmpeg_cmd)}")
 
             # Запускаем FFmpeg
             self.stream_process = subprocess.Popen(
@@ -689,9 +758,9 @@ class FFmpegStreamManager:
             )
             self.audio_processor_thread.start()
 
-            # Запускаем видео процессор
+            # Запускаем видео процессор для динамической смены видео
             self.video_processor_thread = threading.Thread(
-                target=self._video_stream_processor,
+                target=self._dynamic_video_processor,
                 daemon=True
             )
             self.video_processor_thread.start()
@@ -699,7 +768,7 @@ class FFmpegStreamManager:
             socketio.emit('stream_started', {
                 'pid': self.ffmpeg_pid,
                 'rtmp_url': self.rtmp_url,
-                'has_video': bool(self.current_video_file)
+                'has_video': bool(self.active_video_source)
             })
 
             return {'success': True, 'pid': self.ffmpeg_pid}
@@ -708,6 +777,132 @@ class FFmpegStreamManager:
             logger.error(f"❌ Ошибка запуска FFmpeg: {e}", exc_info=True)
             self.is_streaming = False
             return {'success': False, 'error': str(e)}
+
+    def _dynamic_video_processor(self):
+        """Процессор для динамической смены видео во время стрима"""
+        logger.info("🎬 Запуск динамического видео процессора")
+
+        # Проверяем кэш на наличие видео файлов
+        self._scan_video_cache()
+
+        # Создаем очередь видео из кэша
+        video_files = []
+        for filename in os.listdir(self.video_cache_dir):
+            if filename.endswith(('.mp4', '.mov', '.avi', '.mkv')):
+                video_path = os.path.join(self.video_cache_dir, filename)
+                video_files.append({
+                    'path': video_path,
+                    'filename': filename,
+                    'info': self._get_video_info(video_path)
+                })
+
+        if not video_files:
+            logger.warning("⚠️ В кэше нет видео файлов")
+            return
+
+        # Случайный порядок воспроизведения
+        random.shuffle(video_files)
+
+        while self.is_streaming:
+            try:
+                for video_item in video_files:
+                    if not self.is_streaming:
+                        break
+
+                    video_path = video_item['path']
+                    filename = video_item['filename']
+                    video_info = video_item['info']
+
+                    if not video_info:
+                        continue
+
+                    duration = video_info.get('duration', 10.0)
+
+                    logger.info(f"🎬 Показываем видео из кэша: {filename} ({duration:.1f} сек)")
+
+                    # Устанавливаем активное видео
+                    with self.video_source_lock:
+                        self.active_video_source = video_path
+
+                    # Отправляем уведомление
+                    socketio.emit('video_playing', {
+                        'filename': filename,
+                        'duration': duration,
+                        'timestamp': datetime.now().isoformat()
+                    })
+
+                    # Ждем пока видео воспроизведется
+                    time_to_sleep = duration + 1  # +1 секунда на переключение
+
+                    for _ in range(int(time_to_sleep * 10)):
+                        if not self.is_streaming:
+                            break
+                        time.sleep(0.1)
+
+                    # Перерыв между видео
+                    if self.is_streaming:
+                        pause = random.uniform(2.0, 5.0)
+                        time.sleep(pause)
+
+                # После прохождения всех видео - перемешиваем снова
+                random.shuffle(video_files)
+
+            except Exception as e:
+                logger.error(f"❌ Ошибка в видео процессоре: {e}", exc_info=True)
+                time.sleep(1)
+
+        logger.info("🛑 Динамический видео процессор остановлен")
+
+    def _scan_video_cache(self):
+        """Сканирование директории кэша видео"""
+        try:
+            if not os.path.exists(self.video_cache_dir):
+                os.makedirs(self.video_cache_dir, exist_ok=True)
+
+            video_files = [f for f in os.listdir(self.video_cache_dir)
+                           if f.endswith(('.mp4', '.mov', '.avi', '.mkv'))]
+
+            logger.info(f"📂 Найдено видео в кэше: {len(video_files)} файлов")
+
+            for filename in video_files:
+                file_path = os.path.join(self.video_cache_dir, filename)
+                file_size = os.path.getsize(file_path) / (1024 * 1024)  # MB
+                logger.info(f"  - {filename}: {file_size:.1f} MB")
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка сканирования кэша: {e}")
+
+    def show_video_from_cache(self, filename: str) -> bool:
+        """Немедленный показ видео из кэша"""
+        if not self.is_streaming:
+            logger.error("❌ Стрим не активен")
+            return False
+
+        video_path = os.path.join(self.video_cache_dir, filename)
+
+        if not os.path.exists(video_path):
+            logger.error(f"❌ Видео не найдено в кэше: {filename}")
+            return False
+
+        # Получаем информацию о видео
+        video_info = self._get_video_info(video_path)
+        if not video_info:
+            return False
+
+        duration = video_info.get('duration', 10.0)
+
+        with self.video_source_lock:
+            self.active_video_source = video_path
+
+        logger.info(f"🎬 Немедленный показ видео: {filename} ({duration:.1f} сек)")
+
+        socketio.emit('video_immediate', {
+            'filename': filename,
+            'duration': duration,
+            'timestamp': datetime.now().isoformat()
+        })
+
+        return True
 
     def _monitor_ffmpeg(self):
         """Мониторинг процесса FFmpeg"""

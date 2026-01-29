@@ -1426,31 +1426,19 @@ class FFmpegStreamManager:
             # Без сложных параметров, самый простой overlay
             ffmpeg_cmd = [
                 'ffmpeg',
-
-                # Вход 1: Дефолтное видео (фон, зациклен)
                 '-re',
                 '-stream_loop', '-1',
                 '-i', default_video,
-
-                # Вход 2: Текущее активное видео (будет меняться)
                 '-i', self.current_video_file,
-
-                # Вход 3: Аудио через stdin
                 '-f', 's16le',
                 '-ar', str(self.audio_sample_rate),
                 '-ac', str(self.audio_channels),
                 '-channel_layout', 'stereo',
                 '-i', 'pipe:0',
-
-                # Ключевое изменение: overlay с eof_action=pass и shortest=0
                 '-filter_complex',
-                f"""[0:v][1:v]overlay=eof_action=pass:shortest=0[outv]""",
-
-                # Карты
+                '[0:v][1:v]overlay=eof_action=pass:shortest=1[outv]',
                 '-map', '[outv]',
                 '-map', '2:a:0',
-
-                # Кодирование видео
                 '-c:v', 'libx264',
                 '-preset', 'veryfast',
                 '-tune', 'zerolatency',
@@ -1461,20 +1449,13 @@ class FFmpegStreamManager:
                 '-bufsize', '9000k',
                 '-r', str(self.video_fps),
                 '-x264-params', 'keyint=60:min-keyint=60:scenecut=0',
-
-                # Кодирование аудио
                 '-c:a', 'aac',
                 '-b:a', '128k',
                 '-ar', '44100',
                 '-ac', '2',
-
-                # Формат вывода
                 '-f', 'flv',
                 '-flvflags', 'no_duration_filesize',
-
-                # Логирование для отладки
                 '-loglevel', 'verbose',
-
                 self.rtmp_url
             ]
 

@@ -1561,52 +1561,56 @@ class FFmpegStreamManager:
                 audio_map = ['-map', '1:a:0']
                 logger.info(f"🎵 Добавляю аудио к видео: {os.path.basename(audio_file)}")
 
-            # Команда для создания MPEG-TS потока
+            # Команда для создания MPEG-TS потока - ПРАВИЛЬНАЯ СТРУКТУРА:
             mpegts_cmd = [
                 'ffmpeg',
                 '-re',  # Реальное время
                 '-i', video_path,
             ]
 
+            # Добавляем аудио источник ВТОРЫМ
             if audio_input:
                 mpegts_cmd.extend(audio_input)
-
-            mpegts_cmd.extend([
-                '-t', str(duration),
-                '-c:v', 'libx264',
-                '-preset', 'ultrafast',
-                '-tune', 'zerolatency',
-                '-pix_fmt', 'yuv420p',
-                '-b:v', '3000k',
-                '-maxrate', '3000k',
-                '-bufsize', '6000k',
-                '-r', str(self.video_fps),
-                '-g', '30',
-            ])
-
-            # Карты: видео всегда с первого входа
-            mpegts_cmd.extend(['-map', '0:v:0'])
-
-            # Если есть аудио, добавляем его карту
-            if audio_map:
-                mpegts_cmd.extend(audio_map)
+                # Карты: видео с первого входа, аудио со второго
                 mpegts_cmd.extend([
+                    '-map', '0:v:0',
+                    '-map', '1:a:0',
+                    '-c:v', 'libx264',
+                    '-preset', 'ultrafast',
+                    '-tune', 'zerolatency',
+                    '-pix_fmt', 'yuv420p',
+                    '-b:v', '3000k',
+                    '-maxrate', '3000k',
+                    '-bufsize', '6000k',
+                    '-r', str(self.video_fps),
+                    '-g', '30',
                     '-c:a', 'aac',
                     '-b:a', '128k',
-                    '-ar', '44100',
-                    '-ac', '2',
                 ])
             else:
-                # Или добавляем тишину
+                # Если нет аудио - добавляем тихое аудио через lavfi
+                # ВАЖНО: lavfi источник должен быть ОТДЕЛЬНЫМ входом
                 mpegts_cmd.extend([
                     '-f', 'lavfi',
                     '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+                    '-map', '0:v:0',
                     '-map', '1:a:0',
+                    '-c:v', 'libx264',
+                    '-preset', 'ultrafast',
+                    '-tune', 'zerolatency',
+                    '-pix_fmt', 'yuv420p',
+                    '-b:v', '3000k',
+                    '-maxrate', '3000k',
+                    '-bufsize', '6000k',
+                    '-r', str(self.video_fps),
+                    '-g', '30',
                     '-c:a', 'aac',
                     '-b:a', '128k',
                 ])
 
+            # Общие параметры
             mpegts_cmd.extend([
+                '-t', str(duration),
                 '-f', 'mpegts',
                 '-muxdelay', '0',
                 '-muxpreload', '0',
@@ -1658,10 +1662,9 @@ class FFmpegStreamManager:
             success = self._send_mpegts_file(temp_mpegts.name, duration)
 
             # Удаляем обработанное аудио если оно было использовано
-            if audio_input and success:
+            if audio_input and success and self.audio_queue:
                 # Удаляем использованное аудио из очереди
-                if self.audio_queue:
-                    self.audio_queue.pop(0)
+                self.audio_queue.pop(0)
 
             # Очищаем временный файл
             if os.path.exists(temp_mpegts.name):

@@ -678,12 +678,13 @@ class FFmpegStreamManager:
                 '-fflags', '+genpts',
             ]
 
-            # Если video_source это путь к файлу
-            if video_source and os.path.exists(video_source):
-                ffmpeg_cmd.extend(['-i', video_source])
-            else:
-                # Или фильтр lavfi
+            # Проверяем, является ли источник фильтром lavfi
+            if video_source.startswith('color=') or '=' in video_source and not os.path.exists(video_source):
+                # Это фильтр lavfi
                 ffmpeg_cmd.extend(['-f', 'lavfi', '-i', video_source])
+            else:
+                # Это путь к файлу
+                ffmpeg_cmd.extend(['-i', video_source])
 
             # Аудио источник через stdin
             ffmpeg_cmd.extend([

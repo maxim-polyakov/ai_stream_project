@@ -138,6 +138,100 @@ class FFmpegStreamManager:
 
         logger.info("FFmpeg Stream Manager с единым процессом инициализирован")
 
+    def add_video_from_cache(self, filename: str, duration: float = None) -> bool:
+        """
+        Добавление видео файла из кэша в очередь воспроизведения на стриме
+
+        Args:
+            filename: Имя файла видео в директории video_cache
+            duration: Опциональная длительность видео в секундах.
+                      Если не указана, будет получена из файла.
+
+        Returns:
+            bool: True если видео успешно добавлено в очередь, False в случае ошибки
+        """
+        try:
+            # Проверяем, что файл существует в кэше
+            video_path = os.path.join(self.video_cache_dir, filename)
+
+            if not os.path.exists(video_path):
+                logger.error(f"❌ Видео файл не найден в кэше: {filename}")
+                logger.error(f"   Искали по пути: {video_path}")
+                logger.error(f"   Содержимое кэша: {os.listdir(self.video_cache_dir)[:10]}...")
+                return False
+
+            logger.info(f"📁 Найден видео файл в кэше: {filename}")
+
+            # Получаем техническую информацию о видео файле
+            video_info = self._get_video_info(video_path)
+            if not video_info:
+                logger.error(f"❌ Не удалось получить информацию о видео файле: {filename}")
+                return False
+
+            # Определяем длительность видео
+            if duration is not None:
+                # Используем предоставленную длительность
+                actual_duration = float(duration)
+                logger.info(f"⏱️  Используем указанную длительность: {actual_duration:.1f} сек")
+            else:
+                # Используем длительность из файла
+                actual_duration = video_info.get('duration', 10.0)
+                logger.info(f"⏱️  Длительность из файла: {actual_duration:.1f} сек")
+
+            # Минимальная и максимальная длительность для безопасности
+            actual_duration = max(1.0, min(actual_duration, 300.0))  # От 1 до 300 секунд
+
+            # Создаем запись о видео для очереди
+            video_item = {
+                'path': video_path,
+                'filename': filename,
+                'duration': actual_duration,
+                'info': video_info,
+                'added_time': datetime.now().isoformat(),
+                'status': 'queued'
+            }
+
+            # Добавляем видео в очередь воспроизведения
+            self.video_queue.append(video_item)
+
+            # Обновляем статус в логах
+            logger.info(f"✅ Видео добавлено в очередь стрима:")
+            logger.info(f"   📝 Файл: {filename}")
+            logger.info(f"   ⏱️  Длительность: {actual_duration:.1f} сек")
+            logger.info(f"   📊 Размер: {os.path.getsize(video_path) / (1024 * 1024):.1f} MB")
+            logger.info(f"   📏 Разрешение: {video_info.get('width', '?')}x{video_info.get('height', '?')}")
+            logger.info(f"   🎞️  FPS: {video_info.get('fps', '?')}")
+            logger.info(f"   🗂️  Позиция в очереди: #{len(self.video_queue)}")
+
+            # Отправляем уведомление через WebSocket
+            socketio.emit('video_queued', {
+                'filename': filename,
+                'duration': actual_duration,
+                'queue_position': len(self.video_queue),
+                'total_in_queue': len(self.video_queue),
+                'video_info': {
+                    'width': video_info.get('width', 0),
+                    'height': video_info.get('height', 0),
+                    'fps': video_info.get('fps', 0),
+                    'codec': video_info.get('codec', 'unknown'),
+                    'file_size_mb': round(os.path.getsize(video_path) / (1024 * 1024), 1)
+                },
+                'added_time': datetime.now().isoformat()
+            })
+
+            # Проверяем, запущен ли видео процессор
+            if not hasattr(self, 'video_processor_thread') or not self.video_processor_thread.is_alive():
+                logger.warning(
+                    "⚠️ Видео процессор не запущен. Видео будет воспроизводиться когда процессор запустится.")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Критическая ошибка при добавлении видео из кэша: {e}")
+            logger.error(f"   Тип ошибки: {type(e).__name__}")
+            logger.error(f"   Детали: {str(e)}")
+            return False
+        
     def set_stream_key(self, stream_key: str) -> bool:
         """Установка ключа стрима"""
         self.stream_key = stream_key

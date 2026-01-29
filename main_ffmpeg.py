@@ -1102,15 +1102,15 @@ class FFmpegStreamManager:
             # Инициализируем concat файл с дефолтным видео
             self._init_concat_file(concat_list_path, default_video)
 
-            # ЕДИНАЯ команда FFmpeg с concat демаксером
+            # ВАЖНО: БЕЗ stream_loop, чтобы FFmpeg читал concat файл до конца
             ffmpeg_cmd = [
                 'ffmpeg',
 
                 # Вход 1: Concat демаксер для динамического видео
-                '-re',
+                '-re',  # Реальное время
                 '-f', 'concat',
                 '-safe', '0',
-                '-stream_loop', '-1',  # Зацикливаем список
+                # УБРАЛИ: '-stream_loop', '-1',  # НЕ зацикливаем!
                 '-i', concat_list_path,
 
                 # Вход 2: Аудио через stdin (сырой PCM)
@@ -1146,11 +1146,15 @@ class FFmpegStreamManager:
                 '-f', 'flv',
                 '-flvflags', 'no_duration_filesize',
 
+                # Логирование для отладки
+                '-loglevel', 'info',
+
                 self.rtmp_url
             ]
 
-            logger.info(f"🚀 Запуск FFmpeg с concat демаксером")
+            logger.info(f"🚀 Запуск FFmpeg с динамическим concat")
             logger.info(f"📋 Concat файл: {concat_list_path}")
+            logger.info(f"🎬 Первое видео: {os.path.basename(default_video)}")
 
             # Запускаем FFmpeg процесс
             self.stream_process = subprocess.Popen(
@@ -1165,6 +1169,7 @@ class FFmpegStreamManager:
             self.is_streaming = True
             self.ffmpeg_pid = self.stream_process.pid
             self.ffmpeg_stdin = self.stream_process.stdin
+            self.concat_file_lock = threading.Lock()
 
             logger.info(f"✅ FFmpeg запущен (PID: {self.ffmpeg_pid})")
 
@@ -1188,8 +1193,7 @@ class FFmpegStreamManager:
                 'rtmp_url': self.rtmp_url,
                 'has_video': True,
                 'has_audio': True,
-                'concat_mode': True,
-                'concat_file': concat_list_path
+                'concat_mode': True
             })
 
             return {'success': True, 'pid': self.ffmpeg_pid}

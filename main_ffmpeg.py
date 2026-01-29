@@ -675,7 +675,7 @@ class FFmpegStreamManager:
             self.video_queue = []
             self.is_playing_audio = False
             self.is_playing_video = False
-            self.active_video_source = None
+            self.active_video_source = Nonec
 
             # Получаем динамический видео источник
             video_source = self._get_dynamic_video_source()
@@ -2070,9 +2070,9 @@ class AIStreamManager:
                         # Создаем переходное видео через VideoGenerator
                         transition_video = await asyncio.to_thread(
                             self.video_generator.create_transition_video,
-                            from_topic=agent.name,
-                            to_topic=next_agent.name,
-                            duration=pause
+                            f"{agent.name} закончил(а)",  # from_text
+                            self.current_topic,  # to_text
+                            3.0  # duration
                         )
 
                         if transition_video and hasattr(self.ffmpeg_manager, 'show_video_from_cache'):
@@ -2100,10 +2100,11 @@ class AIStreamManager:
                 if self.show_video_intros:
                     # Создаем тематическое переходное видео
                     topic_video = await asyncio.to_thread(
-                        self.video_generator.create_transition_video,
-                        from_topic=old_topic,
-                        to_topic=self.current_topic,
-                        duration=5.0
+                        lambda: self.video_generator.create_transition_video(
+                            from_text=old_topic,
+                            to_text=self.current_topic,
+                            duration=5.0
+                        )
                     )
 
                     if topic_video:

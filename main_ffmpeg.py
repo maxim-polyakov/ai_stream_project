@@ -675,7 +675,7 @@ class FFmpegStreamManager:
             self.video_queue = []
             self.is_playing_audio = False
             self.is_playing_video = False
-            self.active_video_source = Nonec
+            self.active_video_source = None
 
             # Получаем динамический видео источник
             video_source = self._get_dynamic_video_source()

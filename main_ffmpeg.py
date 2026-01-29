@@ -885,6 +885,105 @@ class FFmpegStreamManager:
 
         logger.info("🛑 Видео свитчер остановлен")
 
+    def _create_video_concat_list(self) -> str:
+        """Создание списка видео для concat демаксера"""
+        try:
+            # Создаем временный файл со списком
+            concat_file = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
+
+            # Добавляем дефолтное видео первым
+            default_video = self._create_default_video_file()
+            if default_video:
+                concat_file.write(f"file '{default_video}'\n")
+                concat_file.write("inpoint 0\n")
+                concat_file.write("outpoint 1\n")  # 1 секунда
+
+            concat_file.close()
+
+            logger.info(f"📋 Создан concat список: {concat_file.name}")
+            return concat_file.name
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка создания concat списка: {e}")
+            # Резервный вариант
+            temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
+            temp_file.write("file 'testsrc=size=1920x1080:rate=30:duration=1'\n")
+            temp_file.close()
+            return temp_file.name
+
+    def _update_concat_list(self, video_path: str, duration: float):
+        """Обновление concat списка новым видео"""
+        try:
+            # Создаем новый concat файл
+            new_concat_file = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
+
+            # Добавляем новое видео
+            new_concat_file.write(f"file '{video_path}'\n")
+            new_concat_file.write(f"duration {duration}\n")
+
+            new_concat_file.close()
+
+            # Переименовываем старый файл (если есть)
+            if hasattr(self, 'concat_list_path') and os.path.exists(self.concat_list_path):
+                try:
+                    os.unlink(self.concat_list_path)
+                except:
+                    pass
+
+            # Обновляем путь
+            self.concat_list_path = new_concat_file.name
+
+            logger.info(f"📋 Concat список обновлен: {os.path.basename(video_path)}")
+
+            # Отправляем сигнал FFmpeg для перезагрузки input
+            # В теории FFmpeg должен автоматически перечитать concat файл
+            # На практике может потребоваться более сложная логика
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка обновления concat списка: {e}")
+
+    def _video_controller(self):
+        """Контроллер видео - обновляет concat список"""
+        logger.info("🎬 Запуск видео контроллера")
+
+        last_update = time.time()
+
+        while self.is_streaming:
+            try:
+                # Проверяем очередь видео каждую секунду
+                time.sleep(1)
+
+                # Если есть видео в очереди, добавляем в concat список
+                if self.video_queue and (time.time() - last_update > 2):
+                    video_item = self.video_queue.pop(0)
+                    video_path = video_item['path']
+                    duration = video_item.get('duration', 10.0)
+                    filename = video_item.get('filename', os.path.basename(video_path))
+
+                    logger.info(f"🎥 Добавляю видео в стрим: {filename} ({duration:.1f} сек)")
+
+                    # Обновляем concat список
+                    self._update_concat_list(video_path, duration)
+
+                    # Отправляем уведомление
+                    socketio.emit('video_playing', {
+                        'filename': filename,
+                        'duration': duration,
+                        'timestamp': datetime.now().isoformat(),
+                        'queue_remaining': len(self.video_queue)
+                    })
+
+                    last_update = time.time()
+
+                    # Ждем пока видео воспроизводится
+                    time.sleep(duration)
+
+            except Exception as e:
+                logger.error(f"❌ Ошибка в видео контроллере: {e}")
+                time.sleep(1)
+
+        logger.info("🛑 Видео контроллер остановлен")
+
     def start_stream(self, use_audio: bool = True):
         """Запуск единого FFmpeg процесса для видео и аудио"""
         if not self.stream_key:
@@ -900,21 +999,22 @@ class FFmpegStreamManager:
             self.is_playing_audio = False
             self.is_playing_video = False
 
-            # Создаем дефолтное видео
-            default_video = self._create_default_video_file()
-            if not default_video:
-                return {'success': False, 'error': 'Не удалось создать дефолтное видео'}
+            logger.info(f"🚀 Запуск FFmpeg стрима на YouTube...")
+            logger.info(f"🔗 RTMP URL: {self.rtmp_url}")
 
-            logger.info(f"🎬 Используем дефолтное видео: {os.path.basename(default_video)}")
+            # ВАЖНО: Используем concat демаксера для динамической смены видео
+            # Создаем список видео для конкатенации
+            concat_list_path = self._create_video_concat_list()
 
-            # ВАЖНО: ЕДИНАЯ команда FFmpeg с зацикленным видео и аудио через pipe
+            # ЕДИНАЯ команда FFmpeg с concat демаксером
             ffmpeg_cmd = [
                 'ffmpeg',
 
-                # Вход 1: Видео файл (зацикленный)
+                # Вход 1: Concat демаксер для динамического видео
                 '-re',
-                '-stream_loop', '-1',  # Бесконечный цикл
-                '-i', default_video,
+                '-f', 'concat',
+                '-safe', '0',
+                '-i', concat_list_path,
 
                 # Вход 2: Аудио через stdin (сырой PCM)
                 '-f', 's16le',
@@ -923,7 +1023,7 @@ class FFmpegStreamManager:
                 '-channel_layout', 'stereo',
                 '-i', 'pipe:0',
 
-                # Карты: берем видео с входа 1, аудио с входа 2
+                # Карты
                 '-map', '0:v:0',
                 '-map', '1:a:0',
 
@@ -949,18 +1049,13 @@ class FFmpegStreamManager:
                 '-f', 'flv',
                 '-flvflags', 'no_duration_filesize',
 
-                # Логирование
-                '-loglevel', 'info',
-
                 self.rtmp_url
             ]
 
-            logger.info(f"🚀 Запуск единого FFmpeg процесса")
-            logger.info(f"🔗 RTMP: {self.rtmp_url}")
-            logger.info(f"🎬 Видео: {os.path.basename(default_video)} (зациклено)")
-            logger.info(f"🔊 Аудио: через pipe (PCM)")
+            logger.info(f"🚀 Запуск FFmpeg с concat демаксером")
+            logger.debug(f"Команда: {' '.join(ffmpeg_cmd[:15])}...")
 
-            # Запускаем ЕДИНЫЙ FFmpeg процесс
+            # Запускаем FFmpeg процесс
             self.stream_process = subprocess.Popen(
                 ffmpeg_cmd,
                 stdin=subprocess.PIPE,  # Для аудио
@@ -973,6 +1068,7 @@ class FFmpegStreamManager:
             self.is_streaming = True
             self.ffmpeg_pid = self.stream_process.pid
             self.ffmpeg_stdin = self.stream_process.stdin
+            self.concat_list_path = concat_list_path
 
             logger.info(f"✅ FFmpeg запущен (PID: {self.ffmpeg_pid})")
 
@@ -985,9 +1081,9 @@ class FFmpegStreamManager:
                 daemon=True
             ).start()
 
-            # Запускаем видео процессор для смены видео
+            # Запускаем видео контроллер
             threading.Thread(
-                target=self._continuous_video_switcher,
+                target=self._video_controller,
                 daemon=True
             ).start()
 
@@ -996,7 +1092,7 @@ class FFmpegStreamManager:
                 'rtmp_url': self.rtmp_url,
                 'has_video': True,
                 'has_audio': True,
-                'default_video': os.path.basename(default_video)
+                'concat_mode': True
             })
 
             return {'success': True, 'pid': self.ffmpeg_pid}

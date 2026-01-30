@@ -132,7 +132,7 @@ class FFmpegStreamManager:
         self.use_mpegts_cache = True  # Включить кэширование
         self.mpegts_cache_max_size = 50 * 1024 * 1024 * 1024  # 50GB
         self._load_mpegts_cache_index()
-
+        self.video_generator = None
         self.video_width = 1920
         self.video_height = 1080
         self.video_fps = 30
@@ -1902,9 +1902,9 @@ class FFmpegStreamManager:
             return False
 
     def _create_mpegts_file(self, video_path: str, duration: float, audio_file: str, output_path: str) -> bool:
-        """Создание MPEG-TS файла для кэширования"""
+        """Улучшенная конвертация в MPEG-TS с правильными параметрами"""
         try:
-            # УВЕЛИЧИВАЕМ БИТРЕЙТ ДЛЯ YOUTUBE
+            # УВЕЛИЧИВАЕМ БИТРЕЙТ ДЛЯ YOUTUBЕ
             video_bitrate = '6000k'
             maxrate = '6500k'
             bufsize = '12000k'
@@ -1924,16 +1924,22 @@ class FFmpegStreamManager:
                     '-map', '0:v:0',
                     '-map', '1:a:0',
                     '-c:v', 'libx264',
-                    '-preset', 'medium',
-                    '-tune', 'zerolatency',
+                    '-preset', 'medium',  # Улучшаем качество
+                    '-tune', 'film',  # Меняем на film для лучшего качества
                     '-pix_fmt', 'yuv420p',
                     '-b:v', video_bitrate,
                     '-maxrate', maxrate,
                     '-bufsize', bufsize,
                     '-r', str(self.video_fps),
-                    '-g', '30',
+                    '-g', '60',  # Ключевые кадры каждые 60 кадров (2 секунды)
+                    '-keyint_min', '30',  # Минимальный интервал ключевых кадров
+                    '-sc_threshold', '0',  # Отключаем автоматическое определение сцен
                     '-c:a', 'aac',
-                    '-b:a', '192k',
+                    '-b:a', '192k',  # Хорошее качество аудио
+                    '-ar', '44100',
+                    '-ac', '2',
+                    '-profile:v', 'high',  # Профиль High для лучшего качества
+                    '-level', '4.1',  # Уровень 4.1 для совместимости
                 ])
             else:
                 # Если нет аудио - добавляем тихое аудио
@@ -1944,15 +1950,19 @@ class FFmpegStreamManager:
                     '-map', '1:a:0',
                     '-c:v', 'libx264',
                     '-preset', 'medium',
-                    '-tune', 'zerolatency',
+                    '-tune', 'film',
                     '-pix_fmt', 'yuv420p',
                     '-b:v', video_bitrate,
                     '-maxrate', maxrate,
                     '-bufsize', bufsize,
                     '-r', str(self.video_fps),
-                    '-g', '30',
+                    '-g', '60',
+                    '-keyint_min', '30',
+                    '-sc_threshold', '0',
                     '-c:a', 'aac',
                     '-b:a', '192k',
+                    '-profile:v', 'high',
+                    '-level', '4.1',
                 ])
 
             # Общие параметры
@@ -1961,14 +1971,15 @@ class FFmpegStreamManager:
                 '-f', 'mpegts',
                 '-muxdelay', '0',
                 '-muxpreload', '0',
+                '-flush_packets', '1',  # Немедленная отправка пакетов
                 '-y',
                 output_path
             ])
 
-            logger.info(f"🔧 Создание MPEG-TS для кэша: {os.path.basename(video_path)}")
+            logger.info(f"🔧 Улучшенная конвертация в MPEG-TS: {os.path.basename(video_path)}")
 
-            # Таймаут создания
-            timeout = min(duration + 15, 45)
+            # УВЕЛИЧИВАЕМ ТАЙМАУТ ДЛЯ ЛУЧШЕЙ КОНВЕРТАЦИИ
+            timeout = min(duration + 20, 60)  # До 60 секунд
 
             result = subprocess.run(
                 mpegts_cmd,
@@ -1979,9 +1990,12 @@ class FFmpegStreamManager:
             )
 
             if result.returncode != 0:
-                logger.error(f"❌ Ошибка создания MPEG-TS файла (код {result.returncode}):")
+                logger.error(f"❌ Ошибка конвертации MPEG-TS (код {result.returncode}):")
                 if result.stderr:
-                    logger.error(f"STDERR: {result.stderr[:500]}")
+                    error_lines = result.stderr.split('\n')
+                    for line in error_lines[-10:]:  # Последние 10 строк ошибок
+                        if line.strip():
+                            logger.error(f"   {line}")
                 return False
 
             # Проверяем размер файла
@@ -1995,10 +2009,10 @@ class FFmpegStreamManager:
             return True
 
         except subprocess.TimeoutExpired as e:
-            logger.error(f"❌ Таймаут создания MPEG-TS: {os.path.basename(video_path)}")
+            logger.error(f"❌ Таймаут конвертации MPEG-TS: {os.path.basename(video_path)}")
             return False
         except Exception as e:
-            logger.error(f"❌ Ошибка создания MPEG-TS файла: {e}")
+            logger.error(f"❌ Ошибка конвертации MPEG-TS файла: {e}")
             return False
 
     def _refresh_cached_files_queue(self):
@@ -2066,15 +2080,17 @@ class FFmpegStreamManager:
         try:
             logger.info("🔍 Проверка папок кэша при запуске контроллера...")
 
-            # Проверяем папку видео кэша
-            if os.path.exists(self.video_generator.video_cache_dir):
-                files = os.listdir(self.video_generator.video_cache_dir)
-                video_files = [f for f in files if f.endswith(('.mp4', '.mov', '.avi', '.mkv'))]
-                logger.info(f"📁 Видео кэш: {len(video_files)} файлов в {self.video_generator.video_cache_dir}")
+            # Проверяем папку видео кэша (теперь через video_cache_dir)
+            video_cache_dir = 'video_cache'
 
-                # Автоматически добавляем видео из кэша в очередь
-                for video_file in video_files[:5]:  # Первые 5 файлов
-                    video_path = os.path.join(self.video_generator.video_cache_dir, video_file)
+            if os.path.exists(video_cache_dir):
+                files = os.listdir(video_cache_dir)
+                video_files = [f for f in files if f.endswith(('.mp4', '.mov', '.avi', '.mkv'))]
+                logger.info(f"📁 Видео кэш: {len(video_files)} файлов в {video_cache_dir}")
+
+                # Автоматически добавляем видео из кэша в очередь (ДО 10 ФАЙЛОВ)
+                for video_file in video_files[:10]:
+                    video_path = os.path.join(video_cache_dir, video_file)
                     video_info = self._get_video_info(video_path)
                     if video_info:
                         self.video_queue.append({
@@ -2186,7 +2202,7 @@ class FFmpegStreamManager:
             # Сортируем по времени создания (новые первыми)
             video_files.sort(key=lambda x: x[2], reverse=True)
 
-            # Добавляем файлы в очередь
+            # Добавляем файлы в очередь (ДО 10 ФАЙЛОВ)
             for filename, file_path, mtime in video_files[:limit]:
                 if added_count >= limit:
                     break
@@ -2228,6 +2244,75 @@ class FFmpegStreamManager:
             logger.error(f"❌ Ошибка автоматического добавления видео: {e}")
             return 0
 
+    def _check_video_cache_for_new_files(self):
+        """Проверка папки video_cache на новые файлы"""
+        try:
+            # Проверяем каждые 30 секунд
+            current_time = time.time()
+            if not hasattr(self, '_last_video_cache_check'):
+                self._last_video_cache_check = 0
+
+            if current_time - self._last_video_cache_check < 30:
+                return
+
+            self._last_video_cache_check = current_time
+
+            # Используем прямую ссылку на папку кэша
+            video_cache_dir = 'video_cache'
+            if not os.path.exists(video_cache_dir):
+                logger.debug(f"📭 Папка видео кэша не существует: {video_cache_dir}")
+                return
+
+            # Получаем список файлов в кэше
+            all_files = []
+            for filename in os.listdir(video_cache_dir):
+                if filename.endswith(('.mp4', '.mov', '.avi', '.mkv')):
+                    file_path = os.path.join(video_cache_dir, filename)
+                    file_mtime = os.path.getmtime(file_path)
+                    all_files.append((filename, file_path, file_mtime))
+
+            # Сортируем по времени изменения (новые первыми)
+            all_files.sort(key=lambda x: x[2], reverse=True)
+
+            # Проверяем, есть ли новые файлы
+            if not hasattr(self, '_known_video_files'):
+                self._known_video_files = set()
+
+            new_files = []
+            for filename, file_path, mtime in all_files:
+                if filename not in self._known_video_files:
+                    new_files.append((filename, file_path, mtime))
+                    self._known_video_files.add(filename)
+
+            # Добавляем новые файлы в очередь (ДО 10 ФАЙЛОВ ЗА РАЗ)
+            for filename, file_path, mtime in new_files[:10]:
+                try:
+                    video_info = self._get_video_info(file_path)
+                    if video_info:
+                        self.video_queue.append({
+                            'path': file_path,
+                            'filename': filename,
+                            'duration': video_info.get('duration', 10.0),
+                            'info': video_info,
+                            'from_video_cache': True,
+                            'added_time': datetime.now().isoformat()
+                        })
+                        logger.info(f"📥 Обнаружен новый файл в видео кэше: {filename}")
+
+                        socketio.emit('new_video_discovered', {
+                            'filename': filename,
+                            'duration': video_info.get('duration', 10.0),
+                            'size_mb': os.path.getsize(file_path) / 1024 / 1024,
+                            'timestamp': datetime.fromtimestamp(mtime).isoformat()
+                        })
+                except Exception as e:
+                    logger.error(f"❌ Ошибка обработки нового файла {filename}: {e}")
+
+            if new_files:
+                logger.info(f"📁 Обнаружено {len(new_files)} новых файлов в видео кэше")
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка проверки видео кэша: {e}")
     def _stream_controller(self):
         """Главный контроллер потока - отправляет MPEG-TS данные с интеллектуальным кэшем"""
         logger.info("🎬 Запуск контроллера MPEG-TS потока с интеллектуальным кэшем")
@@ -2546,11 +2631,13 @@ class FFmpegStreamManager:
             self.is_playing_audio = False
             self.is_playing_video = False
 
-            # АВТОМАТИЧЕСКОЕ ДОБАВЛЕНИЕ ВИДЕО ИЗ КЭША ПРИ ЗАПУСКЕ
+            # АВТОМАТИЧЕСКОЕ ДОБАВЛЕНИЕ ВИДЕО ИЗ КЭША ПРИ ЗАПУСКЕ (10 ФАЙЛОВ)
             logger.info("🔍 Автоматическое добавление видео из кэша...")
-            auto_added = self.auto_add_videos_from_cache(limit=5)
+            auto_added = self.auto_add_videos_from_cache(limit=10)
             if auto_added > 0:
                 logger.info(f"📥 Добавлено {auto_added} видео из кэша в очередь")
+            else:
+                logger.info("📭 В кэше не найдено видео файлов")
 
             # УВЕЛИЧИВАЕМ БИТРЕЙТ ДЛЯ YOUTUBE
             video_bitrate = '6000k'  # Было 4500k
@@ -2626,10 +2713,11 @@ class FFmpegStreamManager:
                 'has_video': True,
                 'has_audio': True,
                 'mode': 'mpegts_pipe',
-                'bitrate': video_bitrate
+                'bitrate': video_bitrate,
+                'videos_added_from_cache': auto_added
             })
 
-            return {'success': True, 'pid': self.ffmpeg_pid}
+            return {'success': True, 'pid': self.ffmpeg_pid, 'videos_added': auto_added}
 
         except Exception as e:
             logger.error(f"❌ Ошибка запуска FFmpeg: {e}", exc_info=True)
@@ -4081,6 +4169,7 @@ class AIStreamManager:
 ffmpeg_manager = FFmpegStreamManager()
 stream_manager = AIStreamManager(ffmpeg_manager)
 
+ffmpeg_manager.video_generator = stream_manager.video_generator
 
 # ========== АСИНХРОННЫЙ ЦИКЛ ==========
 

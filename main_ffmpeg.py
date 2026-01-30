@@ -1420,18 +1420,18 @@ class FFmpegStreamManager:
                 '-i', audio_file,
                 '-t', str(audio_duration),
                 '-c:v', 'libx264',
-                '-preset', 'ultrafast',
+                '-preset', 'fast',  # Улучшаем качество
                 '-tune', 'zerolatency',
                 '-pix_fmt', 'yuv420p',
-                '-b:v', '1000k',
-                '-maxrate', '1000k',
-                '-bufsize', '2000k',
+                '-b:v', '3000k',  # Увеличиваем для статичного видео
+                '-maxrate', '3500k',
+                '-bufsize', '6000k',
                 '-r', str(self.video_fps),
                 '-g', '30',
                 '-map', '0:v:0',
                 '-map', '1:a:0',
                 '-c:a', 'aac',
-                '-b:a', '128k',
+                '-b:a', '160k',  # Увеличиваем аудио битрейт
                 '-ar', '44100',
                 '-ac', '2',
                 '-f', 'mpegts',
@@ -1441,7 +1441,7 @@ class FFmpegStreamManager:
                 temp_mpegts.name
             ]
 
-            logger.info(f"🔊 Создание MPEG-TS для аудио: {os.path.basename(audio_file)} ({audio_duration:.1f} сек)")
+            logger.info(f"🔊 Создание MPEG-TS для аудио с битрейтом 160k")
 
             timeout = min(audio_duration + 10, 30)
 
@@ -1551,6 +1551,11 @@ class FFmpegStreamManager:
             temp_mpegts = tempfile.NamedTemporaryFile(suffix='.ts', delete=False)
             temp_mpegts.close()
 
+            # УВЕЛИЧИВАЕМ БИТРЕЙТ ВИДЕО ДЛЯ MPEG-TS
+            video_bitrate = '5000k'  # Увеличиваем для лучшего качества
+            maxrate = '5500k'
+            bufsize = '10000k'
+
             # Берем первое аудио из очереди если есть
             audio_input = None
             audio_map = []
@@ -1561,7 +1566,7 @@ class FFmpegStreamManager:
                 audio_map = ['-map', '1:a:0']
                 logger.info(f"🎵 Добавляю аудио к видео: {os.path.basename(audio_file)}")
 
-            # Команда для создания MPEG-TS потока - ПРАВИЛЬНАЯ СТРУКТУРА:
+            # Команда для создания MPEG-TS потока
             mpegts_cmd = [
                 'ffmpeg',
                 '-re',  # Реальное время
@@ -1576,36 +1581,35 @@ class FFmpegStreamManager:
                     '-map', '0:v:0',
                     '-map', '1:a:0',
                     '-c:v', 'libx264',
-                    '-preset', 'ultrafast',
+                    '-preset', 'fast',  # Улучшаем качество сжатия
                     '-tune', 'zerolatency',
                     '-pix_fmt', 'yuv420p',
-                    '-b:v', '3000k',
-                    '-maxrate', '3000k',
-                    '-bufsize', '6000k',
+                    '-b:v', video_bitrate,
+                    '-maxrate', maxrate,
+                    '-bufsize', bufsize,
                     '-r', str(self.video_fps),
                     '-g', '30',
                     '-c:a', 'aac',
-                    '-b:a', '128k',
+                    '-b:a', '160k',  # Увеличиваем аудио битрейт
                 ])
             else:
                 # Если нет аудио - добавляем тихое аудио через lavfi
-                # ВАЖНО: lavfi источник должен быть ОТДЕЛЬНЫМ входом
                 mpegts_cmd.extend([
                     '-f', 'lavfi',
                     '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
                     '-map', '0:v:0',
                     '-map', '1:a:0',
                     '-c:v', 'libx264',
-                    '-preset', 'ultrafast',
+                    '-preset', 'fast',
                     '-tune', 'zerolatency',
                     '-pix_fmt', 'yuv420p',
-                    '-b:v', '3000k',
-                    '-maxrate', '3000k',
-                    '-bufsize', '6000k',
+                    '-b:v', video_bitrate,
+                    '-maxrate', maxrate,
+                    '-bufsize', bufsize,
                     '-r', str(self.video_fps),
                     '-g', '30',
                     '-c:a', 'aac',
-                    '-b:a', '128k',
+                    '-b:a', '160k',
                 ])
 
             # Общие параметры
@@ -1618,8 +1622,7 @@ class FFmpegStreamManager:
                 temp_mpegts.name
             ])
 
-            # ЛОГИРОВАНИЕ КОМАНДЫ ДЛЯ ОТЛАДКИ
-            logger.info(f"🔧 Команда FFmpeg: {' '.join(mpegts_cmd)}")
+            logger.info(f"🔧 Создание MPEG-TS с битрейтом {video_bitrate}")
 
             # Таймаут создания
             timeout = min(duration + 10, 30)
@@ -1628,29 +1631,13 @@ class FFmpegStreamManager:
                 mpegts_cmd,
                 capture_output=True,
                 text=True,
-                encoding='utf-8',  # Явно указываем кодировку
+                encoding='utf-8',
                 timeout=timeout
             )
 
             if result.returncode != 0:
-                # ПОЛНЫЙ ВЫВОД ОШИБКИ
                 logger.error(f"❌ Ошибка FFmpeg (код {result.returncode}):")
-                logger.error(f"STDOUT: {result.stdout}")
-                logger.error(f"STDERR: {result.stderr}")
-
-                # Также можно сохранить в файл для анализа
-                error_log_path = f"ffmpeg_error_{int(time.time())}.log"
-                with open(error_log_path, 'w', encoding='utf-8') as f:
-                    f.write(f"Команда: {' '.join(mpegts_cmd)}\n")
-                    f.write(f"Return code: {result.returncode}\n")
-                    f.write("=" * 50 + "\n")
-                    f.write("STDOUT:\n")
-                    f.write(result.stdout)
-                    f.write("\n" + "=" * 50 + "\n")
-                    f.write("STDERR:\n")
-                    f.write(result.stderr)
-
-                logger.info(f"📄 Полный лог ошибки сохранен в: {error_log_path}")
+                logger.error(f"STDERR: {result.stderr[:500]}")
 
                 if os.path.exists(temp_mpegts.name):
                     os.unlink(temp_mpegts.name)
@@ -1674,13 +1661,9 @@ class FFmpegStreamManager:
 
         except subprocess.TimeoutExpired as e:
             logger.error(f"❌ Таймаут создания MPEG-TS: {os.path.basename(video_path)}")
-            logger.error(f"Таймаут: {e}")
             return False
         except Exception as e:
             logger.error(f"❌ Ошибка создания MPEG-TS: {e}")
-            logger.error(f"Тип ошибки: {type(e)}")
-            import traceback
-            logger.error(f"Трейсбек: {traceback.format_exc()}")
             return False
 
     def _stream_controller(self):
@@ -1715,7 +1698,7 @@ class FFmpegStreamManager:
                     else:
                         logger.error(f"❌ Не удалось отправить видео: {filename}")
                         # Возвращаем в очередь
-                        self.video_queue.insert(0, video_item)
+                        self.video_queue.insert(0,s video_item)
                         time.sleep(1)
 
                     self.is_playing_video = False
@@ -1839,7 +1822,12 @@ class FFmpegStreamManager:
             self.is_playing_audio = False
             self.is_playing_video = False
 
-            logger.info(f"🚀 Запуск FFmpeg стрима на YouTube...")
+            # УВЕЛИЧИВАЕМ БИТРЕЙТ ДЛЯ YOUTUBE
+            video_bitrate = '6000k'  # Было 4500k
+            maxrate = '6500k'  # Максимальный битрейт
+            bufsize = '12000k'  # Размер буфера
+
+            logger.info(f"🚀 Запуск FFmpeg стрима на YouTube с битрейтом {video_bitrate}...")
             logger.info(f"🔗 RTMP URL: {self.rtmp_url}")
 
             # ВАЖНО: ОДИН PIPE для видео+аудио в формате MPEG-TS
@@ -1850,24 +1838,24 @@ class FFmpegStreamManager:
                 '-f', 'mpegts',
                 '-i', 'pipe:0',
 
-                # Перекодируем для YouTube
+                # Перекодируем для YouTube с ВЫСОКИМ БИТРЕЙТОМ
                 '-c:v', 'libx264',
-                '-preset', 'ultrafast',
+                '-preset', 'medium',  # Было ultrafast, теперь medium для лучшего качества
                 '-tune', 'zerolatency',
                 '-pix_fmt', 'yuv420p',
                 '-g', '60',
-                '-b:v', '4500k',
-                '-maxrate', '4500k',
-                '-bufsize', '9000k',
+                '-b:v', video_bitrate,
+                '-maxrate', maxrate,
+                '-bufsize', bufsize,
                 '-r', str(self.video_fps),
                 '-x264-params', 'keyint=60:min-keyint=60:scenecut=0',
 
                 '-c:a', 'aac',
-                '-b:a', '128k',
+                '-b:a', '192k',  # Увеличиваем аудио битрейт
                 '-ar', '44100',
                 '-ac', '2',
 
-                # Формат вывода
+                # Формат вывода с оптимизацией для YouTube
                 '-f', 'flv',
                 '-flvflags', 'no_duration_filesize',
 
@@ -1875,7 +1863,7 @@ class FFmpegStreamManager:
             ]
 
             logger.info(f"🚀 Запуск FFmpeg с MPEG-TS pipe...")
-            logger.info("📡 Отправка видео+аудио через единый MPEG-TS поток")
+            logger.info(f"📊 Настройки битрейта: видео={video_bitrate}, аудио=192k")
 
             # Запускаем FFmpeg процесс
             self.stream_process = subprocess.Popen(
@@ -1907,7 +1895,8 @@ class FFmpegStreamManager:
                 'rtmp_url': self.rtmp_url,
                 'has_video': True,
                 'has_audio': True,
-                'mode': 'mpegts_pipe'
+                'mode': 'mpegts_pipe',
+                'bitrate': video_bitrate
             })
 
             return {'success': True, 'pid': self.ffmpeg_pid}
@@ -1972,11 +1961,11 @@ class FFmpegStreamManager:
             logger.error(f"❌ Ошибка отправки видео в FIFO: {e}")
             return False
 
-
     def _monitor_ffmpeg(self):
         """Мониторинг процесса FFmpeg"""
         try:
             stream_connected = False
+            last_bitrate_warning = 0
 
             for line in iter(self.stream_process.stderr.readline, b''):
                 line = line.decode('utf-8', errors='ignore').strip()
@@ -1984,6 +1973,31 @@ class FFmpegStreamManager:
                 # Отладочная информация
                 if 'frame=' in line and 'fps=' in line:
                     current_time = time.time()
+
+                    # Парсим информацию о битрейте
+                    if 'bitrate=' in line:
+                        try:
+                            # Ищем битрейт в строке
+                            import re
+                            bitrate_match = re.search(r'bitrate=\s*([\d\.]+)\s*kbits/s', line)
+                            if bitrate_match:
+                                current_bitrate = float(bitrate_match.group(1))
+                                current_time = time.time()
+
+                                # Логируем битрейт каждые 10 секунд
+                                if current_time - last_bitrate_warning > 10:
+                                    logger.info(f"📊 Текущий битрейт: {current_bitrate:.1f} kbps")
+                                    last_bitrate_warning = current_time
+
+                                    # Предупреждение если битрейт слишком низкий
+                                    if current_bitrate < 4000:
+                                        logger.warning(f"⚠️ Низкий битрейт: {current_bitrate:.1f} kbps")
+                                        socketio.emit('stream_warning', {
+                                            'message': f'Низкий битрейт: {current_bitrate:.1f} kbps'
+                                        })
+                        except Exception as e:
+                            logger.debug(f"Ошибка парсинга битрейта: {e}")
+
                     if hasattr(self, '_last_stats_log') and current_time - self._last_stats_log < 5:
                         continue
                     self._last_stats_log = current_time
@@ -2001,6 +2015,11 @@ class FFmpegStreamManager:
                     logger.error(f"⚠️ FFmpeg error: {line}")
                     socketio.emit('stream_warning', {'message': line})
 
+                # Предупреждение о низком битрейте от YouTube
+                elif any(x in line.lower() for x in ['bitrate', 'low bitrate', 'insufficient']):
+                    logger.warning(f"⚠️ YouTube битрейт предупреждение: {line}")
+                    socketio.emit('stream_warning', {'message': f'YouTube: {line}'})
+
             # Процесс завершен
             return_code = self.stream_process.wait()
             logger.info(f"FFmpeg завершился с кодом: {return_code}")
@@ -2009,7 +2028,7 @@ class FFmpegStreamManager:
             logger.error(f"Ошибка мониторинга FFmpeg: {e}")
         finally:
             self.is_streaming = False
-            socketio.emit('stre_send_video_to_pipeam_stopped', {'time': datetime.now().isoformat()})
+            socketio.emit('stream_stopped', {'time': datetime.now().isoformat()})
 
     def stop_stream(self):
         """Остановка стрима с очисткой pipe"""

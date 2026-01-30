@@ -1852,7 +1852,7 @@ class FFmpegStreamManager:
 
                 # Перекодируем для YouTube
                 '-c:v', 'libx264',
-                '-preset', 'veryfast',
+                '-preset', 'ultrafast',
                 '-tune', 'zerolatency',
                 '-pix_fmt', 'yuv420p',
                 '-g', '60',

@@ -2948,7 +2948,7 @@ class AIStreamManager:
         return self.current_topic
 
     async def run_discussion_round(self):
-        """Обновленный метод с использованием VideoGenerator и видео из кэша"""
+        """Оптимизированный метод с уменьшенными паузами и лучшей синхронизацией"""
         if self.is_discussion_active:
             return
 
@@ -2959,21 +2959,25 @@ class AIStreamManager:
             if not self.current_topic:
                 self.select_topic()
 
-            logger.info(f"🚀 Начало раунда #{self.discussion_round}")
+            logger.info(f"🚀 Начало оптимизированного раунда #{self.discussion_round}")
 
             # Определяем порядок выступлений
             speaking_order = random.sample(self.agents, len(self.agents))
 
-            for agent in speaking_order:
+            for agent_idx, agent in enumerate(speaking_order):
                 if not self.is_discussion_active:
                     break
 
-                # Генерация ответа через OpenAI (ДО создания видео, чтобы использовать текст в видео)
+                # ПАРАЛЛЕЛЬНАЯ ГЕНЕРАЦИЯ: запускаем генерацию ответа и видео одновременно
                 logger.info(f"🤖 {agent.name} генерирует ответ...")
-                message = await agent.generate_response(
-                    self.current_topic,
-                    self.conversation_history
+
+                # Запускаем генерацию ответа
+                response_task = asyncio.create_task(
+                    agent.generate_response(self.current_topic, self.conversation_history)
                 )
+
+                # Ждем только ответ (не видео)
+                message = await response_task
 
                 # Сохраняем в историю
                 self.conversation_history.append(f"{agent.name}: {message}")
@@ -2992,8 +2996,31 @@ class AIStreamManager:
 
                 logger.info(f"💬 {agent.name}: {message[:80]}...")
 
-                # ПОКАЗ ВИДЕО-ИНТРО агента (с использованием VideoGenerator)
+                # ========== ПАРАЛЛЕЛЬНАЯ ОБРАБОТКА ==========
+
+                # 1. Запускаем генерацию аудио в фоне
+                audio_task = asyncio.create_task(
+                    self.tts_manager.generate_audio_only(
+                        text=message,
+                        voice_id=agent.voice,
+                        agent_name=agent.name
+                    )
+                )
+
+                # 2. Создаем видео-интро (если включено)
+                video_intro_task = None
                 if self.show_video_intros:
+                    video_intro_task = asyncio.create_task(
+                        asyncio.to_thread(
+                            self.video_generator.create_agent_intro_video,
+                            agent_name=agent.name,
+                            expertise=agent.expertise,
+                            avatar_color=agent.color,
+                            message=message[:150],
+                            duration=5.0
+                        )
+                    )
+
                     socketio.emit('video_start', {
                         'agent_id': agent.id,
                         'agent_name': agent.name,
@@ -3001,32 +3028,35 @@ class AIStreamManager:
                         'duration': 5.0
                     })
 
-                    # Создаем видео-интро через VideoGenerator (сохраняется в кэш)
-                    intro_video = await asyncio.to_thread(
-                        self.video_generator.create_agent_intro_video,
-                        agent_name=agent.name,
-                        expertise=agent.expertise,
-                        avatar_color=agent.color,
-                        message=message[:150],  # Первые 150 символов сообщения
-                        duration=5.0
+                # 3. Создаем видео с сообщением (если включено)
+                video_message_task = None
+                if self.show_video_intros and message:
+                    estimated_duration = min(max(len(message.split()) * 0.2, 3), 10)  # Уменьшили коэффициент
+                    video_message_task = asyncio.create_task(
+                        asyncio.to_thread(
+                            self.video_generator.create_message_video,
+                            agent_name=agent.name,
+                            message=message,
+                            duration=estimated_duration
+                        )
                     )
 
-                    if intro_video:
-                        # Получаем только имя файла
-                        video_filename = os.path.basename(intro_video)
-
-                        # Немедленно показываем видео из кэша
-                        if hasattr(self.ffmpeg_manager, 'show_video_from_cache'):
-                            success = self.ffmpeg_manager.show_video_from_cache(video_filename)
-                            if success:
-                                logger.info(f"🎬 Показываем видео-интро {agent.name} из кэша (5 сек)")
-                                await asyncio.sleep(5.0)
-                            else:
-                                logger.warning(f"⚠️ Не удалось показать видео-интро для {agent.name}")
-
+                # ========== ПЕРВОЕ ВИДЕО (интро) ==========
+                if video_intro_task:
+                    try:
+                        intro_video = await asyncio.wait_for(video_intro_task, timeout=7.0)
+                        if intro_video and hasattr(self.ffmpeg_manager, 'show_video_from_cache'):
+                            video_filename = os.path.basename(intro_video)
+                            self.ffmpeg_manager.show_video_from_cache(video_filename)
+                            logger.info(f"🎬 Показываем видео-интро {agent.name} (5 сек)")
+                            await asyncio.sleep(2.5)  # Уменьшили ожидание до 2.5 сек
                         socketio.emit('video_end', {'agent_id': agent.id})
+                    except asyncio.TimeoutError:
+                        logger.warning(f"⚠️ Таймаут создания видео-интро для {agent.name}")
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка видео-интро: {e}")
 
-                # Агент начинает говорить (после видео-интро)
+                # Агент начинает говорить
                 self.active_agent = agent.id
                 socketio.emit('agent_start_speaking', {
                     'agent_id': agent.id,
@@ -3034,139 +3064,120 @@ class AIStreamManager:
                     'expertise': agent.expertise
                 })
 
-                # Создаем видео с полным текстом сообщения
-                if self.show_video_intros and message:
-                    # Оцениваем длительность видео по длине сообщения
-                    estimated_duration = min(max(len(message.split()) * 0.3, 5), 15)
+                # ========== АУДИО + ВТОРОЕ ВИДЕО ==========
+                try:
+                    # Ждем аудио (с таймаутом)
+                    audio_file = await asyncio.wait_for(audio_task, timeout=15.0)
 
-                    # Создаем видео с сообщением через VideoGenerator
-                    message_video = await asyncio.to_thread(
-                        self.video_generator.create_message_video,
-                        agent_name=agent.name,
-                        message=message,
-                        duration=estimated_duration
-                    )
+                    if audio_file and self.ffmpeg_manager:
+                        # Добавляем аудио в очередь и сразу показываем видео сообщения
+                        success = self.ffmpeg_manager.add_audio_to_queue(audio_file)
 
-                    if message_video and hasattr(self.ffmpeg_manager, 'show_video_from_cache'):
-                        message_filename = os.path.basename(message_video)
-                        self.ffmpeg_manager.show_video_from_cache(message_filename)
-                        logger.info(f"📺 Показываем видео с сообщением {agent.name} ({estimated_duration:.1f} сек)")
+                        if success and video_message_task:
+                            try:
+                                message_video = await asyncio.wait_for(video_message_task, timeout=10.0)
+                                if message_video and hasattr(self.ffmpeg_manager, 'show_video_from_cache'):
+                                    message_filename = os.path.basename(message_video)
+                                    self.ffmpeg_manager.show_video_from_cache(message_filename)
+                                    logger.info(f"📺 Показываем видео с сообщением {agent.name}")
+                            except asyncio.TimeoutError:
+                                logger.warning(f"⚠️ Таймаут создания видео сообщения для {agent.name}")
+                            except Exception as e:
+                                logger.error(f"❌ Ошибка видео сообщения: {e}")
 
-                # Генерация аудио файла
-                logger.info(f"🔊 Генерация TTS для {agent.name}...")
-
-                audio_file = await self.tts_manager.generate_audio_only(
-                    text=message,
-                    voice_id=agent.voice,
-                    agent_name=agent.name
-                )
-
-                if audio_file and self.ffmpeg_manager:
-                    # Добавляем аудио в очередь стрима
-                    success = self.ffmpeg_manager.add_audio_to_queue(audio_file)
-
-                    if success:
-                        # Получаем длительность аудио
+                        # Ждем только половину аудио, пока идет видео
                         audio_duration = self.tts_manager._get_audio_duration(audio_file)
-                        logger.info(f"⏱️  Ожидание завершения аудио: {audio_duration:.1f} сек")
+                        wait_time = min(audio_duration * 0.6, 10)  # Ждем только 60% аудио
+                        await asyncio.sleep(wait_time)
 
-                        # Ждем пока аудио воспроизводится
-                        await asyncio.sleep(audio_duration + 0.5)  # Небольшой буфер
-
-                        # После окончания речи показываем нейтральное видео
-                        if self.show_video_intros and hasattr(self.ffmpeg_manager, 'show_video_from_cache'):
-                            # Создаем нейтральное видео через VideoGenerator
-                            neutral_video = await asyncio.to_thread(
-                                self.video_generator.create_transition_video,
-                                from_text=f"{agent.name} закончил(а)",
-                                to_text=self.current_topic,
-                                duration=3.0
-                            )
-
-                            if neutral_video:
-                                neutral_filename = os.path.basename(neutral_video)
-                                self.ffmpeg_manager.show_video_from_cache(neutral_filename)
-                                await asyncio.sleep(3.0)
                     else:
-                        logger.warning(f"⚠️ Не удалось добавить аудио в очередь")
-                        # Ждем по количеству слов
+                        # Если аудио не сгенерировалось, короткая пауза
                         word_count = len(message.split())
-                        pause_duration = max(3, min(word_count * 0.3, 10))
+                        pause_duration = max(2, min(word_count * 0.15, 8))  # Уменьшили коэффициент
                         await asyncio.sleep(pause_duration)
-                else:
-                    # Если аудио не сгенерировалось, ждем по количеству слов
-                    word_count = len(message.split())
-                    pause_duration = max(3, min(word_count * 0.3, 10))
-                    logger.warning(f"⚠️ Аудио не сгенерировано, ждем {pause_duration} сек")
-                    await asyncio.sleep(pause_duration)
 
-                # Агент заканчивает говорить
+                except asyncio.TimeoutError:
+                    logger.warning(f"⚠️ Таймаут генерации аудио для {agent.name}")
+                    await asyncio.sleep(5.0)  # Короткая пауза при таймауте
+                except Exception as e:
+                    logger.error(f"❌ Ошибка обработки аудио: {e}")
+                    await asyncio.sleep(3.0)
+
+                # ========== ЗАВЕРШЕНИЕ РЕЧИ ==========
                 socketio.emit('agent_stop_speaking', {'agent_id': agent.id})
                 self.active_agent = None
 
-                # Пауза между агентами
-                if agent != speaking_order[-1]:
-                    pause = random.uniform(2.0, 4.0)
-                    logger.debug(f"⏸️  Пауза между агентами: {pause:.1f} сек")
+                # ========== ПЕРЕХОД К СЛЕДУЮЩЕМУ АГЕНТУ ==========
+                if agent_idx < len(speaking_order) - 1:
+                    # Уменьшенная пауза между агентами
+                    pause = random.uniform(1.0, 2.0)  # Было 2.0-4.0
+                    logger.debug(f"⏸️  Короткая пауза: {pause:.1f} сек")
 
-                    # Показываем переходное видео
+                    # Быстрый переход
                     if self.show_video_intros:
-                        next_agent = speaking_order[speaking_order.index(agent) + 1]
+                        try:
+                            next_agent = speaking_order[agent_idx + 1]
+                            # Быстрый переход (1 секунда вместо 3)
+                            transition_video = await asyncio.to_thread(
+                                self.video_generator.create_transition_video,
+                                f"{agent.name}",  # Только имя
+                                next_agent.name,  # Только имя следующего
+                                1.0  # Уменьшили до 1 секунды
+                            )
 
-                        # Создаем переходное видео через VideoGenerator
-                        transition_video = await asyncio.to_thread(
-                            self.video_generator.create_transition_video,
-                            f"{agent.name} закончил(а)",  # from_text
-                            self.current_topic,  # to_text
-                            3.0  # duration
-                        )
+                            if transition_video and hasattr(self.ffmpeg_manager, 'show_video_from_cache'):
+                                transition_filename = os.path.basename(transition_video)
+                                self.ffmpeg_manager.show_video_from_cache(transition_filename)
+                                await asyncio.sleep(1.0)  # Ждем только 1 секунду
+                        except Exception as e:
+                            logger.debug(f"Быстрый переход не удался: {e}")
+                            await asyncio.sleep(pause)
+                    else:
+                        await asyncio.sleep(pause)
 
-                        if transition_video and hasattr(self.ffmpeg_manager, 'show_video_from_cache'):
-                            transition_filename = os.path.basename(transition_video)
-                            self.ffmpeg_manager.show_video_from_cache(transition_filename)
-
-                    await asyncio.sleep(pause)
-
-            logger.info(f"✅ Раунд #{self.discussion_round} завершен")
+            logger.info(f"✅ Раунд #{self.discussion_round} завершен за {len(speaking_order)} выступлений")
 
             socketio.emit('round_complete', {
                 'round': self.discussion_round,
                 'total_messages': self.message_count,
-                'next_round_in': Config.DISCUSSION_INTERVAL
+                'next_round_in': Config.DISCUSSION_INTERVAL // 2  # Уменьшили перерыв между раундами
             })
 
-            # Пауза перед следующим раундом
-            await asyncio.sleep(Config.DISCUSSION_INTERVAL)
+            # Короткая пауза перед следующим раундом
+            await asyncio.sleep(Config.DISCUSSION_INTERVAL // 2)
 
-            # Случайная смена темы с видео-переходом
-            if random.random() > 0.7:
+            # Случайная смена темы (быстрее)
+            if random.random() > 0.6:  # Увеличили вероятность смены темы
                 old_topic = self.current_topic
                 self.select_topic()
 
                 if self.show_video_intros:
-                    # Создаем тематическое переходное видео
-                    topic_video = await asyncio.to_thread(
-                        lambda: self.video_generator.create_transition_video(
-                            from_text=old_topic,
-                            to_text=self.current_topic,
-                            duration=5.0
+                    # Быстрая смена темы (2 секунды вместо 5)
+                    try:
+                        topic_video = await asyncio.to_thread(
+                            lambda: self.video_generator.create_transition_video(
+                                from_text=old_topic[:40],  # Обрезаем длинные темы
+                                to_text=self.current_topic[:40],
+                                duration=2.0  # Уменьшили до 2 секунд
+                            )
                         )
-                    )
 
-                    if topic_video:
-                        socketio.emit('topic_change_video', {
-                            'old_topic': old_topic,
-                            'new_topic': self.current_topic,
-                            'duration': 5.0
-                        })
+                        if topic_video:
+                            socketio.emit('topic_change_video', {
+                                'old_topic': old_topic,
+                                'new_topic': self.current_topic,
+                                'duration': 2.0
+                            })
 
-                        if hasattr(self.ffmpeg_manager, 'show_video_from_cache'):
-                            topic_filename = os.path.basename(topic_video)
-                            self.ffmpeg_manager.show_video_from_cache(topic_filename)
-                            await asyncio.sleep(5.0)
+                            if hasattr(self.ffmpeg_manager, 'show_video_from_cache'):
+                                topic_filename = os.path.basename(topic_video)
+                                self.ffmpeg_manager.show_video_from_cache(topic_filename)
+                                await asyncio.sleep(2.0)
+                    except Exception as e:
+                        logger.debug(f"Быстрая смена темы не удалась: {e}")
 
         except Exception as e:
-            logger.error(f"❌ Ошибка в раунде дискуссии: {e}", exc_info=True)
+            logger.error(f"❌ Ошибка в оптимизированном раунде дискуссии: {e}", exc_info=True)
 
             socketio.emit('error', {
                 'message': f'Ошибка в дискуссии: {str(e)}',

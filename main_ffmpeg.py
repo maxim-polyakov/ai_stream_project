@@ -126,9 +126,12 @@ class FFmpegStreamManager:
         self.audio_format = 's16le'
         self.bytes_per_sample = 2
 
-        self.video_send_timeout = 30  # Максимальное время отправки видео
-        self.video_convert_timeout = 15  # Максимальное время конвертации
-        self.audio_send_timeout = 60  # Максимальное время отправки аудио
+        self.mpegts_cache_dir = 'mpegts_cache'
+        os.makedirs(self.mpegts_cache_dir, exist_ok=True)
+        self.mpegts_cache = {}  # Кэш MPEG-TS файлов
+        self.use_mpegts_cache = True  # Включить кэширование
+        self.mpegts_cache_max_size = 50 * 1024 * 1024 * 1024  # 50GB
+        self._load_mpegts_cache_index()
 
         self.video_width = 1920
         self.video_height = 1080
@@ -141,6 +144,367 @@ class FFmpegStreamManager:
                                       self.bytes_per_sample * self.silence_chunk_duration)
 
         logger.info("FFmpeg Stream Manager с единым процессом инициализирован")
+
+    def _load_mpegts_cache_index(self):
+        """Загрузка индекса кэша MPEG-TS из файла"""
+        cache_index_path = os.path.join(self.mpegts_cache_dir, 'cache_index.json')
+        if os.path.exists(cache_index_path):
+            try:
+                with open(cache_index_path, 'r') as f:
+                    self.mpegts_cache = json.load(f)
+                logger.info(f"📂 Загружен кэш MPEG-TS: {len(self.mpegts_cache)} файлов")
+            except Exception as e:
+                logger.error(f"❌ Ошибка загрузки кэша: {e}")
+                self.mpegts_cache = {}
+
+    def _save_mpegts_cache_index(self):
+        """Сохранение индекса кэша MPEG-TS в файл"""
+        cache_index_path = os.path.join(self.mpegts_cache_dir, 'cache_index.json')
+        try:
+            with open(cache_index_path, 'w') as f:
+                json.dump(self.mpegts_cache, f, indent=2)
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения кэша: {e}")
+
+    def get_cached_mpegts(self, video_path: str, audio_path: str = None) -> Optional[str]:
+        """
+        Получение MPEG-TS файла из кэша
+
+        Args:
+            video_path: Путь к видео файлу
+            audio_path: Путь к аудио файлу (опционально)
+
+        Returns:
+            Путь к кэшированному MPEG-TS файлу или None если не найден
+        """
+        if not self.use_mpegts_cache:
+            return None
+
+        cache_key = self._get_mpegts_cache_key(video_path, audio_path)
+
+        if cache_key in self.mpegts_cache:
+            cache_info = self.mpegts_cache[cache_key]
+            mpegts_path = os.path.join(self.mpegts_cache_dir, cache_info['filename'])
+
+            if os.path.exists(mpegts_path):
+                # Обновляем время последнего доступа
+                cache_info['last_accessed'] = time.time()
+                self.mpegts_cache[cache_key] = cache_info
+                self._save_mpegts_cache_index()
+
+                logger.info(f"✅ MPEG-TS найден в кэше: {cache_info['filename']}")
+                return mpegts_path
+            else:
+                # Файл не существует, удаляем из кэша
+                del self.mpegts_cache[cache_key]
+                self._save_mpegts_cache_index()
+
+        return None
+
+    def add_video_with_mpegts_cache(self, video_path: str, duration: float = None,
+                                    audio_file: str = None, use_cache: bool = True) -> bool:
+        """
+        Добавление видео в очередь с использованием MPEG-TS кэша
+
+        Args:
+            video_path: Путь к видео файлу
+            duration: Длительность видео (если None - определяется автоматически)
+            audio_file: Путь к аудио файлу (опционально)
+            use_cache: Использовать кэш MPEG-TS
+
+        Returns:
+            True если успешно добавлено
+        """
+        try:
+            if not os.path.exists(video_path):
+                logger.error(f"❌ Видео файл не найден: {video_path}")
+                return False
+
+            # Получаем информацию о видео
+            video_info = self._get_video_info(video_path)
+            actual_duration = duration or video_info.get('duration', 10.0)
+
+            # Проверяем кэш если нужно
+            mpegts_path = None
+            if use_cache and self.use_mpegts_cache:
+                mpegts_path = self.get_cached_mpegts(video_path, audio_file)
+
+            # Добавляем в очередь с информацией о кэше
+            self.video_queue.append({
+                'path': video_path,
+                'duration': actual_duration,
+                'info': video_info,
+                'mpegts_cached': mpegts_path if mpegts_path else False,
+                'audio_file': audio_file,
+                'use_cache': use_cache
+            })
+
+            logger.info(f"📥 Видео добавлено в очередь: {os.path.basename(video_path)}")
+            if mpegts_path:
+                logger.info(f"   ✅ Используется кэшированный MPEG-TS")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка добавления видео с кэшем: {e}")
+            return False
+
+    def get_mpegts_cache_stats(self) -> Dict[str, Any]:
+        """
+        Получение статистики кэша MPEG-TS
+
+        Returns:
+            Словарь со статистикой
+        """
+        try:
+            total_size = sum(info.get('size', 0) for info in self.mpegts_cache.values())
+            total_files = len(self.mpegts_cache)
+
+            # Самые старые и новые файлы
+            items = list(self.mpegts_cache.items())
+            items.sort(key=lambda x: x[1].get('last_accessed', 0))
+
+            oldest_files = []
+            newest_files = []
+
+            for i in range(min(5, len(items))):
+                if i < len(items):
+                    key, info = items[i]
+                    oldest_files.append({
+                        'key': key,
+                        'filename': info.get('filename', ''),
+                        'size_mb': info.get('size', 0) / 1024 / 1024,
+                        'last_accessed': datetime.fromtimestamp(info.get('last_accessed', 0)).strftime(
+                            '%Y-%m-%d %H:%M:%S')
+                    })
+
+            for i in range(max(0, len(items) - 5), len(items)):
+                if i >= 0:
+                    key, info = items[i]
+                    newest_files.append({
+                        'key': key,
+                        'filename': info.get('filename', ''),
+                        'size_mb': info.get('size', 0) / 1024 / 1024,
+                        'last_accessed': datetime.fromtimestamp(info.get('last_accessed', 0)).strftime(
+                            '%Y-%m-%d %H:%M:%S')
+                    })
+
+            return {
+                'enabled': self.use_mpegts_cache,
+                'total_files': total_files,
+                'total_size_mb': total_size / 1024 / 1024,
+                'total_size_gb': total_size / 1024 / 1024 / 1024,
+                'max_size_gb': self.mpegts_cache_max_size / 1024 / 1024 / 1024,
+                'directory': self.mpegts_cache_dir,
+                'oldest_files': oldest_files,
+                'newest_files': newest_files,
+                'cache_hit_rate': self._calculate_cache_hit_rate() if hasattr(self, '_cache_stats') else 0
+            }
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения статистики кэша: {e}")
+            return {}
+
+    def clear_mpegts_cache(self) -> Dict[str, Any]:
+        """
+        Полная очистка кэша MPEG-TS
+
+        Returns:
+            Словарь с результатом операции
+        """
+        try:
+            logger.info("🧹 Полная очистка кэша MPEG-TS...")
+
+            removed_count = 0
+            removed_size = 0
+
+            # Удаляем все файлы в директории кэша
+            for filename in os.listdir(self.mpegts_cache_dir):
+                if filename.endswith('.ts'):
+                    filepath = os.path.join(self.mpegts_cache_dir, filename)
+                    try:
+                        file_size = os.path.getsize(filepath)
+                        os.remove(filepath)
+                        removed_count += 1
+                        removed_size += file_size
+                    except Exception as e:
+                        logger.error(f"Ошибка удаления {filename}: {e}")
+
+            # Очищаем индекс
+            self.mpegts_cache = {}
+            cache_index_path = os.path.join(self.mpegts_cache_dir, 'cache_index.json')
+            if os.path.exists(cache_index_path):
+                os.remove(cache_index_path)
+
+            logger.info(f"✅ Кэш очищен: удалено {removed_count} файлов ({removed_size / 1024 / 1024:.1f} MB)")
+
+            return {
+                'success': True,
+                'removed_files': removed_count,
+                'removed_size_mb': removed_size / 1024 / 1024
+            }
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка очистки кэша: {e}")
+            return {'success': False, 'error': str(e)}
+
+    def stream_video_from_mpegts_cache(self, cache_key: str) -> Dict[str, Any]:
+        """
+        Стриминг видео напрямую из кэша MPEG-TS
+
+        Args:
+            cache_key: Ключ кэша
+
+        Returns:
+            Словарь с результатом операции
+        """
+        try:
+            if not self.is_streaming:
+                return {'success': False, 'error': 'Стрим не запущен'}
+
+            if cache_key not in self.mpegts_cache:
+                return {'success': False, 'error': 'Файл не найден в кэше'}
+
+            cache_info = self.mpegts_cache[cache_key]
+            mpegts_path = os.path.join(self.mpegts_cache_dir, cache_info['filename'])
+
+            if not os.path.exists(mpegts_path):
+                return {'success': False, 'error': 'Файл не существует'}
+
+            # Отправляем файл из кэша
+            duration = cache_info.get('duration', 10.0)
+            success = self._send_mpegts_file(mpegts_path, duration)
+
+            if success:
+                # Обновляем время доступа
+                cache_info['last_accessed'] = time.time()
+                self.mpegts_cache[cache_key] = cache_info
+                self._save_mpegts_cache_index()
+
+                return {
+                    'success': True,
+                    'filename': cache_info['filename'],
+                    'duration': duration,
+                    'size_mb': cache_info.get('size', 0) / 1024 / 1024
+                }
+            else:
+                return {'success': False, 'error': 'Ошибка отправки файла'}
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка стриминга из кэша: {e}")
+            return {'success': False, 'error': str(e)}
+    def _cleanup_mpegts_cache(self):
+        """Очистка кэша MPEG-TS при превышении размера"""
+        try:
+            total_size = sum(info.get('size', 0) for info in self.mpegts_cache.values())
+
+            if total_size <= self.mpegts_cache_max_size:
+                return
+
+            logger.info(f"🧹 Очистка кэша MPEG-TS (было: {total_size / 1024 / 1024:.1f} MB)")
+
+            # Сортируем по времени последнего доступа (старые первыми)
+            items = list(self.mpegts_cache.items())
+            items.sort(key=lambda x: x[1].get('last_accessed', 0))
+
+            removed_count = 0
+            removed_size = 0
+
+            while items and total_size > self.mpegts_cache_max_size * 0.7:  # Очищаем до 70%
+                cache_key, cache_info = items.pop(0)
+                cached_path = os.path.join(self.mpegts_cache_dir, cache_info['filename'])
+
+                try:
+                    if os.path.exists(cached_path):
+                        os.remove(cached_path)
+                        removed_size += cache_info.get('size', 0)
+                        removed_count += 1
+                except Exception as e:
+                    logger.error(f"Ошибка удаления файла: {e}")
+
+                del self.mpegts_cache[cache_key]
+                total_size -= cache_info.get('size', 0)
+
+            self._save_mpegts_cache_index()
+
+            if removed_count > 0:
+                logger.info(f"✅ Удалено {removed_count} файлов ({removed_size / 1024 / 1024:.1f} MB)")
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка очистки кэша: {e}")
+
+    def cache_mpegts_file(self, video_path: str, mpegts_path: str, duration: float,
+                          audio_path: str = None, audio_used: bool = False) -> bool:
+        """
+        Добавление MPEG-TS файла в кэш
+
+        Args:
+            video_path: Исходный путь к видео файлу
+            mpegts_path: Путь к созданному MPEG-TS файлу
+            duration: Длительность в секундах
+            audio_path: Путь к аудио файлу (если использовался)
+            audio_used: Флаг использования аудио
+
+        Returns:
+            True если успешно добавлено в кэш
+        """
+        if not self.use_mpegts_cache or not os.path.exists(mpegts_path):
+            return False
+
+        try:
+            cache_key = self._get_mpegts_cache_key(video_path, audio_path)
+            file_size = os.path.getsize(mpegts_path)
+
+            # Проверяем размер файла
+            if file_size < 1024 * 10:  # < 10KB
+                logger.warning(f"⚠️ Файл слишком маленький для кэша: {file_size} байт")
+                return False
+
+            # Проверяем общий размер кэша
+            total_size = sum(info.get('size', 0) for info in self.mpegts_cache.values())
+            if total_size + file_size > self.mpegts_cache_max_size:
+                self._cleanup_mpegts_cache()
+
+            # Копируем файл в директорию кэша
+            cached_filename = f"{cache_key}.ts"
+            cached_path = os.path.join(self.mpegts_cache_dir, cached_filename)
+
+            # Используем shutil.copy2 для сохранения метаданных
+            import shutil
+            shutil.copy2(mpegts_path, cached_path)
+
+            # Добавляем информацию в кэш
+            self.mpegts_cache[cache_key] = {
+                'filename': cached_filename,
+                'original_video': os.path.basename(video_path),
+                'original_audio': os.path.basename(audio_path) if audio_path else None,
+                'duration': duration,
+                'size': file_size,
+                'audio_used': audio_used,
+                'created': time.time(),
+                'last_accessed': time.time(),
+                'resolution': f"{self.video_width}x{self.video_height}",
+                'fps': self.video_fps,
+                'bitrate': self.video_bitrate
+            }
+
+            self._save_mpegts_cache_index()
+            logger.info(f"💾 MPEG-TS добавлен в кэш: {cached_filename} ({file_size / 1024 / 1024:.1f} MB)")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка добавления в кэш: {e}")
+            return False
+
+
+    def _get_mpegts_cache_key(self, video_path: str, audio_path: str = None) -> str:
+        """Генерация уникального ключа для кэша MPEG-TS"""
+        import hashlib
+
+        # Создаем хеш на основе путей файлов и параметров
+        key_data = f"{video_path}:{audio_path if audio_path else 'no_audio'}:{self.video_width}:{self.video_height}:{self.video_fps}:{self.video_bitrate}"
+        return hashlib.md5(key_data.encode()).hexdigest()
 
     def _restore_default_video(self):
         """Восстановление дефолтного видео в текущем файле"""
@@ -1666,9 +2030,109 @@ class FFmpegStreamManager:
             logger.error(f"❌ Ошибка создания MPEG-TS: {e}")
             return False
 
+    def _create_mpegts_file(self, video_path: str, duration: float, audio_file: str, output_path: str) -> bool:
+        """Создание MPEG-TS файла для кэширования"""
+        try:
+            # УВЕЛИЧИВАЕМ БИТРЕЙТ ДЛЯ YOUTUBE
+            video_bitrate = '6000k'
+            maxrate = '6500k'
+            bufsize = '12000k'
+
+            # Команда для создания MPEG-TS потока
+            mpegts_cmd = [
+                'ffmpeg',
+                '-re',  # Реальное время
+                '-i', video_path,
+            ]
+
+            # Добавляем аудио источник если есть
+            if audio_file and os.path.exists(audio_file):
+                mpegts_cmd.extend(['-i', audio_file])
+                # Карты: видео с первого входа, аудио со второго
+                mpegts_cmd.extend([
+                    '-map', '0:v:0',
+                    '-map', '1:a:0',
+                    '-c:v', 'libx264',
+                    '-preset', 'medium',
+                    '-tune', 'zerolatency',
+                    '-pix_fmt', 'yuv420p',
+                    '-b:v', video_bitrate,
+                    '-maxrate', maxrate,
+                    '-bufsize', bufsize,
+                    '-r', str(self.video_fps),
+                    '-g', '30',
+                    '-c:a', 'aac',
+                    '-b:a', '192k',
+                ])
+            else:
+                # Если нет аудио - добавляем тихое аудио
+                mpegts_cmd.extend([
+                    '-f', 'lavfi',
+                    '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+                    '-map', '0:v:0',
+                    '-map', '1:a:0',
+                    '-c:v', 'libx264',
+                    '-preset', 'medium',
+                    '-tune', 'zerolatency',
+                    '-pix_fmt', 'yuv420p',
+                    '-b:v', video_bitrate,
+                    '-maxrate', maxrate,
+                    '-bufsize', bufsize,
+                    '-r', str(self.video_fps),
+                    '-g', '30',
+                    '-c:a', 'aac',
+                    '-b:a', '192k',
+                ])
+
+            # Общие параметры
+            mpegts_cmd.extend([
+                '-t', str(duration),
+                '-f', 'mpegts',
+                '-muxdelay', '0',
+                '-muxpreload', '0',
+                '-y',
+                output_path
+            ])
+
+            logger.info(f"🔧 Создание MPEG-TS для кэша: {os.path.basename(video_path)}")
+
+            # Таймаут создания
+            timeout = min(duration + 15, 45)
+
+            result = subprocess.run(
+                mpegts_cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                timeout=timeout
+            )
+
+            if result.returncode != 0:
+                logger.error(f"❌ Ошибка создания MPEG-TS файла (код {result.returncode}):")
+                if result.stderr:
+                    logger.error(f"STDERR: {result.stderr[:500]}")
+                return False
+
+            # Проверяем размер файла
+            if not os.path.exists(output_path) or os.path.getsize(output_path) < 1024:
+                logger.error("❌ Созданный MPEG-TS файл слишком маленький или не существует")
+                return False
+
+            file_size = os.path.getsize(output_path) / 1024 / 1024
+            logger.info(f"✅ MPEG-TS файл создан: {file_size:.1f} MB")
+
+            return True
+
+        except subprocess.TimeoutExpired as e:
+            logger.error(f"❌ Таймаут создания MPEG-TS: {os.path.basename(video_path)}")
+            return False
+        except Exception as e:
+            logger.error(f"❌ Ошибка создания MPEG-TS файла: {e}")
+            return False
+        
     def _stream_controller(self):
-        """Главный контроллер потока - отправляет MPEG-TS данные"""
-        logger.info("🎬 Запуск контроллера MPEG-TS потока")
+        """Главный контроллер потока - отправляет MPEG-TS данные с поддержкой кэша"""
+        logger.info("🎬 Запуск контроллера MPEG-TS потока с кэшем")
 
         while self.is_streaming:
             try:
@@ -1680,17 +2144,82 @@ class FFmpegStreamManager:
                     duration = video_item.get('duration', 10.0)
                     filename = video_item.get('filename', os.path.basename(video_path))
 
-                    logger.info(f"🎬 Отправка видео через MPEG-TS: {filename} ({duration:.1f} сек)")
+                    # Получаем аудио файл если есть в очереди
+                    audio_to_use = None
+                    if self.audio_queue:
+                        audio_to_use = self.audio_queue[0]  # Берем, но не удаляем пока не используем
 
-                    # Создаем MPEG-TS файл с видео и аудио (если есть)
-                    success = self._send_video_as_mpegts(video_path, duration)
+                    logger.info(f"🎬 Обработка видео: {filename} ({duration:.1f} сек)")
+
+                    # Проверяем MPEG-TS кэш
+                    from_cache = False
+                    success = False
+
+                    if self.use_mpegts_cache:
+                        cache_key = self._get_mpegts_cache_key(video_path, audio_to_use)
+                        cache_info = self.get_cached_mpegts(video_path, audio_to_use)
+
+                        if cache_info:
+                            # Используем файл из кэша
+                            logger.info(f"   ✅ Использую MPEG-TS из кэша")
+                            from_cache = True
+
+                            # Отправляем файл из кэша
+                            success = self._send_mpegts_file(cache_info, duration)
+
+                            # Удаляем использованное аудио из очереди если оно было использовано
+                            if audio_to_use and success and self.audio_queue and self.audio_queue[0] == audio_to_use:
+                                self.audio_queue.pop(0)
+
+                    # Если не нашли в кэше или кэш отключен
+                    if not from_cache:
+                        logger.info(f"   🔧 Создание нового MPEG-TS файла")
+
+                        # Создаем временный MPEG-TS файл
+                        temp_mpegts = tempfile.NamedTemporaryFile(suffix='.ts', delete=False)
+                        temp_mpegts.close()
+
+                        # Создаем MPEG-TS файл с видео и аудио (если есть)
+                        success = self._create_mpegts_file(video_path, duration, audio_to_use, temp_mpegts.name)
+
+                        if success:
+                            # Отправляем созданный файл
+                            success = self._send_mpegts_file(temp_mpegts.name, duration)
+
+                            # Удаляем использованное аудио из очереди если оно было использовано
+                            if audio_to_use and success and self.audio_queue and self.audio_queue[0] == audio_to_use:
+                                self.audio_queue.pop(0)
+
+                            # Кэшируем успешно созданный файл
+                            if success and self.use_mpegts_cache and os.path.exists(temp_mpegts.name):
+                                cache_success = self.cache_mpegts_file(video_path, temp_mpegts.name, duration,
+                                                                       audio_to_use,
+                                                                       audio_used=audio_to_use is not None)
+                                if cache_success:
+                                    logger.info(f"   💾 Файл добавлен в кэш")
+
+                            # Удаляем временный файл
+                            if os.path.exists(temp_mpegts.name):
+                                try:
+                                    os.unlink(temp_mpegts.name)
+                                except:
+                                    pass
+                        else:
+                            # Очищаем временный файл если создание не удалось
+                            if os.path.exists(temp_mpegts.name):
+                                try:
+                                    os.unlink(temp_mpegts.name)
+                                except:
+                                    pass
 
                     if success:
                         socketio.emit('video_playing', {
                             'filename': filename,
                             'duration': duration,
                             'timestamp': datetime.now().isoformat(),
-                            'queue_remaining': len(self.video_queue)
+                            'queue_remaining': len(self.video_queue),
+                            'from_cache': from_cache,
+                            'audio_used': audio_to_use is not None
                         })
 
                         # Ждем пока видео воспроизводится
@@ -1698,7 +2227,8 @@ class FFmpegStreamManager:
                     else:
                         logger.error(f"❌ Не удалось отправить видео: {filename}")
                         # Возвращаем в очередь
-                        self.video_queue.insert(0,video_item)
+                        video_item['audio_file'] = audio_to_use  # Сохраняем аудио для повторной попытки
+                        self.video_queue.insert(0, video_item)
                         time.sleep(1)
 
                     self.is_playing_video = False

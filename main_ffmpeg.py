@@ -1698,7 +1698,7 @@ class FFmpegStreamManager:
                     else:
                         logger.error(f"❌ Не удалось отправить видео: {filename}")
                         # Возвращаем в очередь
-                        self.video_queue.insert(0,s video_item)
+                        self.video_queue.insert(0,video_item)
                         time.sleep(1)
 
                     self.is_playing_video = False

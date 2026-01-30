@@ -4043,37 +4043,10 @@ class AIStreamManager:
                 self.active_agent = None
 
                 # ========== ПЕРЕХОД К СЛЕДУЮЩЕМУ АГЕНТУ ==========
+                # ИЗМЕНЕНИЕ: УДАЛЕНЫ ПЕРЕХОДНЫЕ ВИДЕО
                 if agent_idx < len(speaking_order) - 1 and self.is_discussion_active:
-                    pause = random.uniform(1.0, 2.0)
-                    logger.debug(f"⏸️  Пауза между агентами: {pause:.1f} сек")
-
-                    if self.show_video_intros and self.ffmpeg_manager:
-                        try:
-                            next_agent = speaking_order[agent_idx + 1]
-
-                            # Проверяем кэш для перехода
-                            transition_key = f"transition_{agent.name}_to_{next_agent.name}"
-
-                            # Создаем переходное видео
-                            transition_video = await asyncio.to_thread(
-                                self.video_generator.create_transition_video,
-                                from_text=agent.name,
-                                to_text=next_agent.name,
-                                duration=1.5
-                            )
-
-                            if transition_video:
-                                # Добавляем в очередь
-                                self.ffmpeg_manager.add_video_to_queue(transition_video, 1.5)
-                                await asyncio.sleep(1.5)
-                            else:
-                                await asyncio.sleep(pause)
-
-                        except Exception as e:
-                            logger.debug(f"Переход не удался: {e}")
-                            await asyncio.sleep(pause)
-                    else:
-                        await asyncio.sleep(pause)
+                    pause = random.uniform(1.0, 2.0)  # КОРОТКАЯ ПАУЗА МЕЖДУ АГЕНТАМИ
+                    await asyncio.sleep(pause)
 
             logger.info(f"✅ Раунд #{self.discussion_round} завершен")
 
@@ -4087,32 +4060,10 @@ class AIStreamManager:
             await asyncio.sleep(Config.DISCUSSION_INTERVAL // 2)
 
             # Случайная смена темы
+            # ИЗМЕНЕНИЕ: УДАЛЕНО ВИДЕО ПРИ СМЕНЕ ТЕМЫ
             if random.random() > 0.6:
                 old_topic = self.current_topic
-                self.select_topic()
-
-                if self.show_video_intros and self.ffmpeg_manager:
-                    try:
-                        # Создаем видео смены темы
-                        topic_video = await asyncio.to_thread(
-                            lambda: self.video_generator.create_transition_video(
-                                from_text=old_topic[:40],
-                                to_text=self.current_topic[:40],
-                                duration=2.0
-                            )
-                        )
-
-                        if topic_video:
-                            socketio.emit('topic_change_video', {
-                                'old_topic': old_topic,
-                                'new_topic': self.current_topic,
-                                'duration': 2.0
-                            })
-
-                            self.ffmpeg_manager.add_video_to_queue(topic_video, 2.0)
-                            await asyncio.sleep(2.0)
-                    except Exception as e:
-                        logger.debug(f"Смена темы не удалась: {e}")
+                self.select_topic()  # ТОЛЬКО СМЕНА ТЕМЫ БЕЗ ВИДЕО
 
         except Exception as e:
             logger.error(f"❌ Ошибка в раунде дискуссии: {e}", exc_info=True)

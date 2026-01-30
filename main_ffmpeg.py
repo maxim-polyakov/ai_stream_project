@@ -126,6 +126,7 @@ class FFmpegStreamManager:
         self.audio_format = 's16le'
         self.bytes_per_sample = 2
 
+        self.video_generator = VideoGenerator(ffmpeg_manager)
         self.mpegts_cache_dir = 'mpegts_cache'
         os.makedirs(self.mpegts_cache_dir, exist_ok=True)
         self.mpegts_cache = {}  # Кэш MPEG-TS файлов

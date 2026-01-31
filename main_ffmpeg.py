@@ -2421,6 +2421,10 @@ class FFmpegStreamManager:
             # Флаг для предотвращения одновременной отправки
             self.is_sending_data = False
 
+            # Счетчик неудачных попыток отправки
+            failed_attempts = 0
+            MAX_FAILED_ATTEMPTS = 3
+
             # Событие для остановки всех потоков
             stop_event = threading.Event()
 
@@ -2458,10 +2462,61 @@ class FFmpegStreamManager:
 
             # Основной цикл отправки контента (последовательно)
             while self.is_streaming:
+                # Проверяем FFmpeg - если упал, пытаемся перезапустить
                 if not self._check_ffmpeg_alive():
-                    logger.error("❌ FFmpeg процесс завершился. Останавливаю контроллер...")
-                    stop_event.set()
-                    break
+                    logger.warning("⚠️ FFmpeg процесс завершился. Пытаюсь перезапустить...")
+
+                    # Останавливаем все текущие операции
+                    self.is_sending_data = False
+
+                    try:
+                        # Пытаемся перезапустить FFmpeg
+                        logger.info("🔄 Перезапуск FFmpeg процесса...")
+
+                        # Останавливаем старый процесс если он еще есть
+                        if hasattr(self, 'ffmpeg_process') and self.ffmpeg_process:
+                            try:
+                                self.ffmpeg_process.terminate()
+                                self.ffmpeg_process.wait(timeout=5)
+                            except:
+                                pass
+
+                        # Запускаем новый FFmpeg процесс
+                        success = self._start_ffmpeg_stream()
+
+                        if success:
+                            logger.info("✅ FFmpeg успешно перезапущен")
+                            socketio.emit('stream_restored', {
+                                'message': 'FFmpeg перезапущен',
+                                'timestamp': datetime.now().isoformat()
+                            })
+
+                            # Ждем немного для инициализации
+                            time.sleep(3)
+
+                            # Продолжаем работу - НЕ сбрасываем is_first_run!
+                            # Если мы уже перешли в режим отправки по 1 файлу,
+                            # то остаемся в этом режиме даже после перезапуска FFmpeg
+                            logger.info(
+                                f"🔄 Продолжаю стриминг в режиме: {'первый запуск' if is_first_run else 'регулярный режим'}")
+                            continue
+                        else:
+                            logger.error("❌ Не удалось перезапустить FFmpeg")
+                            socketio.emit('stream_error', {
+                                'message': 'Не удалось перезапустить FFmpeg',
+                                'timestamp': datetime.now().isoformat()
+                            })
+                            # Делаем паузу и пытаемся снова
+                            time.sleep(5)
+                            continue
+
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка при перезапуске FFmpeg: {e}")
+                        time.sleep(5)
+                        continue
+
+                # Сбрасываем счетчик неудачных попыток при успешных проверках
+                failed_attempts = 0
 
                 # Определяем сколько файлов нужно для текущей отправки
                 required_files = MIN_FILES_FOR_STREAM if is_first_run else 1
@@ -2546,6 +2601,7 @@ class FFmpegStreamManager:
                         if success:
                             sent_count += 1
                             logger.info(f"✅ Файл отправлен: {file_info['original_video']}")
+                            failed_attempts = 0  # Сбрасываем счетчик при успехе
 
                             socketio.emit('video_playing', {
                                 'filename': file_info['original_video'],
@@ -2558,37 +2614,66 @@ class FFmpegStreamManager:
 
                         else:
                             failed_count += 1
+                            failed_attempts += 1
                             logger.error(f"❌ Ошибка отправки файла: {file_info['original_video']}")
+
+                            # Если слишком много ошибок подряд, делаем паузу и проверяем FFmpeg
+                            if failed_attempts >= MAX_FAILED_ATTEMPTS:
+                                logger.warning(f"⚠️ Достигнут лимит ошибок ({failed_attempts}). Проверяю FFmpeg...")
+                                socketio.emit('stream_warning', {
+                                    'message': f'Слишком много ошибок отправки ({failed_attempts}). Проверка соединения...',
+                                    'timestamp': datetime.now().isoformat()
+                                })
+                                time.sleep(2)
+                                # Выйдем из цикла отправки, проверим FFmpeg на следующей итерации
+                                break
 
                     except Exception as e:
                         failed_count += 1
+                        failed_attempts += 1
                         logger.error(f"❌ Ошибка отправки: {e}")
+
+                        if failed_attempts >= MAX_FAILED_ATTEMPTS:
+                            logger.warning(f"⚠️ Достигнут лимит ошибок ({failed_attempts}). Проверяю FFmpeg...")
+                            socketio.emit('stream_warning', {
+                                'message': f'Критическая ошибка: {str(e)}. Проверка соединения...',
+                                'timestamp': datetime.now().isoformat()
+                            })
+                            time.sleep(2)
+                            break
 
                     finally:
                         self.is_sending_data = False
                         time.sleep(0.5)
 
-                # УДАЛЯЕМ ОТПРАВЛЕННЫЕ ФАЙЛЫ ИЗ КЭША
+                # Если поток остановлен из-за ошибок, выходим
+                if not self.is_streaming:
+                    break
+
+                # УДАЛЯЕМ ОТПРАВЛЕННЫЕ ФАЙЛЫ ИЗ КЭША только если отправка прошла успешно
                 deleted_count = 0
 
-                # Удаляем только успешно отправленные файлы
-                for i in range(min(sent_count, len(files_to_send))):
-                    file_info = files_to_send[i]
+                if sent_count > 0:
+                    # Удаляем только успешно отправленные файлы
+                    for i in range(min(sent_count, len(files_to_send))):
+                        file_info = files_to_send[i]
 
-                    try:
-                        # Удаляем файл с диска
-                        if os.path.exists(file_info['mpegts_path']):
-                            os.unlink(file_info['mpegts_path'])
+                        try:
+                            # Удаляем файл с диска
+                            if os.path.exists(file_info['mpegts_path']):
+                                os.unlink(file_info['mpegts_path'])
 
-                        # Удаляем из кэша
-                        if file_info['cache_key'] in self.mpegts_cache:
-                            del self.mpegts_cache[file_info['cache_key']]
+                            # Удаляем из кэша
+                            if file_info['cache_key'] in self.mpegts_cache:
+                                del self.mpegts_cache[file_info['cache_key']]
 
-                        deleted_count += 1
-                        logger.info(f"🗑️ Удален файл из кэша: {file_info['cache_info']['filename']}")
+                            deleted_count += 1
+                            logger.info(f"🗑️ Удален файл из кэша: {file_info['cache_info']['filename']}")
 
-                    except Exception as e:
-                        logger.error(f"❌ Ошибка удаления файла {file_info['cache_info']['filename']}: {e}")
+                        except Exception as e:
+                            logger.error(f"❌ Ошибка удаления файла {file_info['cache_info']['filename']}: {e}")
+                else:
+                    logger.warning("⚠️ Не удалено ни одного файла, так как отправка не удалась")
 
                 # Сохраняем обновленный индекс кэша
                 if deleted_count > 0:
@@ -2608,14 +2693,21 @@ class FFmpegStreamManager:
                     'deleted_count': deleted_count,
                     'remaining_in_cache': len(self.mpegts_cache),
                     'timestamp': datetime.now().isoformat(),
-                    'is_first_run': is_first_run
+                    'is_first_run': is_first_run,
+                    'status': 'success' if sent_count > 0 else 'failed'
                 })
 
-                time.sleep(2)
+                # Если были ошибки, делаем более длинную паузу
+                sleep_time = 5 if failed_count > 0 else 2
+                time.sleep(sleep_time)
 
         except Exception as e:
             logger.error(f"❌ Ошибка в контроллере потока: {e}", exc_info=True)
             stop_event.set()
+            socketio.emit('stream_error', {
+                'message': f'Ошибка контроллера потока: {str(e)}',
+                'timestamp': datetime.now().isoformat()
+            })
 
         finally:
             stop_event.set()

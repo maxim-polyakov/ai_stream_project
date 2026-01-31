@@ -2490,6 +2490,45 @@ class FFmpegStreamManager:
 
         logger.info("🛑 Контроллер MPEG-TS потока остановлен")
 
+    def _send_mpegts_data(self, mpegts_path: str, duration: float) -> bool:
+        """Отправка MPEG-TS данных через pipe"""
+        try:
+            if not self.is_streaming or not self.ffmpeg_stdin:
+                return False
+
+            file_size = os.path.getsize(mpegts_path)
+            logger.info(f"📤 Отправка MPEG-TS: {file_size / 1024:.1f} KB, {duration:.1f} сек")
+
+            with open(mpegts_path, 'rb') as f:
+                bytes_sent = 0
+                start_time = time.time()
+
+                while bytes_sent < file_size and self.is_streaming:
+                    # Читаем по 64KB за раз
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+
+                    try:
+                        # Отправляем в pipe
+                        self.ffmpeg_stdin.write(chunk)
+                        bytes_sent += len(chunk)
+
+                        # Синхронизируем время
+                        elapsed = time.time() - start_time
+                        expected_time = (bytes_sent / file_size) * duration
+
+                        if elapsed < expected_time:
+                            # Небольшая пауза для синхронизации
+                            time.sleep(0.001)
+
+                    except BrokenPipeError:
+                        logger.error("❌ Broken pipe: FFmpeg отключился")
+                        self.is_streaming = False
+                        return False
+                    except Exception as e:
+                        logger
+                        
     def _create_test_stream_loop(self):
         """Создание тестового потока для заполнения эфира"""
         logger.info("🎬 Запуск тестового потока...")

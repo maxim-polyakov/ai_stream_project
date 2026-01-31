@@ -2413,11 +2413,10 @@ class FFmpegStreamManager:
             time.sleep(3)
 
             # Минимальное количество файлов для начала отправки
-            INITIAL_MIN_FILES = 2  # Для первого запуска
-            REGULAR_MIN_FILES = 1  # Для последующих отправок
+            MIN_FILES_FOR_STREAM = 2
 
-            # Флаг для определения первого запуска
-            is_first_batch = True
+            # Флаг для отслеживания первого запуска
+            is_first_run = True
 
             # Флаг для предотвращения одновременной отправки
             self.is_sending_data = False
@@ -2431,24 +2430,23 @@ class FFmpegStreamManager:
 
                 while self.is_streaming and not stop_event.is_set():
                     try:
-                        # Определяем минимальное количество файлов для текущего состояния
-                        current_min_files = INITIAL_MIN_FILES if is_first_batch else REGULAR_MIN_FILES
-
-                        # Проверяем количество файлов в кэше
+                        # Для мониторинга всегда используем 2 файла как минимальное требование
                         current_cache_size = len(self.mpegts_cache)
 
                         # Если в кэше мало файлов, отправляем событие
-                        if current_cache_size < current_min_files:
-                            logger.info(f"📭 В кэше мало файлов: {current_cache_size}/{current_min_files}")
+                        if current_cache_size < MIN_FILES_FOR_STREAM:
+                            logger.info(f"📭 В кэше мало файлов: {current_cache_size}/{MIN_FILES_FOR_STREAM}")
 
                             socketio.emit('waiting_for_cache', {
                                 'current': current_cache_size,
-                                'required': current_min_files,
-                                'progress': (current_cache_size / current_min_files) * 100,
-                                'message': f'Параллельное накопление кэша: {current_cache_size}/{current_min_files} файлов',
-                                'timestamp': datetime.now().isoformat(),
-                                'is_first_batch': is_first_batch
+                                'required': MIN_FILES_FOR_STREAM,
+                                'progress': (current_cache_size / MIN_FILES_FOR_STREAM) * 100,
+                                'message': f'Параллельное накопление кэша: {current_cache_size}/{MIN_FILES_FOR_STREAM} файлов',
+                                'timestamp': datetime.now().isoformat()
                             })
+
+                        # Здесь можно добавить логику для автоматического пополнения кэша
+                        # если файлов меньше определенного порога
 
                         time.sleep(5)  # Проверяем каждые 5 секунд
 
@@ -2473,13 +2471,13 @@ class FFmpegStreamManager:
                     stop_event.set()
                     break
 
-                # Определяем минимальное количество файлов для текущего состояния
-                current_min_files = INITIAL_MIN_FILES if is_first_batch else REGULAR_MIN_FILES
+                # Определяем сколько файлов нужно для текущей отправки
+                required_files = MIN_FILES_FOR_STREAM if is_first_run else 1
 
                 # Проверяем, достаточно ли файлов для начала/продолжения отправки
-                if len(self.mpegts_cache) < current_min_files:
+                if len(self.mpegts_cache) < required_files:
                     logger.info(
-                        f"⏳ Ожидание файлов: {len(self.mpegts_cache)}/{current_min_files} {'(первая партия)' if is_first_batch else ''}")
+                        f"⏳ Ожидание файлов: {len(self.mpegts_cache)}/{required_files} {'(первый запуск)' if is_first_run else ''}")
 
                     # Короткая пауза и продолжаем цикл
                     # Параллельный поток уже уведомляет о состоянии кэша
@@ -2501,22 +2499,15 @@ class FFmpegStreamManager:
                 cache_items = list(self.mpegts_cache.items())
                 cache_items.sort(key=lambda x: x[1].get('created', 0))
 
-                # Определяем размер батча в зависимости от того, первая ли это отправка
-                batch_size = current_min_files
-
-                # Для первого батча берем 2 файла или сколько есть (но не меньше минимального)
-                # Для последующих - берем только 1 файл
-                if is_first_batch:
-                    # Берем минимум между 2 и количеством доступных файлов
-                    batch_size = min(INITIAL_MIN_FILES, len(cache_items))
-                else:
-                    # Берем только 1 файл для последующих отправок
-                    batch_size = min(REGULAR_MIN_FILES, len(cache_items))
-
+                # Определяем сколько файлов взять для отправки
+                batch_size = required_files if is_first_run else 1
                 files_to_send = []
                 files_to_delete = []  # Файлы для удаления после отправки
 
                 for i in range(batch_size):
+                    if i >= len(cache_items):
+                        break
+
                     cache_key, cache_info = cache_items[i]
                     mpegts_path = os.path.join(self.mpegts_cache_dir, cache_info['filename'])
 
@@ -2528,8 +2519,7 @@ class FFmpegStreamManager:
                             'duration': cache_info.get('duration', 10.0),
                             'original_video': cache_info.get('original_video', 'unknown'),
                             'index': i + 1,
-                            'total': batch_size,
-                            'is_first_batch': is_first_batch
+                            'total': batch_size
                         })
 
                         # Добавляем в список для удаления
@@ -2544,8 +2534,8 @@ class FFmpegStreamManager:
                     time.sleep(5)
                     continue
 
-                logger.info(f"📦 Начинаю последовательную отправку {len(files_to_send)} файлов"
-                            f" {'(первая партия)' if is_first_batch else ''}")
+                logger.info(
+                    f"📦 Начинаю последовательную отправку {len(files_to_send)} файлов {'(первый запуск)' if is_first_run else ''}")
 
                 sent_count = 0
                 failed_count = 0
@@ -2568,7 +2558,6 @@ class FFmpegStreamManager:
                         logger.info(
                             f"📤 Отправка [{file_info['index']}/{file_info['total']}]: "
                             f"{file_info['original_video']} ({file_info['duration']:.1f} сек)"
-                            f" {'(первая партия)' if file_info['is_first_batch'] else ''}"
                         )
 
                         success = self._send_mpegts_data(
@@ -2586,8 +2575,7 @@ class FFmpegStreamManager:
                                 'timestamp': datetime.now().isoformat(),
                                 'position': f"{file_info['index']}/{file_info['total']}",
                                 'total_in_cache': len(self.mpegts_cache),
-                                'queue_remaining': len(files_to_send) - file_info['index'],
-                                'is_first_batch': file_info['is_first_batch']
+                                'queue_remaining': len(files_to_send) - file_info['index']
                             })
 
                         else:
@@ -2627,13 +2615,12 @@ class FFmpegStreamManager:
                     self._save_mpegts_cache_index()
                     logger.info(f"🧹 Удалено {deleted_count} файлов из кэша после отправки")
 
-                # После успешной отправки первого батча меняем флаг
-                if is_first_batch and sent_count > 0:
-                    logger.info("🔄 Первый батч отправлен. Перехожу на отправку по 1 файлу.")
-                    is_first_batch = False
+                # После успешной отправки первого запуска меняем флаг
+                if is_first_run and sent_count > 0:
+                    logger.info("🔄 Первый запуск завершен. Теперь отправляю по 1 файлу за раз.")
+                    is_first_run = False
 
-                logger.info(f"📊 Итог отправки: {sent_count} успешно, {failed_count} с ошибками"
-                            f" {'(первый батч)' if is_first_batch else ''}")
+                logger.info(f"📊 Итог отправки: {sent_count} успешно, {failed_count} с ошибками")
 
                 socketio.emit('batch_complete', {
                     'sent_count': sent_count,
@@ -2641,8 +2628,7 @@ class FFmpegStreamManager:
                     'deleted_count': deleted_count,
                     'remaining_in_cache': len(self.mpegts_cache),
                     'timestamp': datetime.now().isoformat(),
-                    'is_first_batch': is_first_batch,
-                    'next_batch_size': REGULAR_MIN_FILES  # Сообщаем размер следующего батча
+                    'is_first_run': is_first_run
                 })
 
                 # Короткая пауза перед следующей проверкой
@@ -2655,7 +2641,6 @@ class FFmpegStreamManager:
         finally:
             stop_event.set()
             logger.info("🛑 Контроллер MPEG-TS потока остановлен")
-
 
     def _cleanup_old_cache_files(self, max_age_hours: int = 6):
         """Безопасная очистка старых файлов в кэше"""

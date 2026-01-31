@@ -1904,6 +1904,35 @@ class FFmpegStreamManager:
     def _create_mpegts_file(self, video_path: str, duration: float, audio_file: str, output_path: str) -> bool:
         """Создание MPEG-TS файла для кэширования с оптимизированным битрейтом"""
         try:
+            # Получаем длину аудио, если файл существует
+            audio_duration = 0
+            if audio_file and os.path.exists(audio_file):
+                try:
+                    # Используем ffprobe для получения длительности аудио
+                    probe_cmd = [
+                        'ffprobe',
+                        '-v', 'error',
+                        '-show_entries', 'format=duration',
+                        '-of', 'default=noprint_wrappers=1:nokey=1',
+                        audio_file
+                    ]
+                    result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
+                    if result.returncode == 0:
+                        audio_duration = float(result.stdout.strip())
+                        logger.info(f"🎵 Длительность аудио: {audio_duration:.2f} сек, видео: {duration:.2f} сек")
+                except Exception as e:
+                    logger.warning(f"⚠️ Не удалось получить длительность аудио: {e}")
+
+            # Определяем, нужно ли зацикливать видео
+            loop_video = False
+            actual_duration = duration
+            original_video_path = video_path
+
+            if audio_duration > duration:
+                loop_video = True
+                actual_duration = audio_duration
+                logger.info(f"🔄 Аудио длиннее видео, зациклю видео до {actual_duration:.2f} сек")
+
             # ОПТИМИЗИРОВАННЫЙ БИТРЕЙТ ДЛЯ YOUTUBE
             video_bitrate = '5000k'  # Достаточно для 1080p
             maxrate = '5500k'
@@ -1934,11 +1963,21 @@ class FFmpegStreamManager:
                     logger.info(f"📊 Автоопределение: {width}x{height} -> битрейт {video_bitrate}")
 
             # Команда для создания MPEG-TS потока
-            mpegts_cmd = [
-                'ffmpeg',
-                '-re',  # Реальное время
-                '-i', video_path,
-            ]
+            mpegts_cmd = ['ffmpeg']
+
+            # Если нужно зациклить видео, используем фильтр stream_loop
+            if loop_video:
+                mpegts_cmd.extend([
+                    '-re',
+                    '-stream_loop', '-1',  # Бесконечное зацикливание
+                    '-i', video_path,
+                    '-t', str(actual_duration),  # Ограничиваем по длительности аудио
+                ])
+            else:
+                mpegts_cmd.extend([
+                    '-re',  # Реальное время
+                    '-i', video_path,
+                ])
 
             # Добавляем аудио источник если есть
             if audio_file and os.path.exists(audio_file):
@@ -1949,7 +1988,7 @@ class FFmpegStreamManager:
                     '-map', '1:a:0',
                     '-c:v', 'libx264',
                     '-preset', 'medium',
-                    '-tune', 'film' if duration > 10 else 'zerolatency',
+                    '-tune', 'film' if actual_duration > 10 else 'zerolatency',
                     '-pix_fmt', 'yuv420p',
                     '-profile:v', 'high',
                     '-level', '4.1',
@@ -1975,7 +2014,7 @@ class FFmpegStreamManager:
                     '-map', '1:a:0',
                     '-c:v', 'libx264',
                     '-preset', 'medium',
-                    '-tune', 'film' if duration > 10 else 'zerolatency',
+                    '-tune', 'film' if actual_duration > 10 else 'zerolatency',
                     '-pix_fmt', 'yuv420p',
                     '-profile:v', 'high',
                     '-level', '4.1',
@@ -1995,19 +2034,22 @@ class FFmpegStreamManager:
 
             # Общие параметры
             mpegts_cmd.extend([
-                '-t', str(duration),
+                '-t', str(actual_duration),  # Используем фактическую длительность
                 '-f', 'mpegts',
                 '-muxdelay', '0',
                 '-muxpreload', '0',
                 '-flush_packets', '1',
+                '-avoid_negative_ts', 'make_zero',
                 '-y',
                 output_path
             ])
 
             logger.info(f"🔧 Создание MPEG-TS для кэша: {os.path.basename(video_path)} с битрейтом {video_bitrate}")
+            if loop_video:
+                logger.info(f"🔄 Видео будет зациклено до {actual_duration:.1f} сек")
 
             # Таймаут создания
-            timeout = min(duration + 15, 45)
+            timeout = min(actual_duration + 15, 45)
 
             result = subprocess.run(
                 mpegts_cmd,
@@ -2028,7 +2070,7 @@ class FFmpegStreamManager:
                     logger.error(f"STDERR: {result.stderr[:500]}")
 
                 # Очищаем оптимизированный файл если он был создан
-                if optimized_video != video_path and os.path.exists(optimized_video):
+                if optimized_video != original_video_path and os.path.exists(optimized_video):
                     try:
                         os.unlink(optimized_video)
                     except:
@@ -2040,7 +2082,7 @@ class FFmpegStreamManager:
             if not os.path.exists(output_path) or os.path.getsize(output_path) < 1024:
                 logger.error("❌ Созданный MPEG-TS файл слишком маленький или не существует")
                 # Очищаем оптимизированный файл
-                if optimized_video != video_path and os.path.exists(optimized_video):
+                if optimized_video != original_video_path and os.path.exists(optimized_video):
                     try:
                         os.unlink(optimized_video)
                     except:
@@ -2048,36 +2090,22 @@ class FFmpegStreamManager:
                 return False
 
             file_size = os.path.getsize(output_path) / 1024 / 1024
-            calculated_bitrate = (file_size * 8 * 1024 * 1024) / duration / 1000  # kbps
+            calculated_bitrate = (file_size * 8 * 1024 * 1024) / actual_duration / 1000  # kbps
 
             logger.info(f"✅ MPEG-TS файл создан: {file_size:.1f} MB, битрейт ~{calculated_bitrate:.0f} kbps")
+            if loop_video:
+                logger.info(f"✅ Видео зациклено для синхронизации с аудио ({duration:.1f} → {actual_duration:.1f} сек)")
 
             # Очищаем оптимизированный файл
-            if optimized_video != video_path and os.path.exists(optimized_video):
+            if optimized_video != original_video_path and os.path.exists(optimized_video):
                 try:
                     os.unlink(optimized_video)
                 except:
                     pass
 
             return True
-
-        except subprocess.TimeoutExpired as e:
-            logger.error(f"❌ Таймаут создания MPEG-TS: {os.path.basename(video_path)}")
-            # Очищаем оптимизированный файл
-            if 'optimized_video' in locals() and optimized_video != video_path and os.path.exists(optimized_video):
-                try:
-                    os.unlink(optimized_video)
-                except:
-                    pass
-            return False
         except Exception as e:
-            logger.error(f"❌ Ошибка создания MPEG-TS файла: {e}")
-            # Очищаем оптимизированный файл
-            if 'optimized_video' in locals() and optimized_video != video_path and os.path.exists(optimized_video):
-                try:
-                    os.unlink(optimized_video)
-                except:
-                    pass
+            logger.error(f"❌ Непредвиденная ошибка в _create_mpegts_file: {e}")
             return False
 
     def _create_mpegts_file(self, video_path: str, duration: float, audio_file: str, output_path: str) -> bool:

@@ -4201,7 +4201,7 @@ class AIStreamManager:
         return self.current_topic
 
     async def run_discussion_round(self):
-        """Оптимизированный метод - создает MPEG-TS файлы и сохраняет в кэш"""
+        """Оптимизированный метод - создает MPEG-TS файлы в отдельном потоке и сохраняет в кэш"""
         if self.is_discussion_active:
             return
 
@@ -4251,22 +4251,22 @@ class AIStreamManager:
                     'expertise': agent.expertise
                 })
 
-                # ========== СОЗДАНИЕ MPEG-TS ДЛЯ КЭША ==========
+                # ========== СОЗДАНИЕ КОНТЕНТА ==========
                 audio_file = None
                 video_message = None
 
                 try:
-                    # 1. Генерируем аудио
-                    audio_file = await self.tts_manager.generate_audio_only(
+                    # 1. Генерируем аудио в отдельном потоке (уже так делали)
+                    audio_file = await asyncio.to_thread(
+                        self.tts_manager.generate_audio_only,
                         text=message,
                         voice_id=agent.voice,
                         agent_name=agent.name
                     )
 
-                    # 2. Создаем видео с сообщением
+                    # 2. Создаем видео с сообщением в отдельном потоке (уже так делали)
                     message_video_duration = min(max(len(message.split()) * 0.2, 3), 10)
 
-                    # Создаем видео сообщения
                     video_message = await asyncio.to_thread(
                         self.video_generator.create_message_video,
                         agent_name=agent.name,
@@ -4274,46 +4274,55 @@ class AIStreamManager:
                         duration=message_video_duration
                     )
 
+                    # 3. Запускаем генерацию MPEG-TS в ОТДЕЛЬНОМ ПОТОКЕ (это новое)
                     if audio_file and video_message and self.ffmpeg_manager:
-                        # Создаем MPEG-TS файл с видео и аудио
-                        timestamp = int(time.time())
-                        mpegts_filename = f"mpegts_{agent.name}_{timestamp}.ts"
-                        mpegts_path = os.path.join(self.ffmpeg_manager.mpegts_cache_dir, mpegts_filename)
+                        # Создаем MPEG-TS файл в фоновом потоке
+                        def generate_mpegts_background():
+                            try:
+                                logger.info(f"🔧 Фоновая генерация MPEG-TS для {agent.name}...")
 
-                        # Создаем MPEG-TS файл
-                        success = self.ffmpeg_manager._create_mpegts_file(
-                            video_message,
-                            message_video_duration,
-                            audio_file,
-                            mpegts_path
-                        )
+                                timestamp = int(time.time())
+                                mpegts_filename = f"mpegts_{agent.name}_{timestamp}.ts"
+                                mpegts_path = os.path.join(self.ffmpeg_manager.mpegts_cache_dir, mpegts_filename)
 
-                        if success:
-                            # Добавляем в кэш
-                            cache_key = self.ffmpeg_manager._get_mpegts_cache_key(video_message, audio_file)
-                            self.ffmpeg_manager.cache_mpegts_file(
-                                video_message,
-                                mpegts_path,
-                                message_video_duration,
-                                audio_file,
-                                True
-                            )
+                                # Используем ваш существующий метод _create_mpegts_file
+                                success = self.ffmpeg_manager._create_mpegts_file(
+                                    video_message,
+                                    message_video_duration,
+                                    audio_file,
+                                    mpegts_path
+                                )
 
-                            logger.info(f"💾 MPEG-TS файл сохранен в кэш: {mpegts_filename}")
-                            logger.info(f"📊 В кэше: {len(self.ffmpeg_manager.mpegts_cache)} файлов")
+                                if success:
+                                    # Добавляем в кэш
+                                    cache_key = self.ffmpeg_manager._get_mpegts_cache_key(video_message, audio_file)
+                                    self.ffmpeg_manager.cache_mpegts_file(
+                                        video_message,
+                                        mpegts_path,
+                                        message_video_duration,
+                                        audio_file,
+                                        True
+                                    )
 
-                            # Отправляем уведомление о создании файла
-                            socketio.emit('mpegts_created', {
-                                'agent_name': agent.name,
-                                'filename': mpegts_filename,
-                                'duration': message_video_duration,
-                                'cache_size': len(self.ffmpeg_manager.mpegts_cache),
-                                'timestamp': datetime.now().isoformat()
-                            })
-                        else:
-                            logger.error(f"❌ Не удалось создать MPEG-TS файл для {agent.name}")
+                                    logger.info(f"💾 MPEG-TS сгенерирован в фоне: {mpegts_filename}")
 
-                    # Имитируем воспроизведение для пользователя
+                                    socketio.emit('mpegts_generated', {
+                                        'agent_name': agent.name,
+                                        'filename': mpegts_filename,
+                                        'duration': message_video_duration,
+                                        'cache_size': len(self.ffmpeg_manager.mpegts_cache),
+                                        'timestamp': datetime.now().isoformat()
+                                    })
+                                else:
+                                    logger.error(f"❌ Не удалось сгенерировать MPEG-TS для {agent.name}")
+
+                            except Exception as e:
+                                logger.error(f"❌ Ошибка в фоновой генерации MPEG-TS: {e}")
+
+                        # Запускаем в отдельном потоке
+                        threading.Thread(target=generate_mpegts_background, daemon=True).start()
+
+                    # Имитируем воспроизведение для пользователя (независимо от MPEG-TS генерации)
                     audio_duration = self.tts_manager._get_audio_duration(audio_file) if audio_file else 5.0
                     logger.info(f"🔊 Аудио создано: {agent.name} ({audio_duration:.1f} сек)")
                     await asyncio.sleep(audio_duration)

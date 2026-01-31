@@ -1920,9 +1920,15 @@ class FFmpegStreamManager:
             file_size = os.path.getsize(mpegts_path)
             logger.info(f"📤 Отправка {file_size / 1024:.1f} KB MPEG-TS данных как часть непрерывного потока")
 
+            # Рассчитываем скорость отправки (байт/сек)
+            bytes_per_second = file_size / duration
+
             with open(mpegts_path, 'rb') as f:
                 bytes_sent = 0
-                chunk_size = 188 * 7 * 1024  # MPEG-TS пакеты по 188 байт, 7KB чанки
+                start_time = time.time()
+
+                # Оптимальный размер чанка для MPEG-TS (188 байт * 7 * 1024 ≈ 1.3MB)
+                chunk_size = 188 * 7 * 1024
 
                 while bytes_sent < file_size and self.is_streaming:
                     chunk = f.read(chunk_size)
@@ -1930,18 +1936,33 @@ class FFmpegStreamManager:
                         break
 
                     try:
-                        # Проверяем что это валидные MPEG-TS данные
-                        if len(chunk) % 188 == 0:  # MPEG-TS пакеты должны быть кратно 188 байтам
-                            self.ffmpeg_stdin.write(chunk)
-                            self.ffmpeg_stdin.flush()
-                            bytes_sent += len(chunk)
+                        # Отправляем чанк
+                        self.ffmpeg_stdin.write(chunk)
+                        bytes_sent += len(chunk)
 
-                            # Синхронизация времени
-                            elapsed_bytes = bytes_sent
-                            expected_time = (elapsed_bytes / file_size) * duration
+                        # Синхронизация времени для ПРАВИЛЬНОЙ СКОРОСТИ
+                        current_time = time.time()
+                        elapsed = current_time - start_time
+                        expected_time = bytes_sent / bytes_per_second
 
-                            # Маленькая пауза для предотвращения перегрузки
-                            time.sleep(0.001)
+                        # Если отправляем быстрее чем нужно, замедляемся
+                        if elapsed < expected_time:
+                            sleep_time = expected_time - elapsed
+                            if sleep_time > 0.001:  # Только если пауза значительная
+                                # Но не слишком долго, чтобы не блокировать
+                                time.sleep(min(sleep_time, 0.05))
+
+                        # Периодически сбрасываем буфер
+                        if bytes_sent % (chunk_size * 100) == 0:  # Каждые ~130MB
+                            try:
+                                self.ffmpeg_stdin.flush()
+                            except:
+                                pass
+
+                            # Логируем прогресс
+                            progress = (bytes_sent / file_size) * 100
+                            current_bitrate = (bytes_sent * 8) / (elapsed * 1000)  # kbps
+                            logger.info(f"📊 Прогресс: {progress:.1f}%, битрейт: {current_bitrate:.1f} kbps")
 
                     except BrokenPipeError:
                         logger.error("❌ Broken pipe: FFmpeg отключился")
@@ -1951,11 +1972,26 @@ class FFmpegStreamManager:
                         logger.error(f"❌ Ошибка отправки MPEG-TS: {e}")
                         return False
 
-            logger.info(f"✅ Отправлено {bytes_sent}/{file_size} байт")
+            # Финальный сброс буфера
+            if self.ffmpeg_stdin:
+                try:
+                    self.ffmpeg_stdin.flush()
+                except:
+                    pass
+
+            total_time = time.time() - start_time
+            actual_bitrate = (bytes_sent * 8) / (total_time * 1000)  # kbps
+
+            logger.info(f"✅ Отправлено {bytes_sent}/{file_size} байт за {total_time:.1f} сек")
+            logger.info(f"📊 Фактический битрейт: {actual_bitrate:.1f} kbps")
+
+            if actual_bitrate < 1000:
+                logger.warning(f"⚠️ НИЗКИЙ БИТРЕЙТ: {actual_bitrate:.1f} kbps")
+
             return bytes_sent >= file_size * 0.9  # Успех если >90%
 
         except Exception as e:
-            logger.error(f"❌ Ошибка отправки MPEG-TS файла: {e}")
+            logger.error(f"❌ Ошибка отправки MPEG-TS файла: {e}", exc_info=True)
             return False
 
     def _send_test_stream(self, duration: float):
@@ -1967,10 +2003,9 @@ class FFmpegStreamManager:
             test_mpegts = tempfile.NamedTemporaryFile(suffix='.ts', delete=False)
             test_mpegts.close()
 
-            # Используем переданную длительность
             duration_str = str(duration)
 
-            # Команда для создания тестового MPEG-TS потока
+            # Команда для создания тестового MPEG-TS потока с ПРАВИЛЬНЫМ БИТРЕЙТОМ
             cmd = [
                 'ffmpeg',
                 '-f', 'lavfi',
@@ -1979,18 +2014,18 @@ class FFmpegStreamManager:
                 '-f', 'lavfi',
                 '-i', f'anullsrc=channel_layout=stereo:sample_rate=44100:duration={duration_str}',
                 '-c:v', 'libx264',
-                '-preset', 'ultrafast',
+                '-preset', 'veryfast',  # Лучше чем ultrafast для качества
                 '-tune', 'zerolatency',
                 '-pix_fmt', 'yuv420p',
-                '-b:v', '2000k',
-                '-maxrate', '2000k',
-                '-bufsize', '4000k',
+                '-b:v', '3000k',  # УВЕЛИЧИВАЕМ БИТРЕЙТ
+                '-maxrate', '4000k',
+                '-bufsize', '8000k',
                 '-g', '60',
                 '-c:a', 'aac',
-                '-b:a', '96k',
+                '-b:a', '128k',  # Стандартный для YouTube
                 '-ar', '44100',
                 '-ac', '2',
-                '-t', duration_str,  # Используем переданную длительность
+                '-t', duration_str,
                 '-f', 'mpegts',
                 '-y',
                 test_mpegts.name
@@ -2007,23 +2042,27 @@ class FFmpegStreamManager:
 
             if result.returncode == 0:
                 file_size = os.path.getsize(test_mpegts.name)
-                logger.info(f"✅ Тестовый MPEG-TS создан: {file_size / 1024:.1f} KB")
+                calculated_bitrate = (file_size * 8) / (duration * 1000)  # kbps
+                logger.info(
+                    f"✅ Тестовый MPEG-TS создан: {file_size / 1024:.1f} KB, битрейт: {calculated_bitrate:.1f} kbps")
 
-                # Отправляем используя правильный метод
-                if hasattr(self, '_send_mpegts_data'):
-                    success = self._send_mpegts_data(test_mpegts.name, duration)
-                elif hasattr(self, '_send_continuous_mpegts'):
-                    success = self._send_continuous_mpegts(test_mpegts.name, duration)
-                else:
-                    logger.error("❌ Метод отправки MPEG-TS не найден")
-                    success = False
+                if calculated_bitrate < 2000:
+                    logger.warning(f"⚠️ Тестовый поток имеет низкий битрейт: {calculated_bitrate:.1f} kbps")
+
+                # Используем метод непрерывной отправки
+                success = self._send_continuous_mpegts(test_mpegts.name, duration)
 
                 # Удаляем временный файл
                 os.unlink(test_mpegts.name)
 
                 return success
             else:
-                logger.error(f"❌ Ошибка создания тестового потока: {result.stderr[:200]}")
+                logger.error(f"❌ Ошибка создания тестового потока (код {result.returncode}):")
+                if result.stderr:
+                    # Ищем ошибки битрейта
+                    for line in result.stderr.split('\n'):
+                        if 'bitrate' in line.lower() or 'buffer' in line.lower():
+                            logger.error(f"   🎯 {line[:100]}")
                 return False
 
         except Exception as e:

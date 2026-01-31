@@ -2494,19 +2494,40 @@ class FFmpegStreamManager:
         """Отправка MPEG-TS данных через pipe"""
         try:
             if not self.is_streaming or not self.ffmpeg_stdin:
+                logger.warning("⚠️ FFmpeg не активен или stdin недоступен")
+                return False
+
+            if not os.path.exists(mpegts_path):
+                logger.error(f"❌ Файл не найден: {mpegts_path}")
                 return False
 
             file_size = os.path.getsize(mpegts_path)
-            logger.info(f"📤 Отправка MPEG-TS: {file_size / 1024:.1f} KB, {duration:.1f} сек")
+            if file_size < 1024:  # Минимум 1KB
+                logger.error(f"❌ Файл слишком маленький: {file_size} байт")
+                return False
+
+            logger.info(
+                f"📤 Отправка MPEG-TS: {os.path.basename(mpegts_path)} - {file_size / 1024:.1f} KB, {duration:.1f} сек")
 
             with open(mpegts_path, 'rb') as f:
                 bytes_sent = 0
                 start_time = time.time()
+                last_log_time = start_time
+
+                # Рассчитываем целевую скорость отправки (байт/сек)
+                target_bytes_per_second = file_size / duration
 
                 while bytes_sent < file_size and self.is_streaming:
-                    # Читаем по 64KB за раз
-                    chunk = f.read(65536)
+                    # Читаем оптимальный размер чанка для MPEG-TS (кратно 188 байтам)
+                    # MPEG-TS пакеты = 188 байт, берем 350 пакетов за раз
+                    chunk_size = 188 * 350  # ~65.8KB
+                    chunk = f.read(chunk_size)
+
                     if not chunk:
+                        # Если файл меньше chunk_size
+                        if bytes_sent == 0:
+                            logger.error("❌ Не удалось прочитать файл")
+                            return False
                         break
 
                     try:
@@ -2514,21 +2535,108 @@ class FFmpegStreamManager:
                         self.ffmpeg_stdin.write(chunk)
                         bytes_sent += len(chunk)
 
-                        # Синхронизируем время
-                        elapsed = time.time() - start_time
-                        expected_time = (bytes_sent / file_size) * duration
+                        # Периодически сбрасываем буфер
+                        if bytes_sent % (188 * 3500) == 0:  # Каждые 3500 пакетов
+                            try:
+                                self.ffmpeg_stdin.flush()
+                            except:
+                                pass
 
+                        # Синхронизируем время для равномерной отправки
+                        current_time = time.time()
+                        elapsed = current_time - start_time
+
+                        # Рассчитываем ожидаемое время для отправленных байт
+                        expected_time = bytes_sent / target_bytes_per_second
+
+                        # Если мы отправляем быстрее чем нужно, замедляемся
                         if elapsed < expected_time:
-                            # Небольшая пауза для синхронизации
-                            time.sleep(0.001)
+                            sleep_time = expected_time - elapsed
+                            if sleep_time > 0.001:  # Только если пауза значительная
+                                # Но не слишком долго, чтобы не блокировать
+                                time.sleep(min(sleep_time, 0.05))
+
+                        # Логируем прогресс каждые 2 секунды
+                        if current_time - last_log_time > 2.0:
+                            progress = (bytes_sent / file_size) * 100
+                            elapsed_str = f"{elapsed:.1f}/{duration:.1f} сек"
+                            logger.info(f"📊 Прогресс: {progress:.1f}% ({bytes_sent}/{file_size} байт) - {elapsed_str}")
+                            last_log_time = current_time
+
+                            # Отправляем прогресс через WebSocket
+                            try:
+                                socketio.emit('stream_progress', {
+                                    'filename': os.path.basename(mpegts_path),
+                                    'progress': progress,
+                                    'bytes_sent': bytes_sent,
+                                    'total_bytes': file_size,
+                                    'elapsed': elapsed,
+                                    'duration': duration,
+                                    'timestamp': datetime.now().isoformat()
+                                })
+                            except:
+                                pass
 
                     except BrokenPipeError:
                         logger.error("❌ Broken pipe: FFmpeg отключился")
                         self.is_streaming = False
                         return False
+                    except OSError as e:
+                        if e.errno == 32:  # Broken pipe
+                            logger.error("❌ Broken pipe (OSError): FFmpeg отключился")
+                            self.is_streaming = False
+                            return False
+                        else:
+                            logger.error(f"❌ Ошибка записи в pipe: {e}")
+                            return False
                     except Exception as e:
-                        logger
-                        
+                        logger.error(f"❌ Неожиданная ошибка записи: {e}")
+                        return False
+
+            # Финальный сброс буфера
+            if self.ffmpeg_stdin:
+                try:
+                    self.ffmpeg_stdin.flush()
+                except:
+                    pass
+
+            # Проверяем результат
+            total_elapsed = time.time() - start_time
+            success_ratio = bytes_sent / file_size
+
+            if success_ratio >= 0.99:  # 99% успешно
+                logger.info(f"✅ MPEG-TS успешно отправлен за {total_elapsed:.1f} сек (ожидалось {duration:.1f} сек)")
+                logger.info(
+                    f"📊 Результат: {bytes_sent}/{file_size} байт ({success_ratio * 100:.1f}%), скорость: {file_size / total_elapsed / 1024:.1f} KB/сек")
+                return True
+            elif success_ratio >= 0.9:  # 90% успешно
+                logger.warning(
+                    f"⚠️ MPEG-TS частично отправлен: {bytes_sent}/{file_size} байт ({success_ratio * 100:.1f}%)")
+                logger.warning(f"📊 Время: {total_elapsed:.1f} сек (ожидалось {duration:.1f} сек)")
+                # Все равно считаем успехом для непрерывности
+                return True
+            elif success_ratio >= 0.8:  # 80% успешно
+                logger.warning(
+                    f"⚠️ MPEG-TS отправлен с ошибками: {bytes_sent}/{file_size} байт ({success_ratio * 100:.1f}%)")
+                logger.warning(f"📊 Время: {total_elapsed:.1f} сек (ожидалось {duration:.1f} сек)")
+                # Пробуем продолжить
+                return True
+            else:
+                logger.error(
+                    f"❌ MPEG-TS отправка провалилась: {bytes_sent}/{file_size} байт ({success_ratio * 100:.1f}%)")
+                logger.error(f"📊 Время: {total_elapsed:.1f} сек (ожидалось {duration:.1f} сек)")
+                return False
+
+        except FileNotFoundError:
+            logger.error(f"❌ Файл не найден: {mpegts_path}")
+            return False
+        except PermissionError:
+            logger.error(f"❌ Нет доступа к файлу: {mpegts_path}")
+            return False
+        except Exception as e:
+            logger.error(f"❌ Критическая ошибка отправки MPEG-TS данных: {e}", exc_info=True)
+            return False
+
     def _create_test_stream_loop(self):
         """Создание тестового потока для заполнения эфира"""
         logger.info("🎬 Запуск тестового потока...")

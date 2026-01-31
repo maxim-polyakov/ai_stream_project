@@ -2194,21 +2194,21 @@ class FFmpegStreamManager:
             logger.error(f"❌ Ошибка конвертации MPEG-TS файла: {e}")
             return False
 
-    def _refresh_cached_files_queue(self, max_files: int = 20):
+    def _refresh_cached_files_queue(self, limit: int = 20):
         """Обновление очереди файлов из кэша MPEG-TS"""
         try:
             if not self.use_mpegts_cache or not self.mpegts_cache:
                 return []
 
-            # Сортируем файлы по времени последнего доступа (старые первыми)
+            # Сортируем файлы по времени создания (новые первыми)
             cache_items = list(self.mpegts_cache.items())
-            cache_items.sort(key=lambda x: x[1].get('last_accessed', 0))
+            cache_items.sort(key=lambda x: x[1].get('created', 0), reverse=True)
 
             cached_files_queue = []
 
-            # Берем до max_files файлов
+            # Берем до limit файлов
             for i, (cache_key, cache_info) in enumerate(cache_items):
-                if i >= max_files:
+                if i >= limit:
                     break
 
                 mpegts_path = os.path.join(self.mpegts_cache_dir, cache_info['filename'])
@@ -2218,7 +2218,8 @@ class FFmpegStreamManager:
                         'duration': cache_info.get('duration', 10.0),
                         'original_filename': cache_info.get('original_video', 'unknown'),
                         'cache_key': cache_key,
-                        'audio_used': cache_info.get('audio_used', False)
+                        'audio_used': cache_info.get('audio_used', False),
+                        'created': cache_info.get('created', 0)
                     })
 
             return cached_files_queue
@@ -2510,8 +2511,8 @@ class FFmpegStreamManager:
             return False
 
     def _stream_controller(self):
-        """Главный контроллер потока - отправляет MPEG-TS данные с интеллектуальным кэшем"""
-        logger.info("🎬 Запуск контроллера MPEG-TS потока с интеллектуальным кэшем")
+        """Главный контроллер потока - отправляет MPEG-TS файлы ТОЛЬКО из кэша"""
+        logger.info("🎬 Запуск контроллера MPEG-TS потока (только из кэша)")
 
         # Минимальное количество файлов в кэше для отправки
         MIN_CACHE_FILES_FOR_SEND = 10
@@ -2521,33 +2522,39 @@ class FFmpegStreamManager:
         # Список файлов из кэша, готовых к отправке
         cached_files_queue = []
 
+        # Ждем запуска FFmpeg
+        time.sleep(3)
+
         while self.is_streaming:
             try:
-                # Шаг 0: Проверяем видео кэш на новые файлы (папка video_cache)
-                self._check_video_cache_for_new_files()
-
                 if not self._check_ffmpeg_alive():
                     logger.error("❌ FFmpeg процесс завершился. Останавливаю контроллер...")
                     break
 
-                # Шаг 1: Проверяем и обновляем очередь файлов из кэша MPEG-TS
-                # Если в кэше меньше MIN_CACHE_FILES_FOR_SEND, собираем больше
+                # Шаг 1: Загружаем файлы из кэша MPEG-TS
                 if len(cached_files_queue) < MIN_CACHE_FILES_FOR_SEND and self.use_mpegts_cache:
                     # Загружаем новые файлы из кэша
-                    new_cached_files = self._refresh_cached_files_queue()
+                    new_cached_files = self._refresh_cached_files_queue(limit=20)
                     if new_cached_files:
                         cached_files_queue.extend(new_cached_files)
                         logger.info(
-                            f"📂 Загружено {len(new_cached_files)} файлов из кэша MPEG-TS, всего: {len(cached_files_queue)}")
+                            f"📂 Загружено {len(new_cached_files)} файлов из кэша, всего: {len(cached_files_queue)}")
+
+                        # Отправляем статистику
+                        socketio.emit('cache_status', {
+                            'files_in_cache': len(cached_files_queue),
+                            'min_for_send': MIN_CACHE_FILES_FOR_SEND,
+                            'status': 'accumulating' if len(cached_files_queue) < MIN_CACHE_FILES_FOR_SEND else 'ready'
+                        })
 
                 # Шаг 2: Отправка файлов из кэша MPEG-TS (только когда набралось достаточно)
                 if len(cached_files_queue) >= MIN_CACHE_FILES_FOR_SEND:
                     self.is_playing_video = True
 
-                    # Определяем сколько файлов отправить (не более MAX_CACHE_BATCH)
+                    # Определяем сколько файлов отправить
                     batch_size = min(len(cached_files_queue), MAX_CACHE_BATCH)
                     logger.info(
-                        f"🎯 Набрано {len(cached_files_queue)} файлов в кэше, отправляю батч из {batch_size} файлов")
+                        f"🎯 Отправка батча из кэша: {batch_size} файлов (всего в кэше: {len(cached_files_queue)})")
 
                     sent_count = 0
                     failed_count = 0
@@ -2577,10 +2584,9 @@ class FFmpegStreamManager:
                                 'filename': original_filename,
                                 'duration': duration,
                                 'timestamp': datetime.now().isoformat(),
-                                'queue_remaining': len(self.video_queue),
-                                'from_cache': True,
                                 'cache_position': f"{i + 1}/{batch_size}",
-                                'total_in_cache': len(cached_files_queue)
+                                'total_in_cache': len(cached_files_queue),
+                                'from_cache': True
                             })
 
                             # Ждем пока видео воспроизводится
@@ -2596,166 +2602,48 @@ class FFmpegStreamManager:
                     # Удаляем отправленные файлы из очереди кэша
                     cached_files_queue = cached_files_queue[batch_size:]
 
-                    logger.info(f"✅ Отправлен батч из кэша: {sent_count} успешно, {failed_count} с ошибками")
+                    logger.info(f"✅ Батч отправлен: {sent_count} успешно, {failed_count} с ошибками")
                     logger.info(f"📊 Осталось в кэше: {len(cached_files_queue)} файлов")
 
-                    # Если отправили все файлы, очищаем очередь
-                    if len(cached_files_queue) == 0:
-                        logger.info("📭 Кэш опустошен, переходим к обычной очереди")
+                    # Отправляем статистику после отправки
+                    socketio.emit('batch_complete', {
+                        'sent_count': sent_count,
+                        'failed_count': failed_count,
+                        'remaining_in_cache': len(cached_files_queue)
+                    })
 
                     self.is_playing_video = False
-
-                # Шаг 3: Обработка обычной очереди видео (только если в кэше мало файлов)
-                elif self.video_queue and len(cached_files_queue) < MIN_CACHE_FILES_FOR_SEND:
-                    self.is_playing_video = True
-                    video_item = self.video_queue.pop(0)
-                    video_path = video_item['path']
-                    duration = video_item.get('duration', 10.0)
-                    filename = video_item.get('filename', os.path.basename(video_path))
-
-                    # Получаем аудио файл если есть в очереди
-                    audio_to_use = None
-                    if self.audio_queue:
-                        audio_to_use = self.audio_queue[0]  # Берем, но не удаляем пока не используем
-
-                    logger.info(f"🎬 Обработка нового видео: {filename} ({duration:.1f} сек)")
-
-                    # Проверяем MPEG-TS кэш для этого видео
-                    from_cache = False
-                    success = False
-
-                    if self.use_mpegts_cache:
-                        cache_info = self.get_cached_mpegts(video_path, audio_to_use)
-
-                        if cache_info:
-                            # Используем файл из кэша и добавляем в очередь кэша
-                            logger.info(f"   ✅ Найден в MPEG-TS кэше, добавляю в очередь кэша")
-                            from_cache = True
-
-                            # Добавляем в очередь кэша
-                            cache_key = self._get_mpegts_cache_key(video_path, audio_to_use)
-                            cached_files_queue.append({
-                                'path': cache_info,
-                                'duration': duration,
-                                'original_filename': filename,
-                                'cache_key': cache_key,
-                                'audio_used': audio_to_use is not None
-                            })
-
-                            # Помечаем как успешное (но не отправляем сейчас - ждем набора батча)
-                            success = True
-                            logger.info(f"   📥 Добавлено в кэш-очередь: {filename} (всего: {len(cached_files_queue)})")
-
-                            # Удаляем использованное аудио из очереди если оно было использовано
-                            if audio_to_use and self.audio_queue and self.audio_queue[0] == audio_to_use:
-                                self.audio_queue.pop(0)
-
-                    # Если не нашли в кэше MPEG-TS, создаем новый MPEG-TS
-                    if not from_cache:
-                        logger.info(f"   🔧 Создание нового MPEG-TS файла")
-
-                        # Создаем временный MPEG-TS файл
-                        temp_mpegts = tempfile.NamedTemporaryFile(suffix='.ts', delete=False)
-                        temp_mpegts.close()
-
-                        # Создаем MPEG-TS файл с видео и аудио (если есть)
-                        success = self._create_mpegts_file(video_path, duration, audio_to_use, temp_mpegts.name)
-
-                        if success:
-                            # Отправляем созданный файл
-                            success = self._send_mpegts_file(temp_mpegts.name, duration)
-
-                            # Удаляем использованное аудио из очереди если оно было использовано
-                            if audio_to_use and success and self.audio_queue and self.audio_queue[0] == audio_to_use:
-                                self.audio_queue.pop(0)
-
-                            # Кэшируем успешно созданный файл для будущего использования
-                            if success and self.use_mpegts_cache and os.path.exists(temp_mpegts.name):
-                                cache_success = self.cache_mpegts_file(video_path, temp_mpegts.name, duration,
-                                                                       audio_to_use,
-                                                                       audio_used=audio_to_use is not None)
-                                if cache_success:
-                                    logger.info(f"   💾 Файл сохранен в MPEG-TS кэш для будущих использований")
-                                    # Добавляем в очередь кэша
-                                    cache_key = self._get_mpegts_cache_key(video_path, audio_to_use)
-                                    cached_files_queue.append({
-                                        'path': os.path.join(self.mpegts_cache_dir, f"{cache_key}.ts"),
-                                        'duration': duration,
-                                        'original_filename': filename,
-                                        'cache_key': cache_key,
-                                        'audio_used': audio_to_use is not None
-                                    })
-                                    logger.info(
-                                        f"   📥 Добавлено в кэш-очередь: {filename} (всего: {len(cached_files_queue)})")
-
-                            # Удаляем временный файл
-                            if os.path.exists(temp_mpegts.name):
-                                try:
-                                    os.unlink(temp_mpegts.name)
-                                except:
-                                    pass
-                        else:
-                            # Очищаем временный файл если создание не удалось
-                            if os.path.exists(temp_mpegts.name):
-                                try:
-                                    os.unlink(temp_mpegts.name)
-                                except:
-                                    pass
-
-                    if success and not from_cache:
-                        # Если не из кэша (т.е. создали новый и отправили), отправляем уведомление
-                        socketio.emit('video_playing', {
-                            'filename': filename,
-                            'duration': duration,
-                            'timestamp': datetime.now().isoformat(),
-                            'queue_remaining': len(self.video_queue),
-                            'from_cache': False,
-                            'cached_for_future': self.use_mpegts_cache,
-                            'cache_queue_size': len(cached_files_queue)
-                        })
-
-                        # Ждем пока видео воспроизводится
-                        time.sleep(duration)
-                    elif not success:
-                        logger.error(f"❌ Не удалось отправить видео: {filename}")
-                        # Возвращаем в очередь
-                        video_item['audio_file'] = audio_to_use  # Сохраняем аудио для повторной попытки
-                        self.video_queue.insert(0, video_item)
-                        time.sleep(1)
-
-                    self.is_playing_video = False
-
-                # Шаг 4: Если нет видео и мало файлов в кэше, проверяем аудио
-                elif self.audio_queue and len(cached_files_queue) < MIN_CACHE_FILES_FOR_SEND:
-                    self.is_playing_audio = True
-                    audio_file = self.audio_queue.pop(0)
-
-                    logger.info(f"🔊 Отправка аудио через MPEG-TS: {os.path.basename(audio_file)}")
-
-                    # Создаем MPEG-TS только с аудио (и статичным изображением)
-                    success = self._send_audio_as_mpegts(audio_file)
-
-                    if success:
-                        # Ждем пока аудио воспроизводится
-                        audio_duration = self._get_audio_duration(audio_file)
-                        time.sleep(audio_duration)
-                    else:
-                        logger.error(f"❌ Не удалось отправить аудио: {audio_file}")
-                        self.audio_queue.insert(0, audio_file)
-                        time.sleep(1)
-
-                    self.is_playing_audio = False
 
                 else:
-                    # Если нет ни видео, ни аудио, и мало файлов в кэше - отправляем статичное изображение
-                    if len(cached_files_queue) < MIN_CACHE_FILES_FOR_SEND:
-                        self._send_static_image(1.0)
-                        time.sleep(0.5)
-                    else:
-                        # Ждем набора файлов в кэше
+                    # Если в кэше недостаточно файлов
+                    if len(cached_files_queue) > 0:
                         logger.info(
                             f"⏳ Ожидание набора файлов в кэше: {len(cached_files_queue)}/{MIN_CACHE_FILES_FOR_SEND}")
-                        time.sleep(2)
+
+                        # Показываем статус ожидания
+                        if len(cached_files_queue) == 0:
+                            socketio.emit('waiting_for_content', {
+                                'message': 'Ожидание создания контента...',
+                                'current': 0,
+                                'required': MIN_CACHE_FILES_FOR_SEND
+                            })
+                        else:
+                            socketio.emit('accumulating_cache', {
+                                'message': 'Накопление MPEG-TS файлов в кэше',
+                                'current': len(cached_files_queue),
+                                'required': MIN_CACHE_FILES_FOR_SEND,
+                                'progress': (len(cached_files_queue) / MIN_CACHE_FILES_FOR_SEND) * 100
+                            })
+
+                        # Ждем создания большего количества файлов
+                        time.sleep(5)
+                    else:
+                        # Если кэш пуст
+                        logger.info("📭 Кэш пуст, ожидание создания контента...")
+                        socketio.emit('cache_empty', {
+                            'message': 'Кэш пуст, создание контента...'
+                        })
+                        time.sleep(10)
 
             except Exception as e:
                 logger.error(f"❌ Ошибка в контроллере потока: {e}", exc_info=True)
@@ -4166,7 +4054,7 @@ class AIStreamManager:
         return self.current_topic
 
     async def run_discussion_round(self):
-        """Оптимизированный метод без видео-интро (только сообщения)"""
+        """Оптимизированный метод - создает MPEG-TS файлы и сохраняет в кэш"""
         if self.is_discussion_active:
             return
 
@@ -4177,7 +4065,7 @@ class AIStreamManager:
             if not self.current_topic:
                 self.select_topic()
 
-            logger.info(f"🚀 Начало раунда #{self.discussion_round} (без интро)")
+            logger.info(f"🚀 Начало раунда #{self.discussion_round} - создание MPEG-TS файлов для кэша")
 
             # Определяем порядок выступлений
             speaking_order = random.sample(self.agents, len(self.agents))
@@ -4216,120 +4104,75 @@ class AIStreamManager:
                     'expertise': agent.expertise
                 })
 
-                # ========== АУДИО + ВИДЕО СООБЩЕНИЯ ==========
+                # ========== СОЗДАНИЕ MPEG-TS ДЛЯ КЭША ==========
                 audio_file = None
-                video_message_task = None
+                video_message = None
 
                 try:
-                    # 1. Запускаем генерацию аудио в фоне
-                    audio_task = asyncio.create_task(
-                        self.tts_manager.generate_audio_only(
-                            text=message,
-                            voice_id=agent.voice,
-                            agent_name=agent.name
-                        )
+                    # 1. Генерируем аудио
+                    audio_file = await self.tts_manager.generate_audio_only(
+                        text=message,
+                        voice_id=agent.voice,
+                        agent_name=agent.name
                     )
 
-                    # 2. Создаем видео с сообщением (БЕЗ ИНТРО)
+                    # 2. Создаем видео с сообщением
                     message_video_duration = min(max(len(message.split()) * 0.2, 3), 10)
 
-                    # Проверяем наличие в кэше MPEG-TS
-                    if self.ffmpeg_manager and self.ffmpeg_manager.use_mpegts_cache:
-                        message_cache_key = self._generate_message_cache_key(agent, message)
-                        cached_message = self.ffmpeg_manager.get_cached_mpegts(
-                            f"video_cache/message_{agent.name}_{hash(message[:200])}.mp4",
-                            None
+                    # Создаем видео сообщения
+                    video_message = await asyncio.to_thread(
+                        self.video_generator.create_message_video,
+                        agent_name=agent.name,
+                        message=message,
+                        duration=message_video_duration
+                    )
+
+                    if audio_file and video_message and self.ffmpeg_manager:
+                        # Создаем MPEG-TS файл с видео и аудио
+                        timestamp = int(time.time())
+                        mpegts_filename = f"mpegts_{agent.name}_{timestamp}.ts"
+                        mpegts_path = os.path.join(self.ffmpeg_manager.mpegts_cache_dir, mpegts_filename)
+
+                        # Создаем MPEG-TS файл
+                        success = self.ffmpeg_manager._create_mpegts_file(
+                            video_message,
+                            message_video_duration,
+                            audio_file,
+                            mpegts_path
                         )
-
-                        if cached_message:
-                            logger.info(f"✅ Видео сообщения {agent.name} найдено в MPEG-TS кэше")
-                        else:
-                            # Создаем новое видео сообщения
-                            video_message_task = asyncio.create_task(
-                                asyncio.to_thread(
-                                    self.video_generator.create_message_video,
-                                    agent_name=agent.name,
-                                    message=message,
-                                    duration=message_video_duration
-                                )
-                            )
-                    else:
-                        # Создаем новое видео сообщения
-                        video_message_task = asyncio.create_task(
-                            asyncio.to_thread(
-                                self.video_generator.create_message_video,
-                                agent_name=agent.name,
-                                message=message,
-                                duration=message_video_duration
-                            )
-                        )
-
-                    # Ждем аудио
-                    audio_file = await asyncio.wait_for(audio_task, timeout=15.0)
-
-                    if audio_file and self.ffmpeg_manager:
-                        # Добавляем аудио в очередь
-                        success = self.ffmpeg_manager.add_audio_to_queue(audio_file)
 
                         if success:
-                            # Обработка видео сообщения
-                            if video_message_task:
-                                try:
-                                    message_video = await asyncio.wait_for(video_message_task, timeout=10.0)
+                            # Добавляем в кэш
+                            cache_key = self.ffmpeg_manager._get_mpegts_cache_key(video_message, audio_file)
+                            self.ffmpeg_manager.cache_mpegts_file(
+                                video_message,
+                                mpegts_path,
+                                message_video_duration,
+                                audio_file,
+                                True
+                            )
 
-                                    if message_video:
-                                        # Добавляем видео в очередь
-                                        self.ffmpeg_manager.add_video_to_queue(message_video, message_video_duration)
+                            logger.info(f"💾 MPEG-TS файл сохранен в кэш: {mpegts_filename}")
+                            logger.info(f"📊 В кэше: {len(self.ffmpeg_manager.mpegts_cache)} файлов")
 
-                                        # Кэшируем с аудио в MPEG-TS
-                                        if hasattr(self.ffmpeg_manager, 'cache_mpegts_file'):
-                                            temp_mpegts = tempfile.NamedTemporaryFile(suffix='.ts', delete=False)
-                                            temp_mpegts.close()
+                            # Отправляем уведомление о создании файла
+                            socketio.emit('mpegts_created', {
+                                'agent_name': agent.name,
+                                'filename': mpegts_filename,
+                                'duration': message_video_duration,
+                                'cache_size': len(self.ffmpeg_manager.mpegts_cache),
+                                'timestamp': datetime.now().isoformat()
+                            })
+                        else:
+                            logger.error(f"❌ Не удалось создать MPEG-TS файл для {agent.name}")
 
-                                            success_mpegts = self.ffmpeg_manager._create_mpegts_file(
-                                                message_video,
-                                                message_video_duration,
-                                                audio_file,
-                                                temp_mpegts.name
-                                            )
+                    # Имитируем воспроизведение для пользователя
+                    audio_duration = self.tts_manager._get_audio_duration(audio_file) if audio_file else 5.0
+                    logger.info(f"🔊 Аудио создано: {agent.name} ({audio_duration:.1f} сек)")
+                    await asyncio.sleep(audio_duration * 0.8)
 
-                                            if success_mpegts:
-                                                self.ffmpeg_manager.cache_mpegts_file(
-                                                    message_video,
-                                                    temp_mpegts.name,
-                                                    message_video_duration,
-                                                    audio_file,
-                                                    True
-                                                )
-
-                                                if os.path.exists(temp_mpegts.name):
-                                                    os.unlink(temp_mpegts.name)
-
-                                        logger.info(f"📺 Видео с сообщением {agent.name} добавлено в очередь")
-
-                                except asyncio.TimeoutError:
-                                    logger.warning(f"⚠️ Таймаут создания видео сообщения для {agent.name}")
-                                except Exception as e:
-                                    logger.error(f"❌ Ошибка видео сообщения: {e}")
-
-                            # Ждем завершения аудио
-                            audio_duration = self.tts_manager._get_audio_duration(audio_file)
-                            logger.info(f"🔊 Воспроизводится аудио {agent.name} ({audio_duration:.1f} сек)")
-
-                            # Ждем только 80% длительности аудио для плавного перехода
-                            await asyncio.sleep(audio_duration * 0.8)
-
-                    else:
-                        # Если аудио не сгенерировалось
-                        word_count = len(message.split())
-                        pause_duration = max(2, min(word_count * 0.15, 8))
-                        await asyncio.sleep(pause_duration)
-
-                except asyncio.TimeoutError:
-                    logger.warning(f"⚠️ Таймаут генерации аудио для {agent.name}")
-                    await asyncio.sleep(5.0)
                 except Exception as e:
-                    logger.error(f"❌ Ошибка обработки аудио: {e}")
+                    logger.error(f"❌ Ошибка создания контента для {agent.name}: {e}")
                     await asyncio.sleep(3.0)
 
                 # ========== ЗАВЕРШЕНИЕ РЕЧИ ==========
@@ -4338,7 +4181,7 @@ class AIStreamManager:
 
                 # ========== ПЕРЕХОД К СЛЕДУЮЩЕМУ АГЕНТУ ==========
                 if agent_idx < len(speaking_order) - 1 and self.is_discussion_active:
-                    pause = random.uniform(0.5, 1.5)  # Очень короткая пауза между агентами
+                    pause = random.uniform(0.5, 1.5)
                     await asyncio.sleep(pause)
 
             logger.info(f"✅ Раунд #{self.discussion_round} завершен")
@@ -4346,6 +4189,7 @@ class AIStreamManager:
             socketio.emit('round_complete', {
                 'round': self.discussion_round,
                 'total_messages': self.message_count,
+                'cache_size': len(self.ffmpeg_manager.mpegts_cache) if self.ffmpeg_manager else 0,
                 'next_round_in': Config.DISCUSSION_INTERVAL // 2
             })
 

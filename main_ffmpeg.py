@@ -2413,7 +2413,7 @@ class FFmpegStreamManager:
             time.sleep(3)
 
             # Минимальное количество файлов для начала отправки
-            MIN_FILES_FOR_STREAM = 5
+            MIN_FILES_FOR_STREAM = 2
 
             # Флаг для предотвращения одновременной отправки
             self.is_sending_data = False

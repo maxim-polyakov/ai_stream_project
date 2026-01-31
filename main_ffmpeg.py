@@ -2421,42 +2421,44 @@ class FFmpegStreamManager:
             # Событие для остановки всех потоков
             stop_event = threading.Event()
 
-            def _monitor_and_enrich_cache():
-                """Параллельный поток для мониторинга и пополнения кэша"""
-                logger.info("🔄 Запуск параллельного потока мониторинга кэша")
+            def _background_cache_manager():
+                """Фоновый поток для управления кэшем (накопление и очистка)"""
+                logger.info("🔄 Запуск фонового менеджера кэша")
+
+                last_cache_size = 0
 
                 while self.is_streaming and not stop_event.is_set():
                     try:
-                        # Проверяем количество файлов в кэше
                         current_cache_size = len(self.mpegts_cache)
 
-                        # Если в кэше мало файлов, отправляем событие
+                        # Логируем изменение размера кэша
+                        if current_cache_size != last_cache_size:
+                            logger.info(f"📊 Размер кэша изменился: {last_cache_size} → {current_cache_size} файлов")
+                            last_cache_size = current_cache_size
+
+                        # Если кэш почти пустой, уведомляем
                         if current_cache_size < MIN_FILES_FOR_STREAM:
-                            logger.info(f"📭 В кэше мало файлов: {current_cache_size}/{MIN_FILES_FOR_STREAM}")
+                            logger.info(f"📭 Кэш требует пополнения: {current_cache_size}/{MIN_FILES_FOR_STREAM}")
 
-                            socketio.emit('waiting_for_cache', {
-                                'current': current_cache_size,
-                                'required': MIN_FILES_FOR_STREAM,
-                                'progress': (current_cache_size / MIN_FILES_FOR_STREAM) * 100,
-                                'message': f'Параллельное накопление кэша: {current_cache_size}/{MIN_FILES_FOR_STREAM} файлов',
-                                'timestamp': datetime.now().isoformat()
-                            })
+                            # Можно добавить здесь логику автоматического пополнения кэша
+                            # Например, проверка доступных видео и добавление в очередь конвертации
 
-                        # Здесь можно добавить логику для автоматического пополнения кэша
-                        # если файлов меньше определенного порога
+                        # Периодически чистим старые файлы (если их слишком много)
+                        elif current_cache_size > MIN_FILES_FOR_STREAM * 3:
+                            self._cleanup_old_cache_files()
 
-                        time.sleep(5)  # Проверяем каждые 5 секунд
+                        time.sleep(3)  # Частая проверка
 
                     except Exception as e:
-                        logger.error(f"❌ Ошибка в потоке мониторинга кэша: {e}")
+                        logger.error(f"❌ Ошибка в менеджере кэша: {e}")
                         time.sleep(5)
 
-            # Запускаем параллельный поток для мониторинга кэша
-            monitor_thread = threading.Thread(target=_monitor_and_enrich_cache, daemon=True)
-            monitor_thread.start()
+            # Запускаем фоновый менеджер кэша
+            cache_manager_thread = threading.Thread(target=_background_cache_manager, daemon=True)
+            cache_manager_thread.start()
 
-            # Ожидание накопления файлов в основном потоке
-            logger.info(f"⏳ Ожидание накопления {MIN_FILES_FOR_STREAM} файлов в кэше...")
+            # Ждем накопления минимального количества файлов ДО начала отправки
+            logger.info(f"⏳ Ожидание накопления {MIN_FILES_FOR_STREAM} файлов перед началом отправки...")
 
             while self.is_streaming and len(self.mpegts_cache) < MIN_FILES_FOR_STREAM:
                 if not self._check_ffmpeg_alive():
@@ -2470,15 +2472,23 @@ class FFmpegStreamManager:
                     'current': len(self.mpegts_cache),
                     'required': MIN_FILES_FOR_STREAM,
                     'progress': (len(self.mpegts_cache) / MIN_FILES_FOR_STREAM) * 100,
-                    'message': f'Основной поток: накопление файлов в кэше: {len(self.mpegts_cache)}/{MIN_FILES_FOR_STREAM}',
+                    'message': f'Инициализация кэша: {len(self.mpegts_cache)}/{MIN_FILES_FOR_STREAM} файлов',
                     'timestamp': datetime.now().isoformat()
                 })
 
-                time.sleep(10)
+                time.sleep(5)
 
             logger.info(
-                f"✅ Достаточно файлов в кэше: {len(self.mpegts_cache)}/{MIN_FILES_FOR_STREAM}. Начинаю последовательную отправку..."
+                f"✅ Начальный кэш готов: {len(self.mpegts_cache)} файлов. Начинаю отправку..."
             )
+
+            # Отправляем событие о начале стрима
+            socketio.emit('stream_started', {
+                'cache_size': len(self.mpegts_cache),
+                'min_required': MIN_FILES_FOR_STREAM,
+                'timestamp': datetime.now().isoformat(),
+                'message': 'Стрим начал работу'
+            })
 
             # Основной цикл отправки контента (последовательно)
             while self.is_streaming:
@@ -2502,8 +2512,10 @@ class FFmpegStreamManager:
                 cache_items = list(self.mpegts_cache.items())
                 cache_items.sort(key=lambda x: x[1].get('created', 0))
 
-                # Берем файлы для отправки
-                batch_size = min(10, len(cache_items))
+                # Берем файлы для отправки - берем по одному для непрерывности
+                # но можно взять небольшую группу для эффективности
+                BATCH_SIZE = 3  # Небольшие батчи для плавности
+                batch_size = min(BATCH_SIZE, len(cache_items))
                 files_to_send = []
                 files_to_delete = []  # Файлы для удаления после отправки
 
@@ -2519,7 +2531,8 @@ class FFmpegStreamManager:
                             'duration': cache_info.get('duration', 10.0),
                             'original_video': cache_info.get('original_video', 'unknown'),
                             'index': i + 1,
-                            'total': batch_size
+                            'total': batch_size,
+                            'total_in_cache': len(self.mpegts_cache)
                         })
 
                         # Добавляем в список для удаления
@@ -2534,7 +2547,7 @@ class FFmpegStreamManager:
                     time.sleep(5)
                     continue
 
-                logger.info(f"📦 Начинаю последовательную отправку батча из {len(files_to_send)} файлов")
+                logger.info(f"📦 Начинаю отправку {len(files_to_send)} файлов (всего в кэше: {len(self.mpegts_cache)})")
 
                 sent_count = 0
                 failed_count = 0
@@ -2559,6 +2572,15 @@ class FFmpegStreamManager:
                             f"{file_info['original_video']} ({file_info['duration']:.1f} сек)"
                         )
 
+                        # Уведомляем о начале отправки файла
+                        socketio.emit('file_sending_started', {
+                            'filename': file_info['original_video'],
+                            'duration': file_info['duration'],
+                            'position': f"{file_info['index']}/{file_info['total']}",
+                            'total_in_cache': file_info['total_in_cache'],
+                            'timestamp': datetime.now().isoformat()
+                        })
+
                         success = self._send_mpegts_data(
                             file_info['mpegts_path'],
                             file_info['duration']
@@ -2573,7 +2595,7 @@ class FFmpegStreamManager:
                                 'duration': file_info['duration'],
                                 'timestamp': datetime.now().isoformat(),
                                 'position': f"{file_info['index']}/{file_info['total']}",
-                                'total_in_cache': len(self.mpegts_cache),
+                                'total_in_cache': file_info['total_in_cache'],
                                 'queue_remaining': len(files_to_send) - file_info['index']
                             })
 
@@ -2581,9 +2603,21 @@ class FFmpegStreamManager:
                             failed_count += 1
                             logger.error(f"❌ Ошибка отправки файла: {file_info['original_video']}")
 
+                            socketio.emit('file_sending_failed', {
+                                'filename': file_info['original_video'],
+                                'error': 'Ошибка отправки',
+                                'timestamp': datetime.now().isoformat()
+                            })
+
                     except Exception as e:
                         failed_count += 1
                         logger.error(f"❌ Ошибка отправки: {e}")
+
+                        socketio.emit('file_sending_failed', {
+                            'filename': file_info['original_video'],
+                            'error': str(e),
+                            'timestamp': datetime.now().isoformat()
+                        })
 
                     finally:
                         self.is_sending_data = False
@@ -2593,6 +2627,8 @@ class FFmpegStreamManager:
 
                 # УДАЛЯЕМ ОТПРАВЛЕННЫЕ ФАЙЛЫ ИЗ КЭША
                 deleted_count = 0
+                files_deleted_keys = []
+
                 for file_to_delete in files_to_delete[:sent_count]:  # Удаляем только успешно отправленные
                     try:
                         # Удаляем файл с диска
@@ -2602,6 +2638,7 @@ class FFmpegStreamManager:
                         # Удаляем из кэша
                         if file_to_delete['cache_key'] in self.mpegts_cache:
                             del self.mpegts_cache[file_to_delete['cache_key']]
+                            files_deleted_keys.append(file_to_delete['cache_key'])
 
                         deleted_count += 1
                         logger.info(f"🗑️ Удален файл из кэша: {file_to_delete['filename']}")
@@ -2614,7 +2651,15 @@ class FFmpegStreamManager:
                     self._save_mpegts_cache_index()
                     logger.info(f"🧹 Удалено {deleted_count} файлов из кэша после отправки")
 
-                logger.info(f"📊 Итог отправки: {sent_count} успешно, {failed_count} с ошибками")
+                    # Уведомляем об очистке кэша
+                    socketio.emit('cache_cleaned', {
+                        'deleted_count': deleted_count,
+                        'remaining_in_cache': len(self.mpegts_cache),
+                        'timestamp': datetime.now().isoformat()
+                    })
+
+                logger.info(
+                    f"📊 Итог отправки: {sent_count} успешно, {failed_count} с ошибками. В кэше осталось: {len(self.mpegts_cache)} файлов")
 
                 socketio.emit('batch_complete', {
                     'sent_count': sent_count,
@@ -2624,32 +2669,23 @@ class FFmpegStreamManager:
                     'timestamp': datetime.now().isoformat()
                 })
 
-                # Проверяем сколько файлов осталось в кэше
+                # Проверяем состояние кэша после отправки
                 remaining_files = len(self.mpegts_cache)
 
                 if remaining_files < MIN_FILES_FOR_STREAM:
-                    logger.info(f"📭 В кэше осталось мало файлов: {remaining_files}. Ожидание пополнения...")
+                    logger.warning(f"⚠️ В кэше мало файлов после отправки: {remaining_files}/{MIN_FILES_FOR_STREAM}")
 
-                    # Ждем пока накопится достаточно файлов
-                    # При этом параллельный поток продолжает мониторить и обогащать кэш
-                    while self.is_streaming and len(self.mpegts_cache) < MIN_FILES_FOR_STREAM:
-                        if stop_event.is_set():
-                            break
+                    # Уведомляем, но НЕ останавливаемся - продолжаем отправлять то, что есть
+                    # Фоновый поток пытается пополнить кэш
+                    socketio.emit('low_cache_warning', {
+                        'current': remaining_files,
+                        'required': MIN_FILES_FOR_STREAM,
+                        'message': f'Мало файлов в кэше после отправки: {remaining_files}/{MIN_FILES_FOR_STREAM}. Работа фонового менеджера кэша продолжается.',
+                        'timestamp': datetime.now().isoformat()
+                    })
 
-                        socketio.emit('waiting_for_cache', {
-                            'current': len(self.mpegts_cache),
-                            'required': MIN_FILES_FOR_STREAM,
-                            'progress': (len(self.mpegts_cache) / MIN_FILES_FOR_STREAM) * 100,
-                            'message': f'Основной поток: ожидание пополнения кэша: {len(self.mpegts_cache)}/{MIN_FILES_FOR_STREAM} файлов',
-                            'timestamp': datetime.now().isoformat()
-                        })
-
-                        logger.info(f"⏳ Основной поток ожидает файлы: {len(self.mpegts_cache)}/{MIN_FILES_FOR_STREAM}")
-                        time.sleep(10)  # Проверяем каждые 10 секунд
-
-                    if len(self.mpegts_cache) >= MIN_FILES_FOR_STREAM:
-                        logger.info(f"✅ Кэш пополнен: {len(self.mpegts_cache)} файлов. Продолжаем отправку...")
-
+                    # Небольшая пауза, чтобы дать время фоновому потоку пополнить кэш
+                    time.sleep(2)
                 else:
                     logger.info(f"📊 В кэше осталось {remaining_files} файлов. Продолжаем...")
                     time.sleep(1)  # Короткая пауза перед следующим батчем
@@ -2661,6 +2697,12 @@ class FFmpegStreamManager:
         finally:
             stop_event.set()
             logger.info("🛑 Контроллер MPEG-TS потока остановлен")
+
+            # Отправляем событие о остановке стрима
+            socketio.emit('stream_stopped', {
+                'timestamp': datetime.now().isoformat(),
+                'message': 'Стрим остановлен'
+            })
 
 
     def _cleanup_old_cache_files(self, max_age_hours: int = 6):

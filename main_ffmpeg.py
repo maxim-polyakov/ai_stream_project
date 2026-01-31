@@ -1661,24 +1661,13 @@ class FFmpegStreamManager:
             return 5.0
 
     def _create_mpegts_file(self, video_path: str, duration: float, audio_file: str, output_path: str) -> bool:
-        """
-        Создание MPEG-TS файла для кэширования с оптимизированным битрейтом
-
-        Args:
-            video_path: Путь к исходному видео файлу
-            duration: Ожидаемая длительность видео (может быть изменена при синхронизации с аудио)
-            audio_file: Путь к аудио файлу (может быть None)
-            output_path: Путь для сохранения созданного MPEG-TS файла
-
-        Returns:
-            bool: True если файл успешно создан и добавлен в кэш, False в случае ошибки
-        """
+        """Создание MPEG-TS файла для кэширования с оптимизированным битрейтом"""
         try:
-            # 🎵 ШАГ 1: Проверка и получение длительности аудио
+            # Получаем длину аудио, если файл существует
             audio_duration = 0
             if audio_file and os.path.exists(audio_file):
                 try:
-                    # Используем ffprobe для получения точной длительности аудио файла
+                    # Используем ffprobe для получения длительности аудио
                     probe_cmd = [
                         'ffprobe',
                         '-v', 'error',
@@ -1693,108 +1682,69 @@ class FFmpegStreamManager:
                 except Exception as e:
                     logger.warning(f"⚠️ Не удалось получить длительность аудио: {e}")
 
-            # 🔄 ШАГ 2: Определение необходимости зацикливания видео
+            # Определяем, нужно ли зацикливать видео
             loop_video = False
-            actual_duration = duration  # Фактическая длительность, которая будет использоваться
-            original_video_path = video_path  # Сохраняем оригинальный путь
+            actual_duration = duration
+            original_video_path = video_path
 
-            # Если аудио длиннее видео - зацикливаем видео до конца аудио
             if audio_duration > duration:
                 loop_video = True
                 actual_duration = audio_duration
                 logger.info(f"🔄 Аудио длиннее видео, зациклю видео до {actual_duration:.2f} сек")
 
-            # 📊 ШАГ 3: Настройки битрейта для YouTube
-            # Стандартные значения для 1080p
-            video_bitrate = '5000k'  # 5000 kbps - достаточно для качественного 1080p
-            maxrate = '5500k'  # Максимальный битрейт (пиковое значение)
-            bufsize = '10000k'  # Размер буфера для вариаций битрейта
+            # ОПТИМИЗИРОВАННЫЙ БИТРЕЙТ ДЛЯ YOUTUBE
+            video_bitrate = '5000k'  # Достаточно для 1080p
+            maxrate = '5500k'
+            bufsize = '10000k'
 
-            # 🎞️ ШАГ 4: Оптимизация видео перед кодированием
-            # Конвертация видео в оптимальный формат для стриминга
+            # Оптимизируем видео перед созданием MPEG-TS
             optimized_video = self._optimize_video_for_streaming(video_path, video_bitrate)
             if optimized_video != video_path:
                 logger.info(f"🔧 Использую оптимизированное видео для MPEG-TS")
-                video_path = optimized_video  # Используем оптимизированную версию
+                video_path = optimized_video
 
-            # 📏 ШАГ 5: Автоматическая корректировка битрейта в зависимости от разрешения
+            # Получаем информацию о видео для оптимизации
             video_info = self._get_video_info(video_path)
             if video_info:
                 width = video_info.get('width', self.video_width)
                 height = video_info.get('height', self.video_height)
-                resolution = width * height
 
-                # Автоматически корректируем битрейт для разных разрешений
-                if resolution <= 854 * 480:  # 480p или меньше (854x480 = 409,920 пикселей)
-                    video_bitrate = '1500k'  # 1500 kbps достаточно для 480p
+                # Автоматически корректируем битрейт в зависимости от разрешения
+                if width * height <= 854 * 480:  # 480p или меньше
+                    video_bitrate = '1500k'
                     maxrate = '2000k'
                     bufsize = '4000k'
                     logger.info(f"📊 Автоопределение: {width}x{height} -> битрейт {video_bitrate}")
-
-                elif resolution <= 1280 * 720:  # 720p (1280x720 = 921,600 пикселей)
-                    video_bitrate = '3000k'  # 3000 kbps для 720p
+                elif width * height <= 1280 * 720:  # 720p
+                    video_bitrate = '3000k'
                     maxrate = '3500k'
                     bufsize = '7000k'
                     logger.info(f"📊 Автоопределение: {width}x{height} -> битрейт {video_bitrate}")
 
-            # 🛠️ ШАГ 6: Построение команды FFmpeg для создания MPEG-TS
+            # Команда для создания MPEG-TS потока
             mpegts_cmd = ['ffmpeg']
 
-            # Если нужно зациклить видео (аудио длиннее видео)
+            # Если нужно зациклить видео, используем фильтр stream_loop
             if loop_video:
                 mpegts_cmd.extend([
-                    '-re',  # Чтение в реальном времени (имитация live стрима)
-                    '-stream_loop', '-1',  # Бесконечное зацикливание видео
-                    '-i', video_path,  # Входной видео файл
-                    '-t', str(actual_duration),  # Ограничиваем длительность по аудио
+                    '-re',
+                    '-stream_loop', '-1',  # Бесконечное зацикливание
+                    '-i', video_path,
+                    '-t', str(actual_duration),  # Ограничиваем по длительности аудио
                 ])
             else:
                 mpegts_cmd.extend([
                     '-re',  # Реальное время
-                    '-i', video_path,  # Входной видео файл
+                    '-i', video_path,
                 ])
 
-            # 🎵 ШАГ 7: Добавление аудио источника
+            # Добавляем аудио источник если есть
             if audio_file and os.path.exists(audio_file):
-                # Если есть аудио файл - добавляем его как второй источник
                 mpegts_cmd.extend(['-i', audio_file])
-
-                # Маппинг потоков: видео с первого входа, аудио со второго
+                # Карты: видео с первого входа, аудио со второго
                 mpegts_cmd.extend([
-                    '-map', '0:v:0',  # Видео из первого потока (video)
-                    '-map', '1:a:0',  # Аудио из второго потока (audio)
-
-                    # Настройки видео кодирования
-                    '-c:v', 'libx264',  # Кодек H.264
-                    '-preset', 'medium',  # Баланс скорость/качество
-                    '-tune', 'film' if actual_duration > 10 else 'zerolatency',  # Настройка под тип контента
-                    '-pix_fmt', 'yuv420p',  # Формат пикселей (совместим со всеми устройствами)
-                    '-profile:v', 'high',  # Профиль кодирования (высокое качество)
-                    '-level', '4.1',  # Уровень совместимости
-                    '-b:v', video_bitrate,  # Целевой битрейт видео
-                    '-maxrate', maxrate,  # Максимальный битрейт
-                    '-bufsize', bufsize,  # Размер буфера
-                    '-r', str(self.video_fps),  # Частота кадров
-                    '-g', '60',  # Интервал между ключевыми кадрами (2 секунды при 30 fps)
-                    '-keyint_min', '60',  # Минимальный интервал ключевых кадров
-                    '-sc_threshold', '0',  # Порог для сцены (0 = отключено)
-                    '-bf', '2',  # Количество B-кадров
-
-                    # Настройки аудио кодирования
-                    '-c:a', 'aac',  # Кодек AAC (стандарт для YouTube)
-                    '-b:a', '128k',  # Битрейт аудио 128 kbps
-                    '-ar', '44100',  # Частота дискретизации 44.1 kHz
-                    '-ac', '2',  # Стерео звук
-                ])
-            else:
-                # Если нет аудио - добавляем тихий аудио поток
-                mpegts_cmd.extend([
-                    '-f', 'lavfi',
-                    '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
-                    '-map', '0:v:0',  # Видео
-                    '-map', '1:a:0',  # Аудио (тишина)
-
-                    # Аналогичные настройки видео
+                    '-map', '0:v:0',
+                    '-map', '1:a:0',
                     '-c:v', 'libx264',
                     '-preset', 'medium',
                     '-tune', 'film' if actual_duration > 10 else 'zerolatency',
@@ -1809,33 +1759,56 @@ class FFmpegStreamManager:
                     '-keyint_min', '60',
                     '-sc_threshold', '0',
                     '-bf', '2',
-
-                    # Настройки аудио для тихого потока
+                    '-c:a', 'aac',
+                    '-b:a', '128k',
+                    '-ar', '44100',
+                    '-ac', '2',
+                ])
+            else:
+                # Если нет аудио - добавляем тихое аудио
+                mpegts_cmd.extend([
+                    '-f', 'lavfi',
+                    '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+                    '-map', '0:v:0',
+                    '-map', '1:a:0',
+                    '-c:v', 'libx264',
+                    '-preset', 'medium',
+                    '-tune', 'film' if actual_duration > 10 else 'zerolatency',
+                    '-pix_fmt', 'yuv420p',
+                    '-profile:v', 'high',
+                    '-level', '4.1',
+                    '-b:v', video_bitrate,
+                    '-maxrate', maxrate,
+                    '-bufsize', bufsize,
+                    '-r', str(self.video_fps),
+                    '-g', '60',
+                    '-keyint_min', '60',
+                    '-sc_threshold', '0',
+                    '-bf', '2',
                     '-c:a', 'aac',
                     '-b:a', '128k',
                     '-ar', '44100',
                     '-ac', '2',
                 ])
 
-            # 🎯 ШАГ 8: Общие параметры MPEG-TS
+            # Общие параметры
             mpegts_cmd.extend([
-                '-t', str(actual_duration),  # Финальная длительность
-                '-f', 'mpegts',  # Формат вывода - транспортный поток
-                '-muxdelay', '0',  # Задержка мультиплексирования
-                '-muxpreload', '0',  # Предзагрузка мультиплексера
-                '-flush_packets', '1',  # Частое сбрасывание пакетов
-                '-avoid_negative_ts', 'make_zero',  # Избегание отрицательных меток времени
-                '-y',  # Перезапись без подтверждения
-                output_path  # Выходной файл
+                '-t', str(actual_duration),  # Используем фактическую длительность
+                '-f', 'mpegts',
+                '-muxdelay', '0',
+                '-muxpreload', '0',
+                '-flush_packets', '1',
+                '-avoid_negative_ts', 'make_zero',
+                '-y',
+                output_path
             ])
 
-            # 📝 ШАГ 9: Логирование параметров создания
             logger.info(f"🔧 Создание MPEG-TS для кэша: {os.path.basename(video_path)} с битрейтом {video_bitrate}")
             if loop_video:
                 logger.info(f"🔄 Видео будет зациклено до {actual_duration:.1f} сек")
 
-            # ⏱️ ШАГ 10: Запуск FFmpeg с таймаутом
-            timeout = min(actual_duration + 15, 45)  # Таймаут: длительность + 15 секунд, но не больше 45
+            # Таймаут создания
+            timeout = min(actual_duration + 15, 45)
 
             result = subprocess.run(
                 mpegts_cmd,
@@ -1845,11 +1818,10 @@ class FFmpegStreamManager:
                 timeout=timeout
             )
 
-            # ❌ ШАГ 11: Обработка ошибок FFmpeg
             if result.returncode != 0:
                 logger.error(f"❌ Ошибка создания MPEG-TS файла (код {result.returncode}):")
                 if result.stderr:
-                    # Ищем конкретные ошибки битрейта
+                    # Ищем конкретные ошибки
                     error_lines = result.stderr.split('\n')
                     for error_line in error_lines:
                         if 'bitrate' in error_line.lower() or 'buffer' in error_line.lower():
@@ -1865,7 +1837,7 @@ class FFmpegStreamManager:
 
                 return False
 
-            # ✅ ШАГ 12: Проверка созданного файла
+            # Проверяем размер файла
             if not os.path.exists(output_path) or os.path.getsize(output_path) < 1024:
                 logger.error("❌ Созданный MPEG-TS файл слишком маленький или не существует")
                 # Очищаем оптимизированный файл
@@ -1876,84 +1848,23 @@ class FFmpegStreamManager:
                         pass
                 return False
 
-            # 📊 ШАГ 13: Расчет статистики файла
-            file_size = os.path.getsize(output_path) / 1024 / 1024  # Размер в MB
+            file_size = os.path.getsize(output_path) / 1024 / 1024
             calculated_bitrate = (file_size * 8 * 1024 * 1024) / actual_duration / 1000  # kbps
 
             logger.info(f"✅ MPEG-TS файл создан: {file_size:.1f} MB, битрейт ~{calculated_bitrate:.0f} kbps")
             if loop_video:
                 logger.info(f"✅ Видео зациклено для синхронизации с аудио ({duration:.1f} → {actual_duration:.1f} сек)")
 
-            # 💾 ШАГ 14: Добавление файла в кэш
-            if self.use_mpegts_cache:
-                # Генерируем уникальный ключ кэша
-                cache_key = self._get_mpegts_cache_key(video_path, audio_file)
-
-                # Создаем полную информацию о файле для кэша
-                cache_info = {
-                    'filename': os.path.basename(output_path),
-                    'original_video': os.path.basename(video_path),
-                    'original_audio': os.path.basename(audio_file) if audio_file else None,
-                    'duration': actual_duration,
-                    'size': int(os.path.getsize(output_path)),  # Размер в байтах
-                    'audio_used': bool(audio_file),
-                    'created': time.time(),
-                    'last_accessed': time.time(),
-                    'path': output_path,  # Полный путь к файлу
-                    'resolution': f"{video_info.get('width', self.video_width)}x{video_info.get('height', self.video_height)}" if video_info else f"{self.video_width}x{self.video_height}",
-                    'fps': video_info.get('fps', self.video_fps) if video_info else self.video_fps,
-                    'bitrate': video_bitrate,
-                    'calculated_bitrate': calculated_bitrate,
-                    'file_size_mb': round(file_size, 2)
-                }
-
-                # Добавляем в словарь кэша
-                self.mpegts_cache[cache_key] = cache_info
-
-                # Сохраняем индекс кэша на диск
-                self._save_mpegts_cache_index()
-
-                logger.info(f"💾 MPEG-TS добавлен в кэш: {cache_key} ({file_size:.1f} MB)")
-                logger.info(f"📊 Размер кэша: {len(self.mpegts_cache)} файлов")
-
-                # Отправляем уведомление через WebSocket
-                try:
-                    socketio.emit('cache_updated', {
-                        'cache_size': len(self.mpegts_cache),
-                        'new_file': os.path.basename(output_path),
-                        'duration': actual_duration,
-                        'file_size_mb': file_size,
-                        'bitrate': calculated_bitrate,
-                        'timestamp': datetime.now().isoformat()
-                    })
-                except:
-                    pass
-
-            # 🧹 ШАГ 15: Очистка временных файлов
-            # Удаляем оптимизированное видео, если оно было создано
+            # Очищаем оптимизированный файл
             if optimized_video != original_video_path and os.path.exists(optimized_video):
                 try:
                     os.unlink(optimized_video)
-                    logger.debug(f"🗑️ Удален временный оптимизированный файл")
-                except Exception as e:
-                    logger.warning(f"Не удалось удалить временный файл: {e}")
+                except:
+                    pass
 
             return True
-
         except Exception as e:
-            # ❌ ШАГ 16: Обработка непредвиденных ошибок
-            logger.error(f"❌ Непредвиденная ошибка в _create_mpegts_file: {e}", exc_info=True)
-
-            # Пытаемся очистить все временные файлы в случае ошибки
-            try:
-                if 'optimized_video' in locals() and optimized_video != original_video_path and os.path.exists(
-                        optimized_video):
-                    os.unlink(optimized_video)
-                if os.path.exists(output_path):
-                    os.unlink(output_path)
-            except:
-                pass
-
+            logger.error(f"❌ Непредвиденная ошибка в _create_mpegts_file: {e}")
             return False
 
     def _create_initial_continuous_stream(self):
@@ -2009,15 +1920,9 @@ class FFmpegStreamManager:
             file_size = os.path.getsize(mpegts_path)
             logger.info(f"📤 Отправка {file_size / 1024:.1f} KB MPEG-TS данных как часть непрерывного потока")
 
-            # Рассчитываем скорость отправки (байт/сек)
-            bytes_per_second = file_size / duration
-
             with open(mpegts_path, 'rb') as f:
                 bytes_sent = 0
-                start_time = time.time()
-
-                # Оптимальный размер чанка для MPEG-TS (188 байт * 7 * 1024 ≈ 1.3MB)
-                chunk_size = 188 * 7 * 1024
+                chunk_size = 188 * 7 * 1024  # MPEG-TS пакеты по 188 байт, 7KB чанки
 
                 while bytes_sent < file_size and self.is_streaming:
                     chunk = f.read(chunk_size)
@@ -2025,33 +1930,18 @@ class FFmpegStreamManager:
                         break
 
                     try:
-                        # Отправляем чанк
-                        self.ffmpeg_stdin.write(chunk)
-                        bytes_sent += len(chunk)
+                        # Проверяем что это валидные MPEG-TS данные
+                        if len(chunk) % 188 == 0:  # MPEG-TS пакеты должны быть кратно 188 байтам
+                            self.ffmpeg_stdin.write(chunk)
+                            self.ffmpeg_stdin.flush()
+                            bytes_sent += len(chunk)
 
-                        # Синхронизация времени для ПРАВИЛЬНОЙ СКОРОСТИ
-                        current_time = time.time()
-                        elapsed = current_time - start_time
-                        expected_time = bytes_sent / bytes_per_second
+                            # Синхронизация времени
+                            elapsed_bytes = bytes_sent
+                            expected_time = (elapsed_bytes / file_size) * duration
 
-                        # Если отправляем быстрее чем нужно, замедляемся
-                        if elapsed < expected_time:
-                            sleep_time = expected_time - elapsed
-                            if sleep_time > 0.001:  # Только если пауза значительная
-                                # Но не слишком долго, чтобы не блокировать
-                                time.sleep(min(sleep_time, 0.05))
-
-                        # Периодически сбрасываем буфер
-                        if bytes_sent % (chunk_size * 100) == 0:  # Каждые ~130MB
-                            try:
-                                self.ffmpeg_stdin.flush()
-                            except:
-                                pass
-
-                            # Логируем прогресс
-                            progress = (bytes_sent / file_size) * 100
-                            current_bitrate = (bytes_sent * 8) / (elapsed * 1000)  # kbps
-                            logger.info(f"📊 Прогресс: {progress:.1f}%, битрейт: {current_bitrate:.1f} kbps")
+                            # Маленькая пауза для предотвращения перегрузки
+                            time.sleep(0.001)
 
                     except BrokenPipeError:
                         logger.error("❌ Broken pipe: FFmpeg отключился")
@@ -2061,26 +1951,11 @@ class FFmpegStreamManager:
                         logger.error(f"❌ Ошибка отправки MPEG-TS: {e}")
                         return False
 
-            # Финальный сброс буфера
-            if self.ffmpeg_stdin:
-                try:
-                    self.ffmpeg_stdin.flush()
-                except:
-                    pass
-
-            total_time = time.time() - start_time
-            actual_bitrate = (bytes_sent * 8) / (total_time * 1000)  # kbps
-
-            logger.info(f"✅ Отправлено {bytes_sent}/{file_size} байт за {total_time:.1f} сек")
-            logger.info(f"📊 Фактический битрейт: {actual_bitrate:.1f} kbps")
-
-            if actual_bitrate < 1000:
-                logger.warning(f"⚠️ НИЗКИЙ БИТРЕЙТ: {actual_bitrate:.1f} kbps")
-
+            logger.info(f"✅ Отправлено {bytes_sent}/{file_size} байт")
             return bytes_sent >= file_size * 0.9  # Успех если >90%
 
         except Exception as e:
-            logger.error(f"❌ Ошибка отправки MPEG-TS файла: {e}", exc_info=True)
+            logger.error(f"❌ Ошибка отправки MPEG-TS файла: {e}")
             return False
 
     def _send_test_stream(self, duration: float):
@@ -2092,29 +1967,26 @@ class FFmpegStreamManager:
             test_mpegts = tempfile.NamedTemporaryFile(suffix='.ts', delete=False)
             test_mpegts.close()
 
-            duration_str = str(duration)
-
-            # Команда для создания тестового MPEG-TS потока с ПРАВИЛЬНЫМ БИТРЕЙТОМ
+            # Команда для создания тестового MPEG-TS потока
             cmd = [
                 'ffmpeg',
                 '-f', 'lavfi',
-                '-i',
-                f'color=c=black:s={self.video_width}x{self.video_height}:rate={self.video_fps}:duration={duration_str}',
+                '-i', f'testsrc=size={self.video_width}x{self.video_height}:rate={self.video_fps}:duration={duration}',
                 '-f', 'lavfi',
-                '-i', f'anullsrc=channel_layout=stereo:sample_rate=44100:duration={duration_str}',
+                '-i', f'sine=frequency=1000:duration={duration}',
                 '-c:v', 'libx264',
-                '-preset', 'veryfast',  # Лучше чем ultrafast для качества
+                '-preset', 'ultrafast',
                 '-tune', 'zerolatency',
                 '-pix_fmt', 'yuv420p',
-                '-b:v', '3000k',  # УВЕЛИЧИВАЕМ БИТРЕЙТ
-                '-maxrate', '4000k',
-                '-bufsize', '8000k',
+                '-b:v', '3000k',
+                '-maxrate', '3000k',
+                '-bufsize', '6000k',
                 '-g', '60',
                 '-c:a', 'aac',
-                '-b:a', '128k',  # Стандартный для YouTube
+                '-b:a', '128k',
                 '-ar', '44100',
                 '-ac', '2',
-                '-t', duration_str,
+                '-t', str(duration),
                 '-f', 'mpegts',
                 '-y',
                 test_mpegts.name
@@ -2130,32 +2002,21 @@ class FFmpegStreamManager:
             )
 
             if result.returncode == 0:
-                file_size = os.path.getsize(test_mpegts.name)
-                calculated_bitrate = (file_size * 8) / (duration * 1000)  # kbps
-                logger.info(
-                    f"✅ Тестовый MPEG-TS создан: {file_size / 1024:.1f} KB, битрейт: {calculated_bitrate:.1f} kbps")
+                logger.info(f"✅ Тестовый MPEG-TS создан: {os.path.getsize(test_mpegts.name) / 1024:.1f} KB")
 
-                if calculated_bitrate < 2000:
-                    logger.warning(f"⚠️ Тестовый поток имеет низкий битрейт: {calculated_bitrate:.1f} kbps")
-
-                # Используем метод непрерывной отправки
-                success = self._send_continuous_mpegts(test_mpegts.name, duration)
+                # Отправляем как часть непрерывного потока
+                self._send_continuous_mpegts(test_mpegts.name, duration)
 
                 # Удаляем временный файл
                 os.unlink(test_mpegts.name)
 
-                return success
+                return True
             else:
-                logger.error(f"❌ Ошибка создания тестового потока (код {result.returncode}):")
-                if result.stderr:
-                    # Ищем ошибки битрейта
-                    for line in result.stderr.split('\n'):
-                        if 'bitrate' in line.lower() or 'buffer' in line.lower():
-                            logger.error(f"   🎯 {line[:100]}")
+                logger.error(f"❌ Ошибка создания тестового потока: {result.stderr[:200]}")
                 return False
 
         except Exception as e:
-            logger.error(f"❌ Ошибка тестового потока: {e}", exc_info=True)
+            logger.error(f"❌ Ошибка тестового потока: {e}")
             return False
 
     def _read_from_stream_generator(self):
@@ -2557,49 +2418,34 @@ class FFmpegStreamManager:
             # Флаг для предотвращения одновременной отправки
             self.is_sending_data = False
 
-            # Флаг для отслеживания отправки тестового потока
-            last_test_stream_time = 0
-            TEST_STREAM_INTERVAL = 30  # Отправлять тестовый поток каждые 30 секунд в ожидании
+            # Ожидание накопления файлов
+            logger.info(f"⏳ Ожидание накопления {MIN_FILES_FOR_STREAM} файлов в кэше...")
+
+            while self.is_streaming and len(self.mpegts_cache) < MIN_FILES_FOR_STREAM:
+                if not self._check_ffmpeg_alive():
+                    logger.error("❌ FFmpeg процесс завершился. Останавливаю контроллер...")
+                    return
+
+                logger.info(f"📊 В кэше: {len(self.mpegts_cache)}/{MIN_FILES_FOR_STREAM} файлов")
+
+                socketio.emit('waiting_for_cache', {
+                    'current': len(self.mpegts_cache),
+                    'required': MIN_FILES_FOR_STREAM,
+                    'progress': (len(self.mpegts_cache) / MIN_FILES_FOR_STREAM) * 100,
+                    'message': f'Накопление файлов в кэше: {len(self.mpegts_cache)}/{MIN_FILES_FOR_STREAM}',
+                    'timestamp': datetime.now().isoformat()
+                })
+
+                time.sleep(10)  # Проверяем каждые 10 секунд
+
+            logger.info(
+                f"✅ Достаточно файлов в кэше: {len(self.mpegts_cache)}/{MIN_FILES_FOR_STREAM}. Начинаю отправку...")
 
             # Основной цикл отправки контента
             while self.is_streaming:
                 if not self._check_ffmpeg_alive():
                     logger.error("❌ FFmpeg процесс завершился. Останавливаю контроллер...")
                     break
-
-                # Проверяем сколько файлов в кэше
-                if len(self.mpegts_cache) < MIN_FILES_FOR_STREAM:
-                    # Ожидание накопления файлов
-                    current_time = time.time()
-
-                    # Проверяем нужно ли отправить тестовый поток
-                    if current_time - last_test_stream_time > TEST_STREAM_INTERVAL:
-                        logger.info(
-                            f"📭 Нет контента (в кэше {len(self.mpegts_cache)}/{MIN_FILES_FOR_STREAM}), отправляю тестовый поток...")
-                        if self._send_test_stream(30):  # Отправляем тестовый поток на 30 секунд
-                            last_test_stream_time = current_time
-                        else:
-                            # Если не удалось отправить тестовый поток, ждем немного
-                            time.sleep(5)
-                        continue  # После отправки тестового потока продолжаем проверку
-
-                    logger.info(f"⏳ Ожидание накопления файлов: {len(self.mpegts_cache)}/{MIN_FILES_FOR_STREAM}")
-
-                    socketio.emit('waiting_for_cache', {
-                        'current': len(self.mpegts_cache),
-                        'required': MIN_FILES_FOR_STREAM,
-                        'progress': (len(self.mpegts_cache) / MIN_FILES_FOR_STREAM) * 100,
-                        'message': f'Накопление файлов в кэше: {len(self.mpegts_cache)}/{MIN_FILES_FOR_STREAM}',
-                        'timestamp': datetime.now().isoformat()
-                    })
-
-                    time.sleep(10)  # Проверяем каждые 10 секунд
-                    continue  # Продолжаем ожидание
-
-                # Если достаточно файлов, начинаем отправку
-                logger.info(
-                    f"✅ Достаточно файлов в кэше: {len(self.mpegts_cache)}/{MIN_FILES_FOR_STREAM}. Начинаю отправку..."
-                )
 
                 # Если уже идет отправка, ждем
                 if self.is_sending_data:
@@ -2616,10 +2462,9 @@ class FFmpegStreamManager:
                 cache_items = list(self.mpegts_cache.items())
                 cache_items.sort(key=lambda x: x[1].get('created', 0))
 
-                # Берем первые 10 файлов для отправки
-                batch_size = min(10, len(cache_items))
+                # Берем первые 20 файлов для отправки
+                batch_size = min(20, len(cache_items))
                 files_to_send = []
-                files_to_delete = []  # Файлы для удаления после отправки
 
                 for i in range(batch_size):
                     cache_key, cache_info = cache_items[i]
@@ -2636,22 +2481,12 @@ class FFmpegStreamManager:
                             'total': batch_size
                         })
 
-                        # Добавляем в список для удаления
-                        files_to_delete.append({
-                            'cache_key': cache_key,
-                            'mpegts_path': mpegts_path,
-                            'filename': cache_info['filename']
-                        })
-
                 if not files_to_send:
                     logger.error("❌ Не удалось найти файлы для отправки")
                     time.sleep(5)
                     continue
 
                 logger.info(f"📦 Начинаю отправку батча из {len(files_to_send)} файлов")
-
-                sent_count = 0
-                failed_count = 0
 
                 # Отправляем файлы один за другим
                 for file_info in files_to_send:
@@ -2679,7 +2514,10 @@ class FFmpegStreamManager:
                         )
 
                         if success:
-                            sent_count += 1
+                            # Обновляем время доступа в кэше
+                            if file_info['cache_key'] in self.mpegts_cache:
+                                self.mpegts_cache[file_info['cache_key']]['last_accessed'] = time.time()
+
                             logger.info(f"✅ Файл отправлен: {file_info['original_video']}")
 
                             socketio.emit('video_playing', {
@@ -2691,103 +2529,48 @@ class FFmpegStreamManager:
                                 'queue_remaining': len(files_to_send) - file_info['index']
                             })
 
+                            # Короткая пауза между файлами для плавности
+                            time.sleep(0.5)
+
                         else:
-                            failed_count += 1
                             logger.error(f"❌ Ошибка отправки файла: {file_info['original_video']}")
 
                     except Exception as e:
-                        failed_count += 1
                         logger.error(f"❌ Ошибка отправки: {e}")
 
                     finally:
                         self.is_sending_data = False
 
-                        # Короткая пауза между файлами для плавности
-                        time.sleep(0.5)
+                # После отправки батча проверяем сколько файлов осталось в кэше
+                remaining_files = len(self.mpegts_cache) - batch_size
 
-                # УДАЛЯЕМ ОТПРАВЛЕННЫЕ ФАЙЛЫ ИЗ КЭША
-                deleted_count = 0
-                for file_to_delete in files_to_delete[:sent_count]:  # Удаляем только успешно отправленные
-                    try:
-                        # Удаляем файл с диска
-                        if os.path.exists(file_to_delete['mpegts_path']):
-                            os.unlink(file_to_delete['mpegts_path'])
+                if remaining_files < MIN_FILES_FOR_STREAM:
+                    logger.info(f"📭 В кэше осталось мало файлов: {remaining_files}. Ожидание пополнения...")
 
-                        # Удаляем из кэша
-                        if file_to_delete['cache_key'] in self.mpegts_cache:
-                            del self.mpegts_cache[file_to_delete['cache_key']]
+                    # Ждем пока накопится достаточно файлов
+                    while self.is_streaming and len(self.mpegts_cache) < MIN_FILES_FOR_STREAM:
+                        socketio.emit('waiting_for_cache', {
+                            'current': len(self.mpegts_cache),
+                            'required': MIN_FILES_FOR_STREAM,
+                            'progress': (len(self.mpegts_cache) / MIN_FILES_FOR_STREAM) * 100,
+                            'message': f'Ожидание пополнения кэша: {len(self.mpegts_cache)}/{MIN_FILES_FOR_STREAM} файлов',
+                            'timestamp': datetime.now().isoformat()
+                        })
 
-                        deleted_count += 1
-                        logger.info(f"🗑️ Удален файл из кэша: {file_to_delete['filename']}")
+                        logger.info(f"⏳ Ожидание файлов: {len(self.mpegts_cache)}/{MIN_FILES_FOR_STREAM}")
+                        time.sleep(10)  # Проверяем каждые 10 секунд
 
-                    except Exception as e:
-                        logger.error(f"❌ Ошибка удаления файла {file_to_delete['filename']}: {e}")
+                    if len(self.mpegts_cache) >= MIN_FILES_FOR_STREAM:
+                        logger.info(f"✅ Кэш пополнен: {len(self.mpegts_cache)} файлов. Продолжаем отправку...")
 
-                # Сохраняем обновленный индекс кэша
-                if deleted_count > 0:
-                    self._save_mpegts_cache_index()
-                    logger.info(f"🧹 Удалено {deleted_count} файлов из кэша после отправки")
-
-                logger.info(f"📊 Итог отправки: {sent_count} успешно, {failed_count} с ошибками")
-
-                socketio.emit('batch_complete', {
-                    'sent_count': sent_count,
-                    'failed_count': failed_count,
-                    'deleted_count': deleted_count,
-                    'remaining_in_cache': len(self.mpegts_cache),
-                    'timestamp': datetime.now().isoformat()
-                })
-
-                # После отправки батча продолжаем основной цикл
+                else:
+                    logger.info(f"📊 В кэше осталось {remaining_files} файлов. Продолжаем...")
+                    time.sleep(1)  # Короткая пауза перед следующим батчем
 
         except Exception as e:
             logger.error(f"❌ Ошибка в контроллере потока: {e}", exc_info=True)
 
         logger.info("🛑 Контроллер MPEG-TS потока остановлен")
-
-
-    def _cleanup_old_cache_files(self, max_age_hours: int = 6):
-        """Безопасная очистка старых файлов в кэше"""
-        try:
-            if not self.use_mpegts_cache or not self.mpegts_cache:
-                return
-
-            current_time = time.time()
-            max_age_seconds = max_age_hours * 3600
-
-            files_to_remove = []
-
-            for cache_key, cache_info in self.mpegts_cache.items():
-                created_time = cache_info.get('created', 0)
-
-                # Если файл старше max_age_hours
-                if created_time > 0 and (current_time - created_time) > max_age_seconds:
-                    mpegts_path = os.path.join(self.mpegts_cache_dir, cache_info['filename'])
-                    files_to_remove.append((cache_key, mpegts_path, cache_info))
-
-            # Удаляем старые файлы
-            deleted_count = 0
-            for cache_key, mpegts_path, cache_info in files_to_remove:
-                try:
-                    # Удаляем файл
-                    if os.path.exists(mpegts_path):
-                        os.unlink(mpegts_path)
-
-                    # Удаляем из кэша
-                    del self.mpegts_cache[cache_key]
-                    deleted_count += 1
-
-                    logger.info(f"🗑️ Удален старый файл: {cache_info.get('original_video', 'unknown')}")
-
-                except Exception as e:
-                    logger.error(f"❌ Ошибка удаления старого файла: {e}")
-
-            if deleted_count > 0:
-                self._save_mpegts_cache_index()
-                logger.info(f"🧹 Очищено {deleted_count} старых файлов (старше {max_age_hours} часов)")
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка очистки старых файлов кэша: {e}")
 
     def _send_mpegts_data(self, mpegts_path: str, duration: float) -> bool:
         """Отправка MPEG-TS данных через pipe"""

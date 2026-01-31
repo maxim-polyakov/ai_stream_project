@@ -2430,7 +2430,7 @@ class FFmpegStreamManager:
 
                 while self.is_streaming and not stop_event.is_set():
                     try:
-                        # Для мониторинга всегда используем 2 файла как минимальное требование
+                        # Для мониторинга всегда используем MIN_FILES_FOR_STREAM как минимальное требование
                         current_cache_size = len(self.mpegts_cache)
 
                         # Если в кэше мало файлов, отправляем событие
@@ -2445,10 +2445,7 @@ class FFmpegStreamManager:
                                 'timestamp': datetime.now().isoformat()
                             })
 
-                        # Здесь можно добавить логику для автоматического пополнения кэша
-                        # если файлов меньше определенного порога
-
-                        time.sleep(5)  # Проверяем каждые 5 секунд
+                        time.sleep(5)
 
                     except Exception as e:
                         logger.error(f"❌ Ошибка в потоке мониторинга кэша: {e}")
@@ -2479,8 +2476,6 @@ class FFmpegStreamManager:
                     logger.info(
                         f"⏳ Ожидание файлов: {len(self.mpegts_cache)}/{required_files} {'(первый запуск)' if is_first_run else ''}")
 
-                    # Короткая пауза и продолжаем цикл
-                    # Параллельный поток уже уведомляет о состоянии кэша
                     time.sleep(5)
                     continue
 
@@ -2499,15 +2494,13 @@ class FFmpegStreamManager:
                 cache_items = list(self.mpegts_cache.items())
                 cache_items.sort(key=lambda x: x[1].get('created', 0))
 
-                # Определяем сколько файлов взять для отправки
-                batch_size = required_files if is_first_run else 1
+                # ВАЖНОЕ ИЗМЕНЕНИЕ: Всегда берем MIN_FILES_FOR_STREAM файлов для отправки
+                # но удаляем только отправленные
+                batch_size = min(MIN_FILES_FOR_STREAM, len(cache_items))
                 files_to_send = []
                 files_to_delete = []  # Файлы для удаления после отправки
 
                 for i in range(batch_size):
-                    if i >= len(cache_items):
-                        break
-
                     cache_key, cache_info = cache_items[i]
                     mpegts_path = os.path.join(self.mpegts_cache_dir, cache_info['filename'])
 
@@ -2522,7 +2515,7 @@ class FFmpegStreamManager:
                             'total': batch_size
                         })
 
-                        # Добавляем в список для удаления
+                        # Добавляем в список для удаления, но удалять будем по-разному
                         files_to_delete.append({
                             'cache_key': cache_key,
                             'mpegts_path': mpegts_path,
@@ -2540,8 +2533,11 @@ class FFmpegStreamManager:
                 sent_count = 0
                 failed_count = 0
 
-                # Отправляем файлы ПОСЛЕДОВАТЕЛЬНО один за другим
-                for file_info in files_to_send:
+                # Определяем сколько файлов фактически отправить
+                # Для первого запуска - все batch_size файлов, для последующих - только первый файл
+                files_to_actually_send = files_to_send if is_first_run else [files_to_send[0]]
+
+                for file_info in files_to_actually_send:
                     if not self.is_streaming:
                         break
 
@@ -2575,7 +2571,7 @@ class FFmpegStreamManager:
                                 'timestamp': datetime.now().isoformat(),
                                 'position': f"{file_info['index']}/{file_info['total']}",
                                 'total_in_cache': len(self.mpegts_cache),
-                                'queue_remaining': len(files_to_send) - file_info['index']
+                                'queue_remaining': len(files_to_actually_send) - file_info['index'] + 1
                             })
 
                         else:
@@ -2588,27 +2584,20 @@ class FFmpegStreamManager:
 
                     finally:
                         self.is_sending_data = False
-
-                        # Короткая пауза между файлами для плавности
                         time.sleep(0.5)
 
                 # УДАЛЯЕМ ОТПРАВЛЕННЫЕ ФАЙЛЫ ИЗ КЭША
                 deleted_count = 0
-                for file_to_delete in files_to_delete[:sent_count]:  # Удаляем только успешно отправленные
-                    try:
-                        # Удаляем файл с диска
-                        if os.path.exists(file_to_delete['mpegts_path']):
-                            os.unlink(file_to_delete['mpegts_path'])
 
-                        # Удаляем из кэша
-                        if file_to_delete['cache_key'] in self.mpegts_cache:
-                            del self.mpegts_cache[file_to_delete['cache_key']]
-
-                        deleted_count += 1
-                        logger.info(f"🗑️ Удален файл из кэша: {file_to_delete['filename']}")
-
-                    except Exception as e:
-                        logger.error(f"❌ Ошибка удаления файла {file_to_delete['filename']}: {e}")
+                # Для первого запуска удаляем все отправленные файлы, для последующих - только первый
+                if is_first_run:
+                    # Удаляем все успешно отправленные файлы
+                    for file_to_delete in files_to_delete[:sent_count]:
+                        deleted_count += self._delete_cache_file(file_to_delete)
+                else:
+                    # Удаляем только первый файл
+                    if sent_count > 0 and len(files_to_delete) > 0:
+                        deleted_count += self._delete_cache_file(files_to_delete[0])
 
                 # Сохраняем обновленный индекс кэша
                 if deleted_count > 0:
@@ -2628,7 +2617,8 @@ class FFmpegStreamManager:
                     'deleted_count': deleted_count,
                     'remaining_in_cache': len(self.mpegts_cache),
                     'timestamp': datetime.now().isoformat(),
-                    'is_first_run': is_first_run
+                    'is_first_run': is_first_run,
+                    'files_in_current_batch': len(files_to_send)
                 })
 
                 # Короткая пауза перед следующей проверкой
@@ -2642,6 +2632,23 @@ class FFmpegStreamManager:
             stop_event.set()
             logger.info("🛑 Контроллер MPEG-TS потока остановлен")
 
+    def _delete_cache_file(self, file_info):
+        """Вспомогательный метод для безопасного удаления файла из кэша"""
+        try:
+            # Удаляем файл с диска
+            if os.path.exists(file_info['mpegts_path']):
+                os.unlink(file_info['mpegts_path'])
+
+            # Удаляем из кэша
+            if file_info['cache_key'] in self.mpegts_cache:
+                del self.mpegts_cache[file_info['cache_key']]
+
+            logger.info(f"🗑️ Удален файл из кэша: {file_info['filename']}")
+            return 1
+        except Exception as e:
+            logger.error(f"❌ Ошибка удаления файла {file_info['filename']}: {e}")
+            return 0
+        
     def _cleanup_old_cache_files(self, max_age_hours: int = 6):
         """Безопасная очистка старых файлов в кэше"""
         try:

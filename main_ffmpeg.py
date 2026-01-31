@@ -4414,7 +4414,7 @@ class AIStreamManager:
 
                             # Ждем завершения аудио
                             audio_duration = self.tts_manager._get_audio_duration(audio_file)
-                            wait_time = min(audio_duration * 0.8, 15)  # Ждем 80% аудио
+                            wait_time = min(audio_duration, 15)  # Ждем 80% аудио
                             await asyncio.sleep(wait_time)
 
                     else:

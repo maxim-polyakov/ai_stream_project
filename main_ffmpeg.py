@@ -1971,22 +1971,22 @@ class FFmpegStreamManager:
             cmd = [
                 'ffmpeg',
                 '-f', 'lavfi',
-                '-i', f'testsrc=size={self.video_width}x{self.video_height}:rate={self.video_fps}:duration={duration}',
+                '-i', f'color=c=black:s={self.video_width}x{self.video_height}:rate={self.video_fps}:duration=30',
                 '-f', 'lavfi',
-                '-i', f'sine=frequency=1000:duration={duration}',
+                '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100:duration=30',
                 '-c:v', 'libx264',
                 '-preset', 'ultrafast',
                 '-tune', 'zerolatency',
                 '-pix_fmt', 'yuv420p',
-                '-b:v', '3000k',
-                '-maxrate', '3000k',
-                '-bufsize', '6000k',
+                '-b:v', '2000k',
+                '-maxrate', '2000k',
+                '-bufsize', '4000k',
                 '-g', '60',
                 '-c:a', 'aac',
-                '-b:a', '128k',
+                '-b:a', '96k',
                 '-ar', '44100',
                 '-ac', '2',
-                '-t', str(duration),
+                '-t', '30',
                 '-f', 'mpegts',
                 '-y',
                 test_mpegts.name
@@ -2422,44 +2422,45 @@ class FFmpegStreamManager:
             last_test_stream_time = 0
             TEST_STREAM_INTERVAL = 30  # Отправлять тестовый поток каждые 30 секунд в ожидании
 
-            # Ожидание накопления файлов
-            logger.info(f"⏳ Ожидание накопления {MIN_FILES_FOR_STREAM} файлов в кэше...")
-
-            while self.is_streaming and len(self.mpegts_cache) < MIN_FILES_FOR_STREAM:
-                if not self._check_ffmpeg_alive():
-                    logger.error("❌ FFmpeg процесс завершился. Останавливаю контроллер...")
-                    return
-
-                current_time = time.time()
-
-                # Проверяем нужно ли отправить тестовый поток
-                if current_time - last_test_stream_time > TEST_STREAM_INTERVAL:
-                    logger.info("📭 Нет контента, отправляю тестовый поток...")
-                    self._send_test_stream(30)  # Используем ваш существующий метод
-                    last_test_stream_time = current_time
-                    continue  # После отправки тестового потока продолжаем проверку
-
-                logger.info(f"📊 В кэше: {len(self.mpegts_cache)}/{MIN_FILES_FOR_STREAM} файлов")
-
-                socketio.emit('waiting_for_cache', {
-                    'current': len(self.mpegts_cache),
-                    'required': MIN_FILES_FOR_STREAM,
-                    'progress': (len(self.mpegts_cache) / MIN_FILES_FOR_STREAM) * 100,
-                    'message': f'Накопление файлов в кэше: {len(self.mpegts_cache)}/{MIN_FILES_FOR_STREAM}',
-                    'timestamp': datetime.now().isoformat()
-                })
-
-                time.sleep(10)  # Проверяем каждые 10 секунд
-
-            logger.info(
-                f"✅ Достаточно файлов в кэше: {len(self.mpegts_cache)}/{MIN_FILES_FOR_STREAM}. Начинаю отправку..."
-            )
-
             # Основной цикл отправки контента
             while self.is_streaming:
                 if not self._check_ffmpeg_alive():
                     logger.error("❌ FFmpeg процесс завершился. Останавливаю контроллер...")
                     break
+
+                # Проверяем сколько файлов в кэше
+                if len(self.mpegts_cache) < MIN_FILES_FOR_STREAM:
+                    # Ожидание накопления файлов
+                    current_time = time.time()
+
+                    # Проверяем нужно ли отправить тестовый поток
+                    if current_time - last_test_stream_time > TEST_STREAM_INTERVAL:
+                        logger.info(
+                            f"📭 Нет контента (в кэше {len(self.mpegts_cache)}/{MIN_FILES_FOR_STREAM}), отправляю тестовый поток...")
+                        if self._send_test_stream(30):  # Отправляем тестовый поток на 30 секунд
+                            last_test_stream_time = current_time
+                        else:
+                            # Если не удалось отправить тестовый поток, ждем немного
+                            time.sleep(5)
+                        continue  # После отправки тестового потока продолжаем проверку
+
+                    logger.info(f"⏳ Ожидание накопления файлов: {len(self.mpegts_cache)}/{MIN_FILES_FOR_STREAM}")
+
+                    socketio.emit('waiting_for_cache', {
+                        'current': len(self.mpegts_cache),
+                        'required': MIN_FILES_FOR_STREAM,
+                        'progress': (len(self.mpegts_cache) / MIN_FILES_FOR_STREAM) * 100,
+                        'message': f'Накопление файлов в кэше: {len(self.mpegts_cache)}/{MIN_FILES_FOR_STREAM}',
+                        'timestamp': datetime.now().isoformat()
+                    })
+
+                    time.sleep(10)  # Проверяем каждые 10 секунд
+                    continue  # Продолжаем ожидание
+
+                # Если достаточно файлов, начинаем отправку
+                logger.info(
+                    f"✅ Достаточно файлов в кэше: {len(self.mpegts_cache)}/{MIN_FILES_FOR_STREAM}. Начинаю отправку..."
+                )
 
                 # Если уже идет отправка, ждем
                 if self.is_sending_data:
@@ -2598,41 +2599,7 @@ class FFmpegStreamManager:
                     'timestamp': datetime.now().isoformat()
                 })
 
-                # Проверяем сколько файлов осталось в кэше
-                remaining_files = len(self.mpegts_cache)
-
-                if remaining_files < MIN_FILES_FOR_STREAM:
-                    logger.info(f"📭 В кэше осталось мало файлов: {remaining_files}. Ожидание пополнения...")
-
-                    # Ждем пока накопится достаточно файлов (с отправкой тестового потока)
-                    last_test_stream_time = time.time()
-                    while self.is_streaming and len(self.mpegts_cache) < MIN_FILES_FOR_STREAM:
-                        current_time = time.time()
-
-                        # Отправляем тестовый поток каждые TEST_STREAM_INTERVAL секунд
-                        if current_time - last_test_stream_time > TEST_STREAM_INTERVAL:
-                            logger.info("📭 Нет контента, отправляю тестовый поток...")
-                            self._send_test_stream(30)  # Используем ваш существующий метод
-                            last_test_stream_time = current_time
-                            continue  # После тестового потока продолжаем ожидание
-
-                        socketio.emit('waiting_for_cache', {
-                            'current': len(self.mpegts_cache),
-                            'required': MIN_FILES_FOR_STREAM,
-                            'progress': (len(self.mpegts_cache) / MIN_FILES_FOR_STREAM) * 100,
-                            'message': f'Ожидание пополнения кэша: {len(self.mpegts_cache)}/{MIN_FILES_FOR_STREAM} файлов',
-                            'timestamp': datetime.now().isoformat()
-                        })
-
-                        logger.info(f"⏳ Ожидание файлов: {len(self.mpegts_cache)}/{MIN_FILES_FOR_STREAM}")
-                        time.sleep(10)  # Проверяем каждые 10 секунд
-
-                    if len(self.mpegts_cache) >= MIN_FILES_FOR_STREAM:
-                        logger.info(f"✅ Кэш пополнен: {len(self.mpegts_cache)} файлов. Продолжаем отправку...")
-
-                else:
-                    logger.info(f"📊 В кэше осталось {remaining_files} файлов. Продолжаем...")
-                    time.sleep(1)  # Короткая пауза перед следующим батчем
+                # После отправки батча продолжаем основной цикл
 
         except Exception as e:
             logger.error(f"❌ Ошибка в контроллере потока: {e}", exc_info=True)

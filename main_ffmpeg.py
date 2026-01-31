@@ -2418,6 +2418,10 @@ class FFmpegStreamManager:
             # Флаг для предотвращения одновременной отправки
             self.is_sending_data = False
 
+            # Флаг для отслеживания отправки тестового потока
+            last_test_stream_time = 0
+            TEST_STREAM_INTERVAL = 30  # Отправлять тестовый поток каждые 30 секунд в ожидании
+
             # Ожидание накопления файлов
             logger.info(f"⏳ Ожидание накопления {MIN_FILES_FOR_STREAM} файлов в кэше...")
 
@@ -2425,6 +2429,15 @@ class FFmpegStreamManager:
                 if not self._check_ffmpeg_alive():
                     logger.error("❌ FFmpeg процесс завершился. Останавливаю контроллер...")
                     return
+
+                current_time = time.time()
+
+                # Проверяем нужно ли отправить тестовый поток
+                if current_time - last_test_stream_time > TEST_STREAM_INTERVAL:
+                    logger.info("📭 Нет контента, отправляю тестовый поток...")
+                    self._send_test_stream(30)  # Используем ваш существующий метод
+                    last_test_stream_time = current_time
+                    continue  # После отправки тестового потока продолжаем проверку
 
                 logger.info(f"📊 В кэше: {len(self.mpegts_cache)}/{MIN_FILES_FOR_STREAM} файлов")
 
@@ -2591,8 +2604,18 @@ class FFmpegStreamManager:
                 if remaining_files < MIN_FILES_FOR_STREAM:
                     logger.info(f"📭 В кэше осталось мало файлов: {remaining_files}. Ожидание пополнения...")
 
-                    # Ждем пока накопится достаточно файлов
+                    # Ждем пока накопится достаточно файлов (с отправкой тестового потока)
+                    last_test_stream_time = time.time()
                     while self.is_streaming and len(self.mpegts_cache) < MIN_FILES_FOR_STREAM:
+                        current_time = time.time()
+
+                        # Отправляем тестовый поток каждые TEST_STREAM_INTERVAL секунд
+                        if current_time - last_test_stream_time > TEST_STREAM_INTERVAL:
+                            logger.info("📭 Нет контента, отправляю тестовый поток...")
+                            self._send_test_stream(30)  # Используем ваш существующий метод
+                            last_test_stream_time = current_time
+                            continue  # После тестового потока продолжаем ожидание
+
                         socketio.emit('waiting_for_cache', {
                             'current': len(self.mpegts_cache),
                             'required': MIN_FILES_FOR_STREAM,

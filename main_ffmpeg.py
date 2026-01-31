@@ -4169,7 +4169,7 @@ class AIStreamManager:
                     # Имитируем воспроизведение для пользователя
                     audio_duration = self.tts_manager._get_audio_duration(audio_file) if audio_file else 5.0
                     logger.info(f"🔊 Аудио создано: {agent.name} ({audio_duration:.1f} сек)")
-                    await asyncio.sleep(audio_duration * 0.8)
+                    await asyncio.sleep(audio_duration)
 
                 except Exception as e:
                     logger.error(f"❌ Ошибка создания контента для {agent.name}: {e}")

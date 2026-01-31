@@ -2467,6 +2467,22 @@ class FFmpegStreamManager:
                     stop_event.set()
                     break
 
+                # Проверяем, достаточно ли файлов для отправки
+                if len(self.mpegts_cache) < MIN_FILES_FOR_STREAM:
+                    logger.info(f"⏳ Ожидание накопления файлов: {len(self.mpegts_cache)}/{MIN_FILES_FOR_STREAM}")
+
+                    # Уведомляем о ожидании
+                    socketio.emit('waiting_for_cache', {
+                        'current': len(self.mpegts_cache),
+                        'required': MIN_FILES_FOR_STREAM,
+                        'progress': (len(self.mpegts_cache) / MIN_FILES_FOR_STREAM) * 100,
+                        'message': f'Ожидание накопления файлов: {len(self.mpegts_cache)}/{MIN_FILES_FOR_STREAM}',
+                        'timestamp': datetime.now().isoformat()
+                    })
+
+                    time.sleep(5)
+                    continue
+
                 # Если уже идет отправка, ждем
                 if self.is_sending_data:
                     time.sleep(0.1)
@@ -2584,7 +2600,7 @@ class FFmpegStreamManager:
                     time.sleep(0.5)
 
         except Exception as e:
-            logger.error(f"❌ Ошибка в контроллере потока: {e}", exc_info=True)
+            logger.error(f"❌ Ошибка в контроллера потока: {e}", exc_info=True)
             stop_event.set()
 
         finally:

@@ -1967,13 +1967,17 @@ class FFmpegStreamManager:
             test_mpegts = tempfile.NamedTemporaryFile(suffix='.ts', delete=False)
             test_mpegts.close()
 
+            # Используем переданную длительность
+            duration_str = str(duration)
+
             # Команда для создания тестового MPEG-TS потока
             cmd = [
                 'ffmpeg',
                 '-f', 'lavfi',
-                '-i', f'color=c=black:s={self.video_width}x{self.video_height}:rate={self.video_fps}:duration=30',
+                '-i',
+                f'color=c=black:s={self.video_width}x{self.video_height}:rate={self.video_fps}:duration={duration_str}',
                 '-f', 'lavfi',
-                '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100:duration=30',
+                '-i', f'anullsrc=channel_layout=stereo:sample_rate=44100:duration={duration_str}',
                 '-c:v', 'libx264',
                 '-preset', 'ultrafast',
                 '-tune', 'zerolatency',
@@ -1986,7 +1990,7 @@ class FFmpegStreamManager:
                 '-b:a', '96k',
                 '-ar', '44100',
                 '-ac', '2',
-                '-t', '30',
+                '-t', duration_str,  # Используем переданную длительность
                 '-f', 'mpegts',
                 '-y',
                 test_mpegts.name
@@ -2002,21 +2006,28 @@ class FFmpegStreamManager:
             )
 
             if result.returncode == 0:
-                logger.info(f"✅ Тестовый MPEG-TS создан: {os.path.getsize(test_mpegts.name) / 1024:.1f} KB")
+                file_size = os.path.getsize(test_mpegts.name)
+                logger.info(f"✅ Тестовый MPEG-TS создан: {file_size / 1024:.1f} KB")
 
-                # Отправляем как часть непрерывного потока
-                self._send_continuous_mpegts(test_mpegts.name, duration)
+                # Отправляем используя правильный метод
+                if hasattr(self, '_send_mpegts_data'):
+                    success = self._send_mpegts_data(test_mpegts.name, duration)
+                elif hasattr(self, '_send_continuous_mpegts'):
+                    success = self._send_continuous_mpegts(test_mpegts.name, duration)
+                else:
+                    logger.error("❌ Метод отправки MPEG-TS не найден")
+                    success = False
 
                 # Удаляем временный файл
                 os.unlink(test_mpegts.name)
 
-                return True
+                return success
             else:
                 logger.error(f"❌ Ошибка создания тестового потока: {result.stderr[:200]}")
                 return False
 
         except Exception as e:
-            logger.error(f"❌ Ошибка тестового потока: {e}")
+            logger.error(f"❌ Ошибка тестового потока: {e}", exc_info=True)
             return False
 
     def _read_from_stream_generator(self):

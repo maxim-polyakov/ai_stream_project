@@ -2436,16 +2436,52 @@ class FFmpegStreamManager:
                     try:
                         current_cache_size = len(self.mpegts_cache)
 
-                        if current_cache_size < MIN_FILES_FOR_STREAM:
-                            logger.info(f"📭 В кэше мало файлов: {current_cache_size}/{MIN_FILES_FOR_STREAM}")
+                        # Определяем требуемое количество файлов в зависимости от режима
+                        # Используем нелокальную переменную is_first_run из внешней функции
+                        nonlocal is_first_run
+                        required_for_monitoring = MIN_FILES_FOR_STREAM if is_first_run else 1
 
-                            socketio.emit('waiting_for_cache', {
-                                'current': current_cache_size,
-                                'required': MIN_FILES_FOR_STREAM,
-                                'progress': (current_cache_size / MIN_FILES_FOR_STREAM) * 100,
-                                'message': f'Параллельное накопление кэша: {current_cache_size}/{MIN_FILES_FOR_STREAM} файлов',
-                                'timestamp': datetime.now().isoformat()
-                            })
+                        if current_cache_size < required_for_monitoring:
+                            logger.info(f"📭 В кэше мало файлов: {current_cache_size}/{required_for_monitoring} "
+                                        f"{'(первый запуск)' if is_first_run else '(регулярный режим)'}")
+
+                            # Отправляем разные сообщения в зависимости от режима
+                            if is_first_run:
+                                socketio.emit('waiting_for_cache', {
+                                    'current': current_cache_size,
+                                    'required': required_for_monitoring,
+                                    'progress': (current_cache_size / required_for_monitoring) * 100,
+                                    'message': f'Накопление кэша для начала стрима: {current_cache_size}/{required_for_monitoring} файлов',
+                                    'timestamp': datetime.now().isoformat(),
+                                    'mode': 'initial'
+                                })
+                            else:
+                                socketio.emit('waiting_for_cache', {
+                                    'current': current_cache_size,
+                                    'required': required_for_monitoring,
+                                    'progress': (current_cache_size / required_for_monitoring) * 100,
+                                    'message': f'Ожидание следующего файла: {current_cache_size}/{required_for_monitoring}',
+                                    'timestamp': datetime.now().isoformat(),
+                                    'mode': 'regular'
+                                })
+                        else:
+                            # Если файлов достаточно, отправляем статус готовности
+                            if is_first_run:
+                                socketio.emit('cache_ready', {
+                                    'current': current_cache_size,
+                                    'required': required_for_monitoring,
+                                    'message': f'Кэш готов к началу стрима: {current_cache_size}/{required_for_monitoring} файлов',
+                                    'timestamp': datetime.now().isoformat(),
+                                    'mode': 'initial'
+                                })
+                            else:
+                                socketio.emit('cache_ready', {
+                                    'current': current_cache_size,
+                                    'required': required_for_monitoring,
+                                    'message': f'Кэш готов: {current_cache_size} файлов доступно',
+                                    'timestamp': datetime.now().isoformat(),
+                                    'mode': 'regular'
+                                })
 
                         time.sleep(5)
 

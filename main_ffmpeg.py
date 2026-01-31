@@ -2647,27 +2647,31 @@ class FFmpegStreamManager:
                     time.sleep(1)
                     continue
 
-                # Создаем тестовый MPEG-TS файл
+                # Создаем тестовый MPEG-TS файл (черный экран, тишина)
                 test_mpegts = tempfile.NamedTemporaryFile(suffix='.ts', delete=False)
                 test_mpegts.close()
 
-                # Команда для создания тестового потока
+                # Команда для создания ЧЕРНОГО ЭКРАНА БЕЗ ЗВУКА
                 cmd = [
                     'ffmpeg',
+                    # ЧЕРНЫЙ ЭКРАН вместо testsrc
                     '-f', 'lavfi',
-                    '-i', f'testsrc=size={self.video_width}x{self.video_height}:rate={self.video_fps}:duration=30',
+                    '-i', f'color=c=black:s={self.video_width}x{self.video_height}:rate={self.video_fps}:duration=30',
+
+                    # ТИХИЙ АУДИО ПОТОК вместо sine
                     '-f', 'lavfi',
-                    '-i', f'sine=frequency=1000:duration=30',
+                    '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100:duration=30',
+
                     '-c:v', 'libx264',
                     '-preset', 'ultrafast',
                     '-tune', 'zerolatency',
                     '-pix_fmt', 'yuv420p',
-                    '-b:v', '3000k',
-                    '-maxrate', '3000k',
-                    '-bufsize', '6000k',
+                    '-b:v', '2000k',  # Немного ниже битрейт для теста
+                    '-maxrate', '2000k',
+                    '-bufsize', '4000k',
                     '-g', '60',
                     '-c:a', 'aac',
-                    '-b:a', '128k',
+                    '-b:a', '96k',  # Низкий битрейт аудио
                     '-ar', '44100',
                     '-ac', '2',
                     '-t', '30',
@@ -2675,6 +2679,8 @@ class FFmpegStreamManager:
                     '-y',
                     test_mpegts.name
                 ]
+
+                logger.info("🎬 Создание тестового потока (черный экран, 30 сек)...")
 
                 result = subprocess.run(
                     cmd,
@@ -2684,8 +2690,14 @@ class FFmpegStreamManager:
                 )
 
                 if result.returncode == 0 and os.path.exists(test_mpegts.name):
+                    file_size = os.path.getsize(test_mpegts.name)
+                    logger.info(f"✅ Тестовый поток создан: {file_size / 1024:.1f} KB")
+
                     # Отправляем тестовый поток
-                    self._send_mpegts_data(test_mpegts.name, 30)
+                    if self._send_mpegts_data(test_mpegts.name, 30):
+                        logger.info("✅ Тестовый поток отправлен")
+                    else:
+                        logger.warning("⚠️ Тестовый поток отправлен с ошибками")
 
                     # Удаляем временный файл
                     os.unlink(test_mpegts.name)
@@ -2693,7 +2705,7 @@ class FFmpegStreamManager:
                     # Ждем перед созданием следующего
                     time.sleep(25)  # 5 секунд запас
                 else:
-                    logger.error("❌ Не удалось создать тестовый поток")
+                    logger.error(f"❌ Не удалось создать тестовый поток: {result.stderr[:200]}")
                     time.sleep(5)
 
             except Exception as e:

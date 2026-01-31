@@ -2413,7 +2413,7 @@ class FFmpegStreamManager:
             time.sleep(3)
 
             # Минимальное количество файлов для начала отправки
-            MIN_FILES_FOR_STREAM = 10
+            MIN_FILES_FOR_STREAM = 5
 
             # Флаг для отслеживания первого запуска
             is_first_run = True

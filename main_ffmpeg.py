@@ -1661,211 +1661,299 @@ class FFmpegStreamManager:
             return 5.0
 
     def _create_mpegts_file(self, video_path: str, duration: float, audio_file: str, output_path: str) -> bool:
-        """Создание MPEG-TS файла для кэширования с оптимизированным битрейтом"""
-        try:
-            # Получаем длину аудио, если файл существует
-            audio_duration = 0
-            if audio_file and os.path.exists(audio_file):
-                try:
-                    # Используем ffprobe для получения длительности аудио
-                    probe_cmd = [
-                        'ffprobe',
-                        '-v', 'error',
-                        '-show_entries', 'format=duration',
-                        '-of', 'default=noprint_wrappers=1:nokey=1',
-                        audio_file
-                    ]
-                    result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
-                    if result.returncode == 0:
-                        audio_duration = float(result.stdout.strip())
-                        logger.info(f"🎵 Длительность аудио: {audio_duration:.2f} сек, видео: {duration:.2f} сек")
-                except Exception as e:
-                    logger.warning(f"⚠️ Не удалось получить длительность аудио: {e}")
+        """
+        Создание MPEG-TS файла для кэширования с оптимизированным битрейтом
 
-            # Определяем, нужно ли зацикливать видео
-            loop_video = False
-            actual_duration = duration
-            original_video_path = video_path
+        Args:
+            video_path: Путь к исходному видео файлу
+            duration: Ожидаемая длительность видео (может быть изменена при синхронизации с аудио)
+            audio_file: Путь к аудио файлу (может быть None)
+            output_path: Путь для сохранения созданного MPEG-TS файла
 
-            if audio_duration > duration:
-                loop_video = True
-                actual_duration = audio_duration
-                logger.info(f"🔄 Аудио длиннее видео, зациклю видео до {actual_duration:.2f} сек")
+        Returns:
+            bool: True если файл успешно создан и добавлен в кэш, False в случае ошибки
+        """
 
-            # ОПТИМИЗИРОВАННЫЙ БИТРЕЙТ ДЛЯ YOUTUBE
-            video_bitrate = '5000k'  # Достаточно для 1080p
-            maxrate = '5500k'
-            bufsize = '10000k'
+        # 🎵 ШАГ 1: Проверка и получение длительности аудио
+        audio_duration = 0
+        if audio_file and os.path.exists(audio_file):
+            try:
+                # Используем ffprobe для получения точной длительности аудио файла
+                probe_cmd = [
+                    'ffprobe',
+                    '-v', 'error',
+                    '-show_entries', 'format=duration',
+                    '-of', 'default=noprint_wrappers=1:nokey=1',
+                    audio_file
+                ]
+                result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
+                if result.returncode == 0:
+                    audio_duration = float(result.stdout.strip())
+                    logger.info(f"🎵 Длительность аудио: {audio_duration:.2f} сек, видео: {duration:.2f} сек")
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось получить длительность аудио: {e}")
 
-            # Оптимизируем видео перед созданием MPEG-TS
-            optimized_video = self._optimize_video_for_streaming(video_path, video_bitrate)
-            if optimized_video != video_path:
-                logger.info(f"🔧 Использую оптимизированное видео для MPEG-TS")
-                video_path = optimized_video
+        # 🔄 ШАГ 2: Определение необходимости зацикливания видео
+        loop_video = False
+        actual_duration = duration  # Фактическая длительность, которая будет использоваться
+        original_video_path = video_path  # Сохраняем оригинальный путь
 
-            # Получаем информацию о видео для оптимизации
-            video_info = self._get_video_info(video_path)
-            if video_info:
-                width = video_info.get('width', self.video_width)
-                height = video_info.get('height', self.video_height)
+        # Если аудио длиннее видео - зацикливаем видео до конца аудио
+        if audio_duration > duration:
+            loop_video = True
+            actual_duration = audio_duration
+            logger.info(f"🔄 Аудио длиннее видео, зациклю видео до {actual_duration:.2f} сек")
 
-                # Автоматически корректируем битрейт в зависимости от разрешения
-                if width * height <= 854 * 480:  # 480p или меньше
-                    video_bitrate = '1500k'
-                    maxrate = '2000k'
-                    bufsize = '4000k'
-                    logger.info(f"📊 Автоопределение: {width}x{height} -> битрейт {video_bitrate}")
-                elif width * height <= 1280 * 720:  # 720p
-                    video_bitrate = '3000k'
-                    maxrate = '3500k'
-                    bufsize = '7000k'
-                    logger.info(f"📊 Автоопределение: {width}x{height} -> битрейт {video_bitrate}")
+        # 📊 ШАГ 3: Настройки битрейта для YouTube
+        # Стандартные значения для 1080p
+        video_bitrate = '5000k'  # 5000 kbps - достаточно для качественного 1080p
+        maxrate = '5500k'  # Максимальный битрейт (пиковое значение)
+        bufsize = '10000k'  # Размер буфера для вариаций битрейта
 
-            # Команда для создания MPEG-TS потока
-            mpegts_cmd = ['ffmpeg']
+        # 🎞️ ШАГ 4: Оптимизация видео перед кодированием
+        # Конвертация видео в оптимальный формат для стриминга
+        optimized_video = self._optimize_video_for_streaming(video_path, video_bitrate)
+        if optimized_video != video_path:
+            logger.info(f"🔧 Использую оптимизированное видео для MPEG-TS")
+            video_path = optimized_video  # Используем оптимизированную версию
 
-            # Если нужно зациклить видео, используем фильтр stream_loop
-            if loop_video:
-                mpegts_cmd.extend([
-                    '-re',
-                    '-stream_loop', '-1',  # Бесконечное зацикливание
-                    '-i', video_path,
-                    '-t', str(actual_duration),  # Ограничиваем по длительности аудио
-                ])
-            else:
-                mpegts_cmd.extend([
-                    '-re',  # Реальное время
-                    '-i', video_path,
-                ])
+        # 📏 ШАГ 5: Автоматическая корректировка битрейта в зависимости от разрешения
+        video_info = self._get_video_info(video_path)
+        if video_info:
+            width = video_info.get('width', self.video_width)
+            height = video_info.get('height', self.video_height)
+            resolution = width * height
 
-            # Добавляем аудио источник если есть
-            if audio_file and os.path.exists(audio_file):
-                mpegts_cmd.extend(['-i', audio_file])
-                # Карты: видео с первого входа, аудио со второго
-                mpegts_cmd.extend([
-                    '-map', '0:v:0',
-                    '-map', '1:a:0',
-                    '-c:v', 'libx264',
-                    '-preset', 'medium',
-                    '-tune', 'film' if actual_duration > 10 else 'zerolatency',
-                    '-pix_fmt', 'yuv420p',
-                    '-profile:v', 'high',
-                    '-level', '4.1',
-                    '-b:v', video_bitrate,
-                    '-maxrate', maxrate,
-                    '-bufsize', bufsize,
-                    '-r', str(self.video_fps),
-                    '-g', '60',
-                    '-keyint_min', '60',
-                    '-sc_threshold', '0',
-                    '-bf', '2',
-                    '-c:a', 'aac',
-                    '-b:a', '128k',
-                    '-ar', '44100',
-                    '-ac', '2',
-                ])
-            else:
-                # Если нет аудио - добавляем тихое аудио
-                mpegts_cmd.extend([
-                    '-f', 'lavfi',
-                    '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
-                    '-map', '0:v:0',
-                    '-map', '1:a:0',
-                    '-c:v', 'libx264',
-                    '-preset', 'medium',
-                    '-tune', 'film' if actual_duration > 10 else 'zerolatency',
-                    '-pix_fmt', 'yuv420p',
-                    '-profile:v', 'high',
-                    '-level', '4.1',
-                    '-b:v', video_bitrate,
-                    '-maxrate', maxrate,
-                    '-bufsize', bufsize,
-                    '-r', str(self.video_fps),
-                    '-g', '60',
-                    '-keyint_min', '60',
-                    '-sc_threshold', '0',
-                    '-bf', '2',
-                    '-c:a', 'aac',
-                    '-b:a', '128k',
-                    '-ar', '44100',
-                    '-ac', '2',
-                ])
+            # Автоматически корректируем битрейт для разных разрешений
+            if resolution <= 854 * 480:  # 480p или меньше (854x480 = 409,920 пикселей)
+                video_bitrate = '1500k'  # 1500 kbps достаточно для 480p
+                maxrate = '2000k'
+                bufsize = '4000k'
+                logger.info(f"📊 Автоопределение: {width}x{height} -> битрейт {video_bitrate}")
 
-            # Общие параметры
+            elif resolution <= 1280 * 720:  # 720p (1280x720 = 921,600 пикселей)
+                video_bitrate = '3000k'  # 3000 kbps для 720p
+                maxrate = '3500k'
+                bufsize = '7000k'
+                logger.info(f"📊 Автоопределение: {width}x{height} -> битрейт {video_bitrate}")
+
+        # 🛠️ ШАГ 6: Построение команды FFmpeg для создания MPEG-TS
+        mpegts_cmd = ['ffmpeg']
+
+        # Если нужно зациклить видео (аудио длиннее видео)
+        if loop_video:
             mpegts_cmd.extend([
-                '-t', str(actual_duration),  # Используем фактическую длительность
-                '-f', 'mpegts',
-                '-muxdelay', '0',
-                '-muxpreload', '0',
-                '-flush_packets', '1',
-                '-avoid_negative_ts', 'make_zero',
-                '-y',
-                output_path
+                '-re',  # Чтение в реальном времени (имитация live стрима)
+                '-stream_loop', '-1',  # Бесконечное зацикливание видео
+                '-i', video_path,  # Входной видео файл
+                '-t', str(actual_duration),  # Ограничиваем длительность по аудио
+            ])
+        else:
+            mpegts_cmd.extend([
+                '-re',  # Реальное время
+                '-i', video_path,  # Входной видео файл
             ])
 
-            logger.info(f"🔧 Создание MPEG-TS для кэша: {os.path.basename(video_path)} с битрейтом {video_bitrate}")
-            if loop_video:
-                logger.info(f"🔄 Видео будет зациклено до {actual_duration:.1f} сек")
+        # 🎵 ШАГ 7: Добавление аудио источника
+        if audio_file and os.path.exists(audio_file):
+            # Если есть аудио файл - добавляем его как второй источник
+            mpegts_cmd.extend(['-i', audio_file])
 
-            # Таймаут создания
-            timeout = min(actual_duration + 15, 45)
+            # Маппинг потоков: видео с первого входа, аудио со второго
+            mpegts_cmd.extend([
+                '-map', '0:v:0',  # Видео из первого потока (video)
+                '-map', '1:a:0',  # Аудио из второго потока (audio)
 
-            result = subprocess.run(
-                mpegts_cmd,
-                capture_output=True,
-                text=True,
-                encoding='utf-8',
-                timeout=timeout
-            )
+                # Настройки видео кодирования
+                '-c:v', 'libx264',  # Кодек H.264
+                '-preset', 'medium',  # Баланс скорость/качество
+                '-tune', 'film' if actual_duration > 10 else 'zerolatency',  # Настройка под тип контента
+                '-pix_fmt', 'yuv420p',  # Формат пикселей (совместим со всеми устройствами)
+                '-profile:v', 'high',  # Профиль кодирования (высокое качество)
+                '-level', '4.1',  # Уровень совместимости
+                '-b:v', video_bitrate,  # Целевой битрейт видео
+                '-maxrate', maxrate,  # Максимальный битрейт
+                '-bufsize', bufsize,  # Размер буфера
+                '-r', str(self.video_fps),  # Частота кадров
+                '-g', '60',  # Интервал между ключевыми кадрами (2 секунды при 30 fps)
+                '-keyint_min', '60',  # Минимальный интервал ключевых кадров
+                '-sc_threshold', '0',  # Порог для сцены (0 = отключено)
+                '-bf', '2',  # Количество B-кадров
 
-            if result.returncode != 0:
-                logger.error(f"❌ Ошибка создания MPEG-TS файла (код {result.returncode}):")
-                if result.stderr:
-                    # Ищем конкретные ошибки
-                    error_lines = result.stderr.split('\n')
-                    for error_line in error_lines:
-                        if 'bitrate' in error_line.lower() or 'buffer' in error_line.lower():
-                            logger.error(f"   🎯 BITRATE ERROR: {error_line}")
-                    logger.error(f"STDERR: {result.stderr[:500]}")
+                # Настройки аудио кодирования
+                '-c:a', 'aac',  # Кодек AAC (стандарт для YouTube)
+                '-b:a', '128k',  # Битрейт аудио 128 kbps
+                '-ar', '44100',  # Частота дискретизации 44.1 kHz
+                '-ac', '2',  # Стерео звук
+            ])
+        else:
+            # Если нет аудио - добавляем тихий аудио поток
+            mpegts_cmd.extend([
+                '-f', 'lavfi',
+                '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+                '-map', '0:v:0',  # Видео
+                '-map', '1:a:0',  # Аудио (тишина)
 
-                # Очищаем оптимизированный файл если он был создан
-                if optimized_video != original_video_path and os.path.exists(optimized_video):
-                    try:
-                        os.unlink(optimized_video)
-                    except:
-                        pass
+                # Аналогичные настройки видео
+                '-c:v', 'libx264',
+                '-preset', 'medium',
+                '-tune', 'film' if actual_duration > 10 else 'zerolatency',
+                '-pix_fmt', 'yuv420p',
+                '-profile:v', 'high',
+                '-level', '4.1',
+                '-b:v', video_bitrate,
+                '-maxrate', maxrate,
+                '-bufsize', bufsize,
+                '-r', str(self.video_fps),
+                '-g', '60',
+                '-keyint_min', '60',
+                '-sc_threshold', '0',
+                '-bf', '2',
 
-                return False
+                # Настройки аудио для тихого потока
+                '-c:a', 'aac',
+                '-b:a', '128k',
+                '-ar', '44100',
+                '-ac', '2',
+            ])
 
-            # Проверяем размер файла
-            if not os.path.exists(output_path) or os.path.getsize(output_path) < 1024:
-                logger.error("❌ Созданный MPEG-TS файл слишком маленький или не существует")
-                # Очищаем оптимизированный файл
-                if optimized_video != original_video_path and os.path.exists(optimized_video):
-                    try:
-                        os.unlink(optimized_video)
-                    except:
-                        pass
-                return False
+        # 🎯 ШАГ 8: Общие параметры MPEG-TS
+        mpegts_cmd.extend([
+            '-t', str(actual_duration),  # Финальная длительность
+            '-f', 'mpegts',  # Формат вывода - транспортный поток
+            '-muxdelay', '0',  # Задержка мультиплексирования
+            '-muxpreload', '0',  # Предзагрузка мультиплексера
+            '-flush_packets', '1',  # Частое сбрасывание пакетов
+            '-avoid_negative_ts', 'make_zero',  # Избегание отрицательных меток времени
+            '-y',  # Перезапись без подтверждения
+            output_path  # Выходной файл
+        ])
 
-            file_size = os.path.getsize(output_path) / 1024 / 1024
-            calculated_bitrate = (file_size * 8 * 1024 * 1024) / actual_duration / 1000  # kbps
+        # 📝 ШАГ 9: Логирование параметров создания
+        logger.info(f"🔧 Создание MPEG-TS для кэша: {os.path.basename(video_path)} с битрейтом {video_bitrate}")
+        if loop_video:
+            logger.info(f"🔄 Видео будет зациклено до {actual_duration:.1f} сек")
 
-            logger.info(f"✅ MPEG-TS файл создан: {file_size:.1f} MB, битрейт ~{calculated_bitrate:.0f} kbps")
-            if loop_video:
-                logger.info(f"✅ Видео зациклено для синхронизации с аудио ({duration:.1f} → {actual_duration:.1f} сек)")
+        # ⏱️ ШАГ 10: Запуск FFmpeg с таймаутом
+        timeout = min(actual_duration + 15, 45)  # Таймаут: длительность + 15 секунд, но не больше 45
 
-            # Очищаем оптимизированный файл
+        result = subprocess.run(
+            mpegts_cmd,
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            timeout=timeout
+        )
+
+        # ❌ ШАГ 11: Обработка ошибок FFmpeg
+        if result.returncode != 0:
+            logger.error(f"❌ Ошибка создания MPEG-TS файла (код {result.returncode}):")
+            if result.stderr:
+                # Ищем конкретные ошибки битрейта
+                error_lines = result.stderr.split('\n')
+                for error_line in error_lines:
+                    if 'bitrate' in error_line.lower() or 'buffer' in error_line.lower():
+                        logger.error(f"   🎯 BITRATE ERROR: {error_line}")
+                logger.error(f"STDERR: {result.stderr[:500]}")
+
+            # Очищаем оптимизированный файл если он был создан
             if optimized_video != original_video_path and os.path.exists(optimized_video):
                 try:
                     os.unlink(optimized_video)
                 except:
                     pass
 
-            return True
-        except Exception as e:
-            logger.error(f"❌ Непредвиденная ошибка в _create_mpegts_file: {e}")
             return False
+
+        # ✅ ШАГ 12: Проверка созданного файла
+        if not os.path.exists(output_path) or os.path.getsize(output_path) < 1024:
+            logger.error("❌ Созданный MPEG-TS файл слишком маленький или не существует")
+            # Очищаем оптимизированный файл
+            if optimized_video != original_video_path and os.path.exists(optimized_video):
+                try:
+                    os.unlink(optimized_video)
+                except:
+                    pass
+            return False
+
+        # 📊 ШАГ 13: Расчет статистики файла
+        file_size = os.path.getsize(output_path) / 1024 / 1024  # Размер в MB
+        calculated_bitrate = (file_size * 8 * 1024 * 1024) / actual_duration / 1000  # kbps
+
+        logger.info(f"✅ MPEG-TS файл создан: {file_size:.1f} MB, битрейт ~{calculated_bitrate:.0f} kbps")
+        if loop_video:
+            logger.info(f"✅ Видео зациклено для синхронизации с аудио ({duration:.1f} → {actual_duration:.1f} сек)")
+
+        # 💾 ШАГ 14: Добавление файла в кэш
+        if self.use_mpegts_cache:
+            # Генерируем уникальный ключ кэша
+            cache_key = self._get_mpegts_cache_key(video_path, audio_file)
+
+            # Создаем полную информацию о файле для кэша
+            cache_info = {
+                'filename': os.path.basename(output_path),
+                'original_video': os.path.basename(video_path),
+                'original_audio': os.path.basename(audio_file) if audio_file else None,
+                'duration': actual_duration,
+                'size': int(os.path.getsize(output_path)),  # Размер в байтах
+                'audio_used': bool(audio_file),
+                'created': time.time(),
+                'last_accessed': time.time(),
+                'path': output_path,  # Полный путь к файлу
+                'resolution': f"{video_info.get('width', self.video_width)}x{video_info.get('height', self.video_height)}" if video_info else f"{self.video_width}x{self.video_height}",
+                'fps': video_info.get('fps', self.video_fps) if video_info else self.video_fps,
+                'bitrate': video_bitrate,
+                'calculated_bitrate': calculated_bitrate,
+                'file_size_mb': round(file_size, 2)
+            }
+
+            # Добавляем в словарь кэша
+            self.mpegts_cache[cache_key] = cache_info
+
+            # Сохраняем индекс кэша на диск
+            self._save_mpegts_cache_index()
+
+            logger.info(f"💾 MPEG-TS добавлен в кэш: {cache_key} ({file_size:.1f} MB)")
+            logger.info(f"📊 Размер кэша: {len(self.mpegts_cache)} файлов")
+
+            # Отправляем уведомление через WebSocket
+            try:
+                socketio.emit('cache_updated', {
+                    'cache_size': len(self.mpegts_cache),
+                    'new_file': os.path.basename(output_path),
+                    'duration': actual_duration,
+                    'file_size_mb': file_size,
+                    'bitrate': calculated_bitrate,
+                    'timestamp': datetime.now().isoformat()
+                })
+            except:
+                pass
+
+        # 🧹 ШАГ 15: Очистка временных файлов
+        # Удаляем оптимизированное видео, если оно было создано
+        if optimized_video != original_video_path and os.path.exists(optimized_video):
+            try:
+                os.unlink(optimized_video)
+                logger.debug(f"🗑️ Удален временный оптимизированный файл")
+            except Exception as e:
+                logger.warning(f"Не удалось удалить временный файл: {e}")
+
+        return True
+
+    except Exception as e:
+    # ❌ ШАГ 16: Обработка непредвиденных ошибок
+    logger.error(f"❌ Непредвиденная ошибка в _create_mpegts_file: {e}", exc_info=True)
+
+    # Пытаемся очистить все временные файлы в случае ошибки
+    try:
+        if 'optimized_video' in locals() and optimized_video != original_video_path and os.path.exists(optimized_video):
+            os.unlink(optimized_video)
+        if os.path.exists(output_path):
+            os.unlink(output_path)
+    except:
+        pass
+
+    return False
 
     def _create_initial_continuous_stream(self):
         """Создание начального непрерывного потока"""

@@ -2430,20 +2430,55 @@ class FFmpegStreamManager:
 
                 while self.is_streaming and not stop_event.is_set():
                     try:
-                        # Для мониторинга всегда используем MIN_FILES_FOR_STREAM как минимальное требование
+                        # Для мониторинга используем динамическое требование в зависимости от режима
                         current_cache_size = len(self.mpegts_cache)
 
-                        # Если в кэше мало файлов, отправляем событие
-                        if current_cache_size < MIN_FILES_FOR_STREAM:
-                            logger.info(f"📭 В кэше мало файлов: {current_cache_size}/{MIN_FILES_FOR_STREAM}")
+                        # Используем нелокальную переменную is_first_run из внешней функции
+                        nonlocal is_first_run
+                        required_for_monitoring = MIN_FILES_FOR_STREAM if is_first_run else 1
 
-                            socketio.emit('waiting_for_cache', {
-                                'current': current_cache_size,
-                                'required': MIN_FILES_FOR_STREAM,
-                                'progress': (current_cache_size / MIN_FILES_FOR_STREAM) * 100,
-                                'message': f'Параллельное накопление кэша: {current_cache_size}/{MIN_FILES_FOR_STREAM} файлов',
-                                'timestamp': datetime.now().isoformat()
-                            })
+                        # Если в кэше мало файлов, отправляем событие
+                        if current_cache_size < required_for_monitoring:
+                            logger.info(f"📭 В кэше мало файлов: {current_cache_size}/{required_for_monitoring} "
+                                        f"{'(первый запуск)' if is_first_run else '(регулярный режим)'}")
+
+                            # Отправляем разные сообщения в зависимости от режима
+                            if is_first_run:
+                                socketio.emit('waiting_for_cache', {
+                                    'current': current_cache_size,
+                                    'required': required_for_monitoring,
+                                    'progress': (current_cache_size / required_for_monitoring) * 100,
+                                    'message': f'Накопление кэша для начала стрима: {current_cache_size}/{required_for_monitoring} файлов',
+                                    'timestamp': datetime.now().isoformat(),
+                                    'mode': 'initial'
+                                })
+                            else:
+                                socketio.emit('waiting_for_cache', {
+                                    'current': current_cache_size,
+                                    'required': required_for_monitoring,
+                                    'progress': (current_cache_size / required_for_monitoring) * 100,
+                                    'message': f'Ожидание следующего файла: {current_cache_size}/{required_for_monitoring}',
+                                    'timestamp': datetime.now().isoformat(),
+                                    'mode': 'regular'
+                                })
+                        else:
+                            # Если файлов достаточно, отправляем статус готовности
+                            if is_first_run:
+                                socketio.emit('cache_ready', {
+                                    'current': current_cache_size,
+                                    'required': required_for_monitoring,
+                                    'message': f'Кэш готов к началу стрима: {current_cache_size}/{required_for_monitoring} файлов',
+                                    'timestamp': datetime.now().isoformat(),
+                                    'mode': 'initial'
+                                })
+                            else:
+                                socketio.emit('cache_ready', {
+                                    'current': current_cache_size,
+                                    'required': required_for_monitoring,
+                                    'message': f'Кэш готов: {current_cache_size} файлов доступно',
+                                    'timestamp': datetime.now().isoformat(),
+                                    'mode': 'regular'
+                                })
 
                         time.sleep(5)
 
@@ -2714,21 +2749,19 @@ class FFmpegStreamManager:
                 bytes_sent = 0
                 start_time = time.time()
                 last_log_time = start_time
+                chunk_size = 131072  # 128KB - оптимальный размер для pipe
 
-                # Рассчитываем целевую скорость отправки (байт/сек)
-                target_bytes_per_second = file_size / duration
+                # УВЕЛИЧЕННАЯ ПРОВЕРКА: если длительность файла слишком мала для отправки
+                min_required_duration = max(file_size / (1024 * 100), 1.0)  # Минимум 1 сек на 100KB
+                if duration < min_required_duration:
+                    logger.warning(
+                        f"⚠️ Длительность файла ({duration:.1f} сек) слишком мала для размера {file_size / 1024:.1f} KB")
+                    logger.warning(f"⚠️ Автоматически корректирую до {min_required_duration:.1f} сек")
+                    duration = min_required_duration
 
                 while bytes_sent < file_size and self.is_streaming:
-                    # Читаем оптимальный размер чанка для MPEG-TS (кратно 188 байтам)
-                    # MPEG-TS пакеты = 188 байт, берем 350 пакетов за раз
-                    chunk_size = 188 * 350  # ~65.8KB
                     chunk = f.read(chunk_size)
-
                     if not chunk:
-                        # Если файл меньше chunk_size
-                        if bytes_sent == 0:
-                            logger.error("❌ Не удалось прочитать файл")
-                            return False
                         break
 
                     try:
@@ -2736,104 +2769,52 @@ class FFmpegStreamManager:
                         self.ffmpeg_stdin.write(chunk)
                         bytes_sent += len(chunk)
 
-                        # Периодически сбрасываем буфер
-                        if bytes_sent % (188 * 3500) == 0:  # Каждые 3500 пакетов
-                            try:
-                                self.ffmpeg_stdin.flush()
-                            except:
-                                pass
-
-                        # Синхронизируем время для равномерной отправки
+                        # Простая проверка прогресса без сложной синхронизации
                         current_time = time.time()
-                        elapsed = current_time - start_time
-
-                        # Рассчитываем ожидаемое время для отправленных байт
-                        expected_time = bytes_sent / target_bytes_per_second
-
-                        # Если мы отправляем быстрее чем нужно, замедляемся
-                        if elapsed < expected_time:
-                            sleep_time = expected_time - elapsed
-                            if sleep_time > 0.001:  # Только если пауза значительная
-                                # Но не слишком долго, чтобы не блокировать
-                                time.sleep(min(sleep_time, 0.05))
-
-                        # Логируем прогресс каждые 2 секунды
-                        if current_time - last_log_time > 2.0:
+                        if current_time - last_log_time > 1.0:  # Логируем каждую секунду
                             progress = (bytes_sent / file_size) * 100
-                            elapsed_str = f"{elapsed:.1f}/{duration:.1f} сек"
-                            logger.info(f"📊 Прогресс: {progress:.1f}% ({bytes_sent}/{file_size} байт) - {elapsed_str}")
+                            elapsed = current_time - start_time
+                            logger.debug(f"📊 Прогресс: {progress:.1f}% ({bytes_sent}/{file_size} байт)")
                             last_log_time = current_time
-
-                            # Отправляем прогресс через WebSocket
-                            try:
-                                socketio.emit('stream_progress', {
-                                    'filename': os.path.basename(mpegts_path),
-                                    'progress': progress,
-                                    'bytes_sent': bytes_sent,
-                                    'total_bytes': file_size,
-                                    'elapsed': elapsed,
-                                    'duration': duration,
-                                    'timestamp': datetime.now().isoformat()
-                                })
-                            except:
-                                pass
 
                     except BrokenPipeError:
                         logger.error("❌ Broken pipe: FFmpeg отключился")
                         self.is_streaming = False
                         return False
-                    except OSError as e:
-                        if e.errno == 32:  # Broken pipe
-                            logger.error("❌ Broken pipe (OSError): FFmpeg отключился")
-                            self.is_streaming = False
-                            return False
-                        else:
-                            logger.error(f"❌ Ошибка записи в pipe: {e}")
-                            return False
                     except Exception as e:
-                        logger.error(f"❌ Неожиданная ошибка записи: {e}")
+                        logger.error(f"❌ Ошибка записи в pipe: {e}")
                         return False
 
-            # Финальный сброс буфера
-            if self.ffmpeg_stdin:
-                try:
-                    self.ffmpeg_stdin.flush()
-                except:
-                    pass
+                # Финальный сброс буфера
+                if self.ffmpeg_stdin:
+                    try:
+                        self.ffmpeg_stdin.flush()
+                    except:
+                        pass
 
             # Проверяем результат
             total_elapsed = time.time() - start_time
             success_ratio = bytes_sent / file_size
 
-            if success_ratio >= 0.99:  # 99% успешно
-                logger.info(f"✅ MPEG-TS успешно отправлен за {total_elapsed:.1f} сек (ожидалось {duration:.1f} сек)")
-                logger.info(
-                    f"📊 Результат: {bytes_sent}/{file_size} байт ({success_ratio * 100:.1f}%), скорость: {file_size / total_elapsed / 1024:.1f} KB/сек")
+            # УВЕЛИЧЕННЫЙ ЛОГ для отладки
+            logger.info(f"📊 Отправка завершена: {bytes_sent}/{file_size} байт ({success_ratio * 100:.1f}%)")
+            logger.info(f"📊 Время: {total_elapsed:.1f} сек (ожидалось {duration:.1f} сек)")
+            logger.info(f"📊 Скорость: {bytes_sent / total_elapsed / 1024:.1f} KB/сек")
+
+            # БОЛЕЕ ГИБКАЯ ПРОВЕРКА УСПЕХА
+            if success_ratio >= 0.95:  # 95% успешно
+                logger.info(f"✅ MPEG-TS успешно отправлен")
                 return True
-            elif success_ratio >= 0.9:  # 90% успешно
-                logger.warning(
-                    f"⚠️ MPEG-TS частично отправлен: {bytes_sent}/{file_size} байт ({success_ratio * 100:.1f}%)")
-                logger.warning(f"📊 Время: {total_elapsed:.1f} сек (ожидалось {duration:.1f} сек)")
-                # Все равно считаем успехом для непрерывности
-                return True
-            elif success_ratio >= 0.8:  # 80% успешно
-                logger.warning(
-                    f"⚠️ MPEG-TS отправлен с ошибками: {bytes_sent}/{file_size} байт ({success_ratio * 100:.1f}%)")
-                logger.warning(f"📊 Время: {total_elapsed:.1f} сек (ожидалось {duration:.1f} сек)")
-                # Пробуем продолжить
-                return True
+            elif success_ratio >= 0.75:  # 75% успешно
+                logger.warning(f"⚠️ MPEG-TS отправлен с потерями ({success_ratio * 100:.1f}%)")
+                return True  # Все равно продолжаем для непрерывности
+            elif total_elapsed < 0.1:  # Слишком быстро - вероятно, FFmpeg упал сразу
+                logger.error(f"❌ Отправка прервана слишком быстро ({total_elapsed:.2f} сек)")
+                return False
             else:
-                logger.error(
-                    f"❌ MPEG-TS отправка провалилась: {bytes_sent}/{file_size} байт ({success_ratio * 100:.1f}%)")
-                logger.error(f"📊 Время: {total_elapsed:.1f} сек (ожидалось {duration:.1f} сек)")
+                logger.error(f"❌ MPEG-TS отправка провалилась ({success_ratio * 100:.1f}%)")
                 return False
 
-        except FileNotFoundError:
-            logger.error(f"❌ Файл не найден: {mpegts_path}")
-            return False
-        except PermissionError:
-            logger.error(f"❌ Нет доступа к файлу: {mpegts_path}")
-            return False
         except Exception as e:
             logger.error(f"❌ Критическая ошибка отправки MPEG-TS данных: {e}", exc_info=True)
             return False

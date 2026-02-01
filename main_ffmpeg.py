@@ -2407,96 +2407,28 @@ class FFmpegStreamManager:
             logger.error(f"❌ Ошибка очистки отправленных файлов: {e}")
 
     def _stream_controller(self):
-        """Главный контроллер потока - создает непрерывный MPEG-TS поток"""
+        """Главный контроллер потока - с сохранением состояния при перезапуске"""
         logger.info("🎬 Запуск контроллера непрерывного MPEG-TS потока")
 
         try:
+            # Инициализируем состояние контроллера
+            if not hasattr(self, '_controller_is_first_run'):
+                self._controller_is_first_run = True
+            if not hasattr(self, '_sent_files_count'):
+                self._sent_files_count = 0
+            if not hasattr(self, '_controller_start_time'):
+                self._controller_start_time = time.time()
+
+            logger.info(
+                f"🎯 Начало работы контроллера: is_first_run={self._controller_is_first_run}, sent_files={self._sent_files_count}")
+
             # Ждем запуска FFmpeg
             time.sleep(3)
-
-            # Минимальное количество файлов для начала отправки
-            MIN_FILES_FOR_STREAM = 2
-
-            # Флаг для отслеживания первого запуска
-            is_first_run = True
-
-            # Флаг для предотвращения одновременной отправки
-            self.is_sending_data = False
 
             # Событие для остановки всех потоков
             stop_event = threading.Event()
 
-            def _monitor_and_enrich_cache():
-                """Параллельный поток для мониторинга и пополнения кэша"""
-                logger.info("🔄 Запуск параллельного потока мониторинга кэша")
-
-                while self.is_streaming and not stop_event.is_set():
-                    try:
-                        # Для мониторинга используем динамическое требование в зависимости от режима
-                        current_cache_size = len(self.mpegts_cache)
-
-                        # Используем нелокальную переменную is_first_run из внешней функции
-                        nonlocal is_first_run
-                        required_for_monitoring = MIN_FILES_FOR_STREAM if is_first_run else 1
-
-                        # Если в кэше мало файлов, отправляем событие
-                        if current_cache_size < required_for_monitoring:
-                            logger.info(f"📭 В кэше мало файлов: {current_cache_size}/{required_for_monitoring} "
-                                        f"{'(первый запуск)' if is_first_run else '(регулярный режим)'}")
-
-                            # Отправляем разные сообщения в зависимости от режима
-                            if is_first_run:
-                                socketio.emit('waiting_for_cache', {
-                                    'current': current_cache_size,
-                                    'required': required_for_monitoring,
-                                    'progress': (current_cache_size / required_for_monitoring) * 100,
-                                    'message': f'Накопление кэша для начала стрима: {current_cache_size}/{required_for_monitoring} файлов',
-                                    'timestamp': datetime.now().isoformat(),
-                                    'mode': 'initial'
-                                })
-                            else:
-                                socketio.emit('waiting_for_cache', {
-                                    'current': current_cache_size,
-                                    'required': required_for_monitoring,
-                                    'progress': (current_cache_size / required_for_monitoring) * 100,
-                                    'message': f'Ожидание следующего файла: {current_cache_size}/{required_for_monitoring}',
-                                    'timestamp': datetime.now().isoformat(),
-                                    'mode': 'regular'
-                                })
-                        else:
-                            # Если файлов достаточно, отправляем статус готовности
-                            if is_first_run:
-                                socketio.emit('cache_ready', {
-                                    'current': current_cache_size,
-                                    'required': required_for_monitoring,
-                                    'message': f'Кэш готов к началу стрима: {current_cache_size}/{required_for_monitoring} файлов',
-                                    'timestamp': datetime.now().isoformat(),
-                                    'mode': 'initial'
-                                })
-                            else:
-                                socketio.emit('cache_ready', {
-                                    'current': current_cache_size,
-                                    'required': required_for_monitoring,
-                                    'message': f'Кэш готов: {current_cache_size} файлов доступно',
-                                    'timestamp': datetime.now().isoformat(),
-                                    'mode': 'regular'
-                                })
-
-                        time.sleep(5)
-
-                    except Exception as e:
-                        logger.error(f"❌ Ошибка в потоке мониторинга кэша: {e}")
-                        time.sleep(5)
-
-            # Сразу запускаем параллельный поток для мониторинга кэша
-            monitor_thread = threading.Thread(target=_monitor_and_enrich_cache, daemon=True)
-            monitor_thread.start()
-
-            time.sleep(2)
-
-            logger.info("🚀 Запуск основного потока отправки видео")
-
-            # Основной цикл отправки контента (последовательно)
+            # Основной цикл контроллера
             while self.is_streaming:
                 # Проверяем FFmpeg
                 if not self._check_ffmpeg_alive():
@@ -2505,22 +2437,34 @@ class FFmpegStreamManager:
                     break
 
                 # ВАЖНОЕ ИСПРАВЛЕНИЕ: Раздельная логика ожидания файлов
-                if is_first_run:
+                if self._controller_is_first_run:
                     # При первом запуске ждем минимум 2 файла
-                    if len(self.mpegts_cache) < MIN_FILES_FOR_STREAM:
+                    required_files = 2
+                    if len(self.mpegts_cache) < required_files:
                         logger.info(
-                            f"⏳ Ожидание файлов: {len(self.mpegts_cache)}/{MIN_FILES_FOR_STREAM} (первый запуск)")
+                            f"⏳ Ожидание файлов для первого запуска: {len(self.mpegts_cache)}/{required_files}")
+
+                        socketio.emit('waiting_for_cache', {
+                            'current': len(self.mpegts_cache),
+                            'required': required_files,
+                            'progress': (len(self.mpegts_cache) / required_files) * 100,
+                            'message': f'Накопление кэша для начала стрима: {len(self.mpegts_cache)}/{required_files} файлов',
+                            'timestamp': datetime.now().isoformat(),
+                            'mode': 'initial'
+                        })
+
                         time.sleep(5)
                         continue
                 else:
                     # При регулярном режиме ждем минимум 1 файл
-                    if len(self.mpegts_cache) < 1:
+                    required_files = 1
+                    if len(self.mpegts_cache) < required_files:
                         logger.info(f"⏳ Кэш пуст. Ожидаю появления файла... (регулярный режим)")
-                        time.sleep(2)  # Короткая пауза, проверяем чаще
+                        time.sleep(2)
                         continue
 
                 # Если уже идет отправка, ждем
-                if self.is_sending_data:
+                if getattr(self, 'is_sending_data', False):
                     time.sleep(0.1)
                     continue
 
@@ -2535,9 +2479,10 @@ class FFmpegStreamManager:
                 cache_items.sort(key=lambda x: x[1].get('created', 0))
 
                 # ВАЖНОЕ ИСПРАВЛЕНИЕ: Разное количество файлов для отправки
-                if is_first_run:
+                if self._controller_is_first_run:
                     # Первый запуск: берем до 2 файлов
-                    files_to_take = min(MIN_FILES_FOR_STREAM, len(cache_items))
+                    files_to_take = min(2, len(cache_items))
+                    logger.info(f"🎯 Первый запуск: беру {files_to_take} файлов из кэша")
                 else:
                     # Регулярный режим: берем только 1 файл
                     files_to_take = 1
@@ -2546,6 +2491,9 @@ class FFmpegStreamManager:
                 files_to_delete = []  # Файлы для удаления после отправки
 
                 for i in range(files_to_take):
+                    if i >= len(cache_items):
+                        break
+
                     cache_key, cache_info = cache_items[i]
                     mpegts_path = os.path.join(self.mpegts_cache_dir, cache_info['filename'])
 
@@ -2557,7 +2505,7 @@ class FFmpegStreamManager:
                             'duration': cache_info.get('duration', 10.0),
                             'original_video': cache_info.get('original_video', 'unknown'),
                             'index': i + 1,
-                            'total': files_to_take  # Важно: total равно количеству файлов, которые отправляются сейчас
+                            'total': files_to_take
                         })
 
                         # Добавляем в список для удаления
@@ -2573,7 +2521,8 @@ class FFmpegStreamManager:
                     continue
 
                 logger.info(
-                    f"📦 Начинаю последовательную отправку {len(files_to_send)} файлов {'(первый запуск)' if is_first_run else ''}")
+                    f"📦 Начинаю отправку {len(files_to_send)} файлов "
+                    f"{'(первый запуск)' if self._controller_is_first_run else '(регулярный режим)'}")
 
                 sent_count = 0
                 failed_count = 0
@@ -2584,7 +2533,7 @@ class FFmpegStreamManager:
                         break
 
                     # Ждем если уже идет отправка
-                    while self.is_sending_data and self.is_streaming:
+                    while getattr(self, 'is_sending_data', False) and self.is_streaming:
                         time.sleep(0.1)
 
                     if not self.is_streaming:
@@ -2605,6 +2554,8 @@ class FFmpegStreamManager:
 
                         if success:
                             sent_count += 1
+                            self._sent_files_count += 1  # Увеличиваем общий счетчик
+
                             logger.info(f"✅ Файл отправлен: {file_info['original_video']}")
 
                             socketio.emit('video_playing', {
@@ -2613,7 +2564,11 @@ class FFmpegStreamManager:
                                 'timestamp': datetime.now().isoformat(),
                                 'position': f"{file_info['index']}/{file_info['total']}",
                                 'total_in_cache': len(self.mpegts_cache),
-                                'queue_remaining': len(files_to_send) - file_info['index']
+                                'queue_remaining': len(files_to_send) - file_info['index'],
+                                'controller_state': {
+                                    'is_first_run': self._controller_is_first_run,
+                                    'sent_files_total': self._sent_files_count
+                                }
                             })
 
                         else:
@@ -2654,23 +2609,36 @@ class FFmpegStreamManager:
                     logger.info(f"🧹 Удалено {deleted_count} файлов из кэша после отправки")
 
                 # После успешной отправки первого запуска меняем флаг
-                if is_first_run and sent_count > 0:
+                if self._controller_is_first_run and sent_count > 0:
+                    self._controller_is_first_run = False
                     logger.info("🔄 Первый запуск завершен. Теперь отправляю по 1 файлу за раз.")
-                    is_first_run = False
+
+                    socketio.emit('controller_state_change', {
+                        'old_state': 'initial',
+                        'new_state': 'regular',
+                        'sent_files_in_initial': sent_count,
+                        'timestamp': datetime.now().isoformat()
+                    })
 
                 logger.info(f"📊 Итог отправки: {sent_count} успешно, {failed_count} с ошибками")
+                logger.info(f"📈 Всего отправлено файлов: {self._sent_files_count}")
 
                 socketio.emit('batch_complete', {
                     'sent_count': sent_count,
                     'failed_count': failed_count,
                     'deleted_count': deleted_count,
                     'remaining_in_cache': len(self.mpegts_cache),
+                    'controller_state': {
+                        'is_first_run': self._controller_is_first_run,
+                        'sent_files_total': self._sent_files_count,
+                        'uptime': time.time() - self._controller_start_time
+                    },
                     'timestamp': datetime.now().isoformat(),
-                    'mode': 'initial' if is_first_run else 'regular'  # Добавлен режим в сообщение
+                    'mode': 'initial' if self._controller_is_first_run else 'regular'
                 })
 
                 # Разная пауза в зависимости от режима
-                sleep_time = 2 if is_first_run else 1  # В регулярном режиме проверяем чаще
+                sleep_time = 2 if self._controller_is_first_run else 1
                 time.sleep(sleep_time)
 
         except Exception as e:
@@ -3279,27 +3247,34 @@ class FFmpegStreamManager:
             return video_path
 
     def _safe_restart_stream(self):
-        """Безопасный перезапуск стрима"""
+        """Безопасный перезапуск стрима с сохранением состояния контроллера"""
         try:
             logger.info("🔄 Безопасный перезапуск стрима...")
 
-            # Сохраняем состояние очередей
+            # Сохраняем КРИТИЧЕСКИ важные данные
+            saved_stream_key = self.stream_key
             saved_video_queue = self.video_queue.copy() if self.video_queue else []
-            saved_audio_queue = self.audio_queue.copy() if self.audio_queue else []
 
-            logger.info(f"💾 Сохранено: видео={len(saved_video_queue)}, аудио={len(saved_audio_queue)}")
+            # Сохраняем состояние контроллера
+            controller_state = {
+                'is_first_run': getattr(self, '_controller_is_first_run', True),
+                'sent_files_count': getattr(self, '_sent_files_count', 0),
+                'last_cache_check': getattr(self, '_last_cache_check', 0)
+            }
+
+            logger.info(f"💾 Сохранено состояние контроллера: {controller_state}")
 
             # Останавливаем текущий стрим
             self.stop_stream()
 
-            # Ждем немного для очистки
+            # Ждем очистки
             time.sleep(2)
 
             # Сбрасываем флаг streaming перед запуском
             self.is_streaming = True
 
             # Запускаем заново с тем же stream key
-            if not self.stream_key:
+            if not saved_stream_key:
                 logger.error("❌ Нет stream key для перезапуска")
                 return False
 
@@ -3311,18 +3286,21 @@ class FFmpegStreamManager:
                     self.video_queue = saved_video_queue + self.video_queue
                     logger.info(f"📥 Восстановлено {len(saved_video_queue)} видео в очередь")
 
-                if saved_audio_queue:
-                    self.audio_queue = saved_audio_queue + self.audio_queue
-                    logger.info(f"📥 Восстановлено {len(saved_audio_queue)} аудио в очередь")
+                # Восстанавливаем состояние контроллера
+                self._controller_is_first_run = controller_state['is_first_run']
+                self._sent_files_count = controller_state['sent_files_count']
+                self._last_cache_check = controller_state['last_cache_check']
 
-                logger.info(
-                    f"✅ Стрим перезапущен. Всего в очередях: видео={len(self.video_queue)}, аудио={len(self.audio_queue)}")
+                # НЕ ПЕРЕЗАПУСКАЕМ контроллер потока - он должен продолжить работу
+                # Вместо этого просто запускаем мониторинг
+
+                logger.info(f"✅ Стрим перезапущен. Состояние контроллера восстановлено")
+                logger.info(f"📊 is_first_run={self._controller_is_first_run}, sent_files={self._sent_files_count}")
+
                 socketio.emit('stream_restarted', {
                     'message': 'Стрим автоматически перезапущен',
                     'video_queue_restored': len(saved_video_queue),
-                    'audio_queue_restored': len(saved_audio_queue),
-                    'total_video_queue': len(self.video_queue),
-                    'total_audio_queue': len(self.audio_queue)
+                    'controller_state': controller_state
                 })
 
                 return True
@@ -3334,16 +3312,80 @@ class FFmpegStreamManager:
             logger.error(f"❌ Ошибка перезапуска стрима: {e}", exc_info=True)
             return False
 
+    def _recover_stream_gracefully(self):
+        """Плавное восстановление стрима после отключения"""
+        try:
+            logger.info("🔄 Попытка плавного восстановления стрима...")
+
+            # 1. Сохраняем текущее состояние
+            current_stream_key = self.stream_key
+            current_video_queue = self.video_queue.copy() if self.video_queue else []
+            controller_state = {
+                'is_first_run': getattr(self, '_controller_is_first_run', True),
+                'sent_files_count': getattr(self, '_sent_files_count', 0)
+            }
+
+            # 2. Останавливаем старый процесс (если он еще есть)
+            if self.stream_process:
+                try:
+                    self.stream_process.terminate()
+                    time.sleep(1)
+                    if self.stream_process.poll() is None:
+                        self.stream_process.kill()
+                except:
+                    pass
+
+            # 3. Сбрасываем флаги, но сохраняем ключ
+            self.is_streaming = False
+            self.stream_process = None
+            self.ffmpeg_stdin = None
+            self.ffmpeg_pid = None
+
+            # 4. Ждем очистки
+            time.sleep(2)
+
+            # 5. Запускаем заново
+            if current_stream_key:
+                self.stream_key = current_stream_key
+                self.rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{current_stream_key}"
+
+                result = self.start_stream()
+
+                if result.get('success'):
+                    # 6. Восстанавливаем состояние
+                    if current_video_queue:
+                        self.video_queue = current_video_queue + self.video_queue
+
+                    self._controller_is_first_run = controller_state['is_first_run']
+                    self._sent_files_count = controller_state['sent_files_count']
+
+                    logger.info(f"✅ Стрим успешно восстановлен")
+                    logger.info(f"📊 Состояние контроллера: {controller_state}")
+
+                    socketio.emit('stream_recovered_gracefully', {
+                        'message': 'Стрим плавно восстановлен после отключения',
+                        'controller_state': controller_state,
+                        'timestamp': datetime.now().isoformat()
+                    })
+
+                    return True
+
+            return False
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка плавного восстановления: {e}")
+            return False
+
     def _monitor_ffmpeg_with_restart(self):
-        """Мониторинг процесса FFmpeg с автоматическим перезапуском при низком битрейте"""
+        """Мониторинг FFmpeg с автовосстановлением при отключении YouTube"""
         try:
             stream_connected = False
             last_bitrate_warning = 0
             restart_count = 0
-            max_restarts = 3
+            max_restarts = 10  # Увеличиваем лимит перезапусков
             last_restart_time = 0
 
-            logger.info("📡 Запущен улучшенный мониторинг FFmpeg")
+            logger.info("📡 Запущен мониторинг FFmpeg с автовосстановлением")
 
             for line in iter(self.stream_process.stderr.readline, b''):
                 line = line.decode('utf-8', errors='ignore').strip()
@@ -3366,12 +3408,16 @@ class FFmpegStreamManager:
                                     logger.info(f"📊 Текущий битрейт: {current_bitrate:.1f} kbps")
                                     last_bitrate_warning = current_time
 
-                                    # КРИТИЧЕСКОЕ ПРЕДУПРЕЖДЕНИЕ если битрейт слишком низкий
-                                    if current_bitrate < 2000:
-                                        logger.warning(f"⚠️ КРИТИЧЕСКИ НИЗКИЙ БИТРЕЙТ: {current_bitrate:.1f} kbps")
-                                        socketio.emit('stream_critical', {
-                                            'message': f'Критически низкий битрейт: {current_bitrate:.1f} kbps',
-                                            'bitrate': current_bitrate
+                                    # ВНИМАНИЕ: YouTube может отключить стрим при битрейте < 1000 kbps
+                                    if current_bitrate < 1000:
+                                        logger.warning(f"⚠️ ОЧЕНЬ НИЗКИЙ БИТРЕЙТ: {current_bitrate:.1f} kbps")
+                                        logger.warning(f"⚠️ YouTube может отключить стрим при битрейте < 1000 kbps")
+
+                                        # НЕ ПЕРЕЗАПУСКАЕМ при низком битрейте, просто логируем
+                                        socketio.emit('stream_warning', {
+                                            'message': f'Очень низкий битрейт: {current_bitrate:.1f} kbps',
+                                            'bitrate': current_bitrate,
+                                            'action': 'monitor_only'
                                         })
                         except Exception as e:
                             logger.debug(f"Ошибка парсинга битрейта: {e}")
@@ -3391,57 +3437,86 @@ class FFmpegStreamManager:
                         # Сбрасываем счетчик перезапусков при успешном подключении
                         restart_count = 0
 
-                # Ошибки
-                elif any(x in line.lower() for x in ['error', 'failed', 'invalid']):
-                    logger.error(f"⚠️ FFmpeg error: {line}")
-                    socketio.emit('stream_warning', {'message': line})
-
-                # Broken pipe - критическая ошибка
-                elif 'broken pipe' in line.lower():
+                # КРИТИЧЕСКИЕ ОШИБКИ, которые требуют перезапуска
+                elif any(x in line.lower() for x in ['broken pipe', 'end of file', 'error writing trailer']):
                     logger.error(f"💥 КРИТИЧЕСКАЯ ОШИБКА: {line}")
-                    socketio.emit('stream_error', {
-                        'message': 'YouTube закрыл соединение (Broken pipe)',
-                        'reason': 'Возможно низкий битрейт или проблемы с сетью'
-                    })
 
-                # Предупреждение о низком битрейте от YouTube
-                elif any(x in line.lower() for x in ['bitrate', 'low bitrate', 'insufficient']):
-                    logger.warning(f"⚠️ YouTube битрейт предупреждение: {line}")
-                    socketio.emit('stream_warning', {
-                        'message': f'YouTube: {line}',
-                        'type': 'bitrate_warning'
-                    })
+                    # Проверяем, не слишком ли часто перезапускаем
+                    current_time = time.time()
+                    if restart_count >= max_restarts and (current_time - last_restart_time < 60):
+                        logger.error(f"❌ Слишком много перезапусков ({restart_count}). Пауза 60 секунд.")
+                        time.sleep(60)
+                        continue
+
+                    logger.info("🔄 Пробую безопасный перезапуск FFmpeg...")
+
+                    # Сохраняем состояние контроллера перед перезапуском
+                    controller_state = {
+                        'is_first_run': getattr(self, '_controller_is_first_run', True),
+                        'sent_files_count': getattr(self, '_sent_files_count', 0)
+                    }
+
+                    # Пробуем безопасный перезапуск
+                    if self._safe_restart_stream():
+                        restart_count += 1
+                        last_restart_time = current_time
+
+                        # ВОССТАНАВЛИВАЕМ состояние контроллера
+                        self._controller_is_first_run = controller_state['is_first_run']
+                        self._sent_files_count = controller_state['sent_files_count']
+
+                        logger.info(f"✅ FFmpeg перезапущен (попытка {restart_count})")
+                        logger.info(f"🔄 Контроллер продолжит с состояния: {controller_state}")
+
+                        socketio.emit('stream_recovered', {
+                            'message': 'Стрим восстановлен после ошибки',
+                            'restart_count': restart_count,
+                            'controller_state': controller_state,
+                            'timestamp': datetime.now().isoformat()
+                        })
+
+                        return  # Выходим из мониторинга, новый процесс будет запущен
+                    else:
+                        logger.error("❌ Не удалось перезапустить FFmpeg")
+
+                # Предупреждения (не требуют перезапуска)
+                elif any(x in line.lower() for x in ['warning', 'non-monotonic']):
+                    logger.warning(f"⚠️ FFmpeg warning: {line}")
+                    socketio.emit('stream_warning', {'message': line})
 
             # Процесс завершен
             return_code = self.stream_process.wait()
             logger.info(f"FFmpeg завершился с кодом: {return_code}")
 
-            # Только если код ошибки не 0, помечаем как остановленный
+            # Если код ошибки не 0, пробуем перезапустить
             if return_code != 0:
-                logger.warning(f"⚠️ FFmpeg завершился с ошибкой")
-                self.is_streaming = False
-                socketio.emit('stream_stopped', {
+                logger.warning(f"⚠️ FFmpeg завершился с ошибкой, пробую перезапустить...")
+
+                # НЕ сбрасываем is_streaming, иначе контроллер остановится
+                # self.is_streaming = False  # НЕ ДЕЛАЕМ ЭТОГО!
+
+                socketio.emit('stream_error', {
                     'time': datetime.now().isoformat(),
                     'exit_code': return_code,
-                    'auto_restart': False
+                    'auto_restart': True
                 })
+
+                # Пробуем безопасный перезапуск
+                time.sleep(2)
+                self._safe_restart_stream()
 
         except Exception as e:
             logger.error(f"Ошибка мониторинга FFmpeg: {e}")
+            # Пробуем восстановиться даже при ошибке мониторинга
+            time.sleep(2)
+            self._safe_restart_stream()
 
     def stop_stream(self):
-        """Остановка стрима с очисткой pipe"""
-        logger.info("🛑 Остановка стрима и очистка pipe...")
+        """Остановка стрима без сброса состояния контроллера"""
+        logger.info("🛑 Остановка стрима (сохраняю состояние контроллера)...")
 
-        self.is_streaming = False
-
-        # Очищаем pipe
-        if hasattr(self, 'video_pipe_path') and os.path.exists(self.video_pipe_path):
-            try:
-                os.unlink(self.video_pipe_path)
-                logger.info("🧹 Video pipe очищен")
-            except:
-                pass
+        # НЕ СБРАСЫВАЕМ is_streaming сразу, чтобы контроллер мог восстановиться
+        # self.is_streaming = False  # НЕ ДЕЛАЕМ ЭТОГО!
 
         # Останавливаем процесс FFmpeg
         time.sleep(0.5)
@@ -3465,12 +3540,15 @@ class FFmpegStreamManager:
         except Exception as e:
             logger.error(f"Ошибка при остановке: {e}")
 
-        # Сбрасываем атрибуты
+        # Сбрасываем только процессные атрибуты, но не состояние контроллера
         self.stream_process = None
         self.ffmpeg_stdin = None
         self.ffmpeg_pid = None
 
-        logger.info("✅ Стрим остановлен")
+        # Устанавливаем is_streaming = False только для внешних потребителей
+        # Внутренние флаги контроллера сохраняем
+
+        logger.info("✅ FFmpeg процесс остановлен (состояние контроллера сохранено)")
         return True
 
     def get_status(self):

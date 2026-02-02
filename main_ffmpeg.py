@@ -3572,7 +3572,9 @@ class VideoGenerator:
     def __init__(self, ffmpeg_manager: FFmpegStreamManager = None):
         self.ffmpeg_manager = ffmpeg_manager
         self.video_cache_dir = 'video_cache'
+        self.avatars_dir = "avatars"  # Добавьте эту строку
         os.makedirs(self.video_cache_dir, exist_ok=True)
+        os.makedirs(self.avatars_dir, exist_ok=True)
 
         # НОВОЕ: Очищаем старые файлы при инициализации
         self._clean_old_cache_files()
@@ -3583,6 +3585,7 @@ class VideoGenerator:
 
         # Шрифты для текста
         self.fonts = self._load_fonts()
+
 
         logger.info(f"✅ Video Generator инициализирован. Кэш: {self.video_cache_dir}")
 
@@ -3903,7 +3906,7 @@ class VideoGenerator:
 
     def create_message_video(self, agent_name: str, message: str,
                              duration: float = 10.0) -> str:
-        """Создание видео с текстом сообщения и сохранение в кэш"""
+        """Создание видео с текстом сообщения, аватаром и сохранение в кэш"""
         try:
             timestamp = int(time.time())
             video_filename = f"message_{agent_name}_{timestamp}.mp4"
@@ -3920,6 +3923,48 @@ class VideoGenerator:
                 logger.error(f"❌ Не удалось открыть VideoWriter")
                 return None
 
+            # Загружаем аватар агента
+            avatar_path = os.path.join(self.avatars_dir, f"{agent_name}.png")
+            avatar_img = None
+            if os.path.exists(avatar_path):
+                try:
+                    avatar_img = Image.open(avatar_path).convert("RGBA")
+                    # Ресайз аватара
+                    avatar_size = 150
+                    avatar_img = avatar_img.resize((avatar_size, avatar_size), Image.Resampling.LANCZOS)
+
+                    # Создаем круглую маску для аватара
+                    mask = Image.new('L', (avatar_size, avatar_size), 0)
+                    draw_mask = ImageDraw.Draw(mask)
+                    draw_mask.ellipse((0, 0, avatar_size, avatar_size), fill=255)
+
+                    # Применяем маску
+                    avatar_img.putalpha(mask)
+                except Exception as e:
+                    logger.warning(f"⚠️ Не удалось загрузить аватар для {agent_name}: {e}")
+                    avatar_img = None
+            else:
+                logger.warning(f"⚠️ Аватар не найден: {avatar_path}")
+                # Создаем стандартный аватар
+                avatar_size = 150
+                avatar_img = Image.new('RGBA', (avatar_size, avatar_size), (100, 100, 200, 255))
+                draw_avatar = ImageDraw.Draw(avatar_img)
+                draw_avatar.ellipse((0, 0, avatar_size, avatar_size),
+                                    fill=(100, 100, 200), outline=(255, 255, 255, 128))
+                # Инициалы агента
+                initials = agent_name[:2].upper() if len(agent_name) >= 2 else agent_name[0].upper()
+                font_size = 60
+                try:
+                    font = ImageFont.truetype("arial.ttf", font_size)
+                except:
+                    font = ImageFont.load_default()
+                text_bbox = draw_avatar.textbbox((0, 0), initials, font=font)
+                text_width = text_bbox[2] - text_bbox[0]
+                text_height = text_bbox[3] - text_bbox[1]
+                draw_avatar.text(((avatar_size - text_width) // 2,
+                                  (avatar_size - text_height) // 2 - 5),
+                                 initials, font=font, fill=(255, 255, 255, 255))
+
             for frame_num in range(total_frames):
                 progress = min(1.0, frame_num / (fps * 1.0))
 
@@ -3928,31 +3973,57 @@ class VideoGenerator:
                                 (30, 30, 40))
                 draw = ImageDraw.Draw(img)
 
-                # Заголовок с именем агента
-                header_alpha = int(255 * progress)
-                try:
-                    draw.text((self.video_width // 2, 100),
-                              agent_name,
-                              font=self.fonts['bold'],
-                              fill=(255, 255, 255, header_alpha),
-                              anchor="mm")
-                except:
-                    draw.text((self.video_width // 2, 100),
-                              agent_name,
-                              fill=(255, 255, 255, header_alpha),
-                              anchor="mm")
+                # Аватар агента с анимацией появления
+                if avatar_img and progress > 0.1:
+                    avatar_alpha = int(255 * min(1.0, (progress - 0.1) * 2))
+
+                    # Создаем копию аватара с текущей прозрачностью
+                    avatar_with_alpha = avatar_img.copy()
+                    alpha = avatar_with_alpha.split()[3]
+                    alpha = alpha.point(lambda p: p * avatar_alpha / 255)
+                    avatar_with_alpha.putalpha(alpha)
+
+                    # Позиция аватара (центр сверху)
+                    avatar_x = self.video_width // 2 - avatar_size // 2
+                    avatar_y = 50  # Отступ сверху
+
+                    # Создаем фоновое изображение с альфа-каналом для вставки аватара
+                    img_rgba = img.convert("RGBA")
+                    img_rgba.paste(avatar_with_alpha, (avatar_x, avatar_y), avatar_with_alpha)
+                    img = img_rgba.convert("RGB")
+                    draw = ImageDraw.Draw(img)
+
+                # Заголовок с именем агента (под аватаром)
+                if progress > 0.2:
+                    header_alpha = int(255 * min(1.0, (progress - 0.2) * 2))
+                    name_y_pos = 220 if avatar_img else 100  # Ниже аватара или наверху если нет аватара
+
+                    try:
+                        draw.text((self.video_width // 2, name_y_pos),
+                                  agent_name,
+                                  font=self.fonts['bold'],
+                                  fill=(255, 255, 255, header_alpha),
+                                  anchor="mm")
+                    except:
+                        draw.text((self.video_width // 2, name_y_pos),
+                                  agent_name,
+                                  fill=(255, 255, 255, header_alpha),
+                                  anchor="mm")
 
                 # Текст сообщения
-                if progress > 0.2:
-                    text_alpha = int(255 * min(1.0, (progress - 0.2) * 1.5))
+                if progress > 0.3:
+                    text_alpha = int(255 * min(1.0, (progress - 0.3) * 1.5))
 
                     # Разбиваем текст на строки
                     wrapped_text = textwrap.fill(message, width=50)
                     lines = wrapped_text.split('\n')
 
+                    # Определяем начальную позицию для текста (ниже заголовка)
+                    start_y = 280 if avatar_img else 160
+
                     # Рисуем текст
                     for i, line in enumerate(lines[:6]):  # Максимум 6 строк
-                        y_pos = 200 + i * 45
+                        y_pos = start_y + i * 45
                         try:
                             draw.text((self.video_width // 2, y_pos),
                                       line,

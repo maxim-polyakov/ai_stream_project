@@ -2993,7 +2993,6 @@ class FFmpegStreamManager:
             return {'success': False, 'error': 'Stream Key не установлен'}
 
         try:
-            default_video_path = self._create_default_video_file()
             self.start_time = time.time()
 
             # Инициализируем очереди
@@ -3016,36 +3015,14 @@ class FFmpegStreamManager:
             ffmpeg_cmd = [
                 'ffmpeg',
 
-                # Вход 0: MPEG-TS поток через pipe (основной контент)
-                '-fflags', '+genpts+igndts+discardcorrupt',
-                '-analyzeduration', '0',
-                '-probesize', '32',
+                # Входные параметры - исправляем обработку MPEG-TS
                 '-f', 'mpegts',
                 '-i', 'pipe:0',
 
-                # Вход 1: дефолтное видео (резерв, бесконечный цикл)
-                '-stream_loop', '-1',
-                '-re',
-                '-i', default_video_path,
 
-                # 🔥 ПРОСТОЙ ФИЛЬТР: Используем select для выбора видео источника
-                # Если есть видео в MPEG-TS (вход 0) - используем его, иначе фоновое видео (вход 1)
-                '-filter_complex',
-                '[0:v]setpts=PTS-STARTPTS[v0];'
-                '[1:v]setpts=PTS-STARTPTS,scale={self.video_width}:{self.video_height}:force_original_aspect_ratio=decrease,pad={self.video_width}:{self.video_height}:(ow-iw)/2:(oh-ih)/2[v1];'
-                '[v0][v1]concat=n=2:v=1:a=0[outv]',
-
-                # Выбор потоков
-                '-map', '[outv]',  # Видео из фильтра
-                '-map', '0:a:0',  # Аудио из MPEG-TS
-
-                # Исправление временных меток
-                '-use_wallclock_as_timestamps', '1',
-                '-avoid_negative_ts', 'make_zero',
-
-                # Видео кодирование
+                # Видео кодирование - оптимизировано для потоковой передачи
                 '-c:v', 'libx264',
-                '-preset', 'veryfast',
+                '-preset', 'veryfast',  # Быстрее чем medium для снижения задержки
                 '-tune', 'zerolatency',
                 '-pix_fmt', 'yuv420p',
                 '-profile:v', 'high',
@@ -3053,7 +3030,7 @@ class FFmpegStreamManager:
                 '-g', '60',
                 '-keyint_min', '60',
                 '-sc_threshold', '0',
-                '-bf', '0',
+                '-bf', '0',  # Убрать B-кадры для уменьшения задержки
                 '-b:v', video_bitrate,
                 '-maxrate', maxrate,
                 '-bufsize', bufsize,
@@ -3062,32 +3039,20 @@ class FFmpegStreamManager:
                 '-x264opts', 'nal-hrd=cbr:force-cfr=1',
                 '-flags', '+global_header',
 
-                # Аудио кодирование
+                # Аудио кодирование - исправляем синхронизацию
                 '-c:a', 'aac',
                 '-b:a', audio_bitrate,
                 '-ar', '44100',
                 '-ac', '2',
                 '-strict', 'experimental',
-                '-async', '1000',
+                '-async', '1000',  # Синхронизация аудио
 
-                # Формат вывода
+                # Формат вывода с улучшенной обработкой ошибок
                 '-f', 'flv',
                 '-flvflags', 'no_duration_filesize',
-                '-max_muxing_queue_size', '1024',
+                '-max_muxing_queue_size', '1024',  # Критически важно!
                 '-muxdelay', '0',
                 '-muxpreload', '0',
-
-                # Сетевые параметры
-                '-timeout', '5000000',
-                '-rw_timeout', '5000000',
-                '-stimeout', '5000000',
-                '-reconnect', '1',
-                '-reconnect_streamed', '1',
-                '-reconnect_on_network_error', '1',
-                '-reconnect_on_http_error', '4xx,5xx',
-                '-reconnect_delay_max', '5',
-                '-multiple_requests', '1',
-                '-buffer_size', '1024k',
 
                 self.rtmp_url
             ]

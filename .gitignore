@@ -7,3 +7,4 @@ client_secret.json
 .env
 token.json
 *.json
+ffmpeg.exe

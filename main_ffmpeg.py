@@ -2439,7 +2439,7 @@ class FFmpegStreamManager:
                 # ВАЖНОЕ ИСПРАВЛЕНИЕ: Раздельная логика ожидания файлов
                 if self._controller_is_first_run:
                     # При первом запуске ждем минимум 2 файла
-                    required_files = 20
+                    required_files = 2
                     if len(self.mpegts_cache) < required_files:
                         logger.info(
                             f"⏳ Ожидание файлов для первого запуска: {len(self.mpegts_cache)}/{required_files}")
@@ -3014,12 +3014,19 @@ class FFmpegStreamManager:
             # ВАЖНО: ОДИН PIPE для видео+аудио в формате MPEG-TS
             ffmpeg_cmd = [
                 'ffmpeg',
-                '-f', 'mpegts',
-                '-i', 'pipe:0',  # MPEG-TS поток через stdin
 
-                # Видео кодирование
+                # Входные параметры - исправляем обработку MPEG-TS
+                '-f', 'mpegts',
+                '-fflags', '+genpts',  # Генерация временных меток
+                '-i', 'pipe:0',
+
+                # Исправление проблемы с DTS (временными метками)
+                '-use_wallclock_as_timestamps', '1',
+                '-avoid_negative_ts', 'make_zero',
+
+                # Видео кодирование - оптимизировано для потоковой передачи
                 '-c:v', 'libx264',
-                '-preset', 'medium',
+                '-preset', 'veryfast',  # Быстрее чем medium для снижения задержки
                 '-tune', 'zerolatency',
                 '-pix_fmt', 'yuv420p',
                 '-profile:v', 'high',
@@ -3027,26 +3034,29 @@ class FFmpegStreamManager:
                 '-g', '60',
                 '-keyint_min', '60',
                 '-sc_threshold', '0',
-                '-bf', '2',
+                '-bf', '0',  # Убрать B-кадры для уменьшения задержки
                 '-b:v', video_bitrate,
                 '-maxrate', maxrate,
                 '-bufsize', bufsize,
                 '-r', str(self.video_fps),
                 '-s', f'{self.video_width}x{self.video_height}',
-                '-force_key_frames', 'expr:gte(t,n_forced*2)',
+                '-x264opts', 'nal-hrd=cbr:force-cfr=1',
+                '-flags', '+global_header',
 
-                # Аудио кодирование
+                # Аудио кодирование - исправляем синхронизацию
                 '-c:a', 'aac',
                 '-b:a', audio_bitrate,
                 '-ar', '44100',
                 '-ac', '2',
                 '-strict', 'experimental',
+                '-async', '1000',  # Синхронизация аудио
 
-                # Формат вывода для YouTube
+                # Формат вывода с улучшенной обработкой ошибок
                 '-f', 'flv',
                 '-flvflags', 'no_duration_filesize',
-                '-rtmp_buffer', '10000',
-                '-rtmp_live', 'live',
+                '-max_muxing_queue_size', '1024',  # Критически важно!
+                '-muxdelay', '0',
+                '-muxpreload', '0',
 
                 self.rtmp_url
             ]

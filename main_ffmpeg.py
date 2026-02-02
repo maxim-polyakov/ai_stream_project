@@ -3112,27 +3112,28 @@ class FFmpegStreamManager:
             ffmpeg_cmd = [
                 'ffmpeg',
 
-                # Вход 0: бесконечный фоновый поток из дефолтного видео
-                '-stream_loop', '-1',  # Бесконечный цикл
-                '-re',  # ВАЖНО: Реальное время для синхронизации
+                # Вход 0: бесконечный фоновый поток
+                '-stream_loop', '-1',
+                '-re',
                 '-i', default_video_path,
 
-                # Вход 1: MPEG-TS поток через pipe (основной контент)
+                # Вход 1: MPEG-TS поток через pipe
                 '-f', 'mpegts',
-                '-thread_queue_size', '2048',  # Увеличиваем буфер для pipe
+                '-thread_queue_size', '4096',  # Еще больше буфер
                 '-i', 'pipe:0',
 
-                # ПРОСТОЙ И РАБОЧИЙ ФИЛЬТР: concat
+                # ФИЛЬТР: Используем overlay вместо concat
+                # Накладываем MPEG-TS видео поверх фона
                 '-filter_complex',
-                # Масштабируем оба видео до нужного размера
-                f'[0:v]scale={self.video_width}:{self.video_height},setpts=PTS-STARTPTS[bg];'
-                f'[1:v]scale={self.video_width}:{self.video_height},setpts=PTS-STARTPTS[main];'
-                # Объединяем: сначала фон, потом основное видео
-                '[bg][main]concat=n=2:v=1:a=0[outv]',
+                f'[0:v]scale={self.video_width}:{self.video_height},'
+                'setpts=PTS-STARTPTS[bg];'
+                '[1:v]scale=iw:-1,'  # Сохраняем пропорции
+                'setpts=PTS-STARTPTS[main];'
+                '[bg][main]overlay=(W-w)/2:(H-h)/2[v]',
 
                 # Выбор потоков
-                '-map', '[outv]',  # Видео из фильтра (объединенное)
-                '-map', '1:a:0',  # Аудио из MPEG-TS потока
+                '-map', '[v]',  # Видео из фильтра
+                '-map', '1:a:0',  # Аудио из MPEG-TS
 
                 # Видео кодирование
                 '-c:v', 'libx264',
@@ -3153,6 +3154,7 @@ class FFmpegStreamManager:
                 '-x264opts', 'nal-hrd=cbr:force-cfr=1',
                 '-flags', '+global_header',
                 '-force_key_frames', 'expr:gte(t,n_forced*2)',
+                '-vsync', 'cfr',  # Синхронизация кадров
 
                 # Аудио кодирование
                 '-c:a', 'aac',
@@ -3162,13 +3164,13 @@ class FFmpegStreamManager:
                 '-strict', 'experimental',
                 '-async', '1000',
 
-                # Формат вывода с улучшенной обработкой ошибок
+                # Формат вывода
                 '-f', 'flv',
                 '-flvflags', 'no_duration_filesize',
-                '-max_muxing_queue_size', '2048',  # Увеличиваем
-                '-muxdelay', '0',
-                '-muxpreload', '0',
-                '-flush_packets', '1',  # Важно для pipe
+                '-max_muxing_queue_size', '4096',
+                '-muxdelay', '0.1',
+                '-muxpreload', '0.1',
+                '-flush_packets', '1',
 
                 self.rtmp_url
             ]

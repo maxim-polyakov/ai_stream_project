@@ -3930,7 +3930,7 @@ class VideoGenerator:
                 try:
                     avatar_img = Image.open(avatar_path).convert("RGBA")
                     # Ресайз аватара
-                    avatar_size = 150
+                    avatar_size = 120
                     avatar_img = avatar_img.resize((avatar_size, avatar_size), Image.Resampling.LANCZOS)
 
                     # Создаем круглую маску для аватара
@@ -3944,97 +3944,84 @@ class VideoGenerator:
                     logger.warning(f"⚠️ Не удалось загрузить аватар для {agent_name}: {e}")
                     avatar_img = None
             else:
-                logger.warning(f"⚠️ Аватар не найден: {avatar_path}")
                 # Создаем стандартный аватар
-                avatar_size = 150
-                avatar_img = Image.new('RGBA', (avatar_size, avatar_size), (100, 100, 200, 255))
+                avatar_size = 120
+                avatar_img = Image.new('RGBA', (avatar_size, avatar_size), (80, 120, 200, 255))
                 draw_avatar = ImageDraw.Draw(avatar_img)
                 draw_avatar.ellipse((0, 0, avatar_size, avatar_size),
-                                    fill=(100, 100, 200), outline=(255, 255, 255, 128))
+                                    fill=(80, 120, 200), outline=(200, 200, 255, 200))
+
                 # Инициалы агента
                 initials = agent_name[:2].upper() if len(agent_name) >= 2 else agent_name[0].upper()
-                font_size = 60
                 try:
-                    font = ImageFont.truetype("arial.ttf", font_size)
+                    font = ImageFont.truetype("arial.ttf", 40)
                 except:
                     font = ImageFont.load_default()
+
                 text_bbox = draw_avatar.textbbox((0, 0), initials, font=font)
                 text_width = text_bbox[2] - text_bbox[0]
                 text_height = text_bbox[3] - text_bbox[1]
                 draw_avatar.text(((avatar_size - text_width) // 2,
-                                  (avatar_size - text_height) // 2 - 5),
+                                  (avatar_size - text_height) // 2 - 3),
                                  initials, font=font, fill=(255, 255, 255, 255))
 
             for frame_num in range(total_frames):
-                progress = min(1.0, frame_num / (fps * 1.0))
-
                 # Создаем фон
                 img = Image.new('RGB', (self.video_width, self.video_height),
-                                (30, 30, 40))
+                                (25, 25, 35))
                 draw = ImageDraw.Draw(img)
 
-                # Аватар агента с анимацией появления
-                if avatar_img and progress > 0.1:
-                    avatar_alpha = int(255 * min(1.0, (progress - 0.1) * 2))
+                # Позиция аватара (центр сверху)
+                avatar_x = self.video_width // 2 - avatar_size // 2
+                avatar_y = 60
 
-                    # Создаем копию аватара с текущей прозрачностью
-                    avatar_with_alpha = avatar_img.copy()
-                    alpha = avatar_with_alpha.split()[3]
-                    alpha = alpha.point(lambda p: p * avatar_alpha / 255)
-                    avatar_with_alpha.putalpha(alpha)
-
-                    # Позиция аватара (центр сверху)
-                    avatar_x = self.video_width // 2 - avatar_size // 2
-                    avatar_y = 50  # Отступ сверху
-
-                    # Создаем фоновое изображение с альфа-каналом для вставки аватара
+                # Вставляем аватар
+                if avatar_img:
                     img_rgba = img.convert("RGBA")
-                    img_rgba.paste(avatar_with_alpha, (avatar_x, avatar_y), avatar_with_alpha)
+                    img_rgba.paste(avatar_img, (avatar_x, avatar_y), avatar_img)
                     img = img_rgba.convert("RGB")
                     draw = ImageDraw.Draw(img)
 
-                # Заголовок с именем агента (под аватаром)
-                if progress > 0.2:
-                    header_alpha = int(255 * min(1.0, (progress - 0.2) * 2))
-                    name_y_pos = 220 if avatar_img else 100  # Ниже аватара или наверху если нет аватара
+                # Имя агента под аватаром
+                name_y_pos = avatar_y + avatar_size + 25
 
+                try:
+                    draw.text((self.video_width // 2, name_y_pos),
+                              agent_name,
+                              font=self.fonts['bold'],
+                              fill=(255, 255, 255, 255),
+                              anchor="mm")
+                except:
+                    draw.text((self.video_width // 2, name_y_pos),
+                              agent_name,
+                              fill=(255, 255, 255, 255),
+                              anchor="mm")
+
+                # Текст сообщения под именем
+                # Разбиваем текст на строки
+                wrapped_text = textwrap.fill(message, width=50)
+                lines = wrapped_text.split('\n')
+
+                # Определяем начальную позицию для текста
+                start_y = name_y_pos + 60
+
+                # Рисуем текст
+                max_lines = 6
+                actual_lines = min(len(lines), max_lines)
+
+                for i, line in enumerate(lines[:max_lines]):
+                    y_pos = start_y + i * 45
                     try:
-                        draw.text((self.video_width // 2, name_y_pos),
-                                  agent_name,
-                                  font=self.fonts['bold'],
-                                  fill=(255, 255, 255, header_alpha),
+                        draw.text((self.video_width // 2, y_pos),
+                                  line,
+                                  font=self.fonts['regular'],
+                                  fill=(240, 240, 240, 255),
                                   anchor="mm")
                     except:
-                        draw.text((self.video_width // 2, name_y_pos),
-                                  agent_name,
-                                  fill=(255, 255, 255, header_alpha),
+                        draw.text((self.video_width // 2, y_pos),
+                                  line,
+                                  fill=(240, 240, 240, 255),
                                   anchor="mm")
-
-                # Текст сообщения
-                if progress > 0.3:
-                    text_alpha = int(255 * min(1.0, (progress - 0.3) * 1.5))
-
-                    # Разбиваем текст на строки
-                    wrapped_text = textwrap.fill(message, width=50)
-                    lines = wrapped_text.split('\n')
-
-                    # Определяем начальную позицию для текста (ниже заголовка)
-                    start_y = 280 if avatar_img else 160
-
-                    # Рисуем текст
-                    for i, line in enumerate(lines[:6]):  # Максимум 6 строк
-                        y_pos = start_y + i * 45
-                        try:
-                            draw.text((self.video_width // 2, y_pos),
-                                      line,
-                                      font=self.fonts['regular'],
-                                      fill=(255, 255, 255, text_alpha),
-                                      anchor="mm")
-                        except:
-                            draw.text((self.video_width // 2, y_pos),
-                                      line,
-                                      fill=(255, 255, 255, text_alpha),
-                                      anchor="mm")
 
                 cv_img = cv2.cvtColor(numpy.array(img), cv2.COLOR_RGB2BGR)
                 video_writer.write(cv_img)

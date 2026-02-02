@@ -3113,7 +3113,6 @@ class FFmpegStreamManager:
                 'ffmpeg',
 
                 # Вход 0: бесконечный фоновый поток из дефолтного видео
-                '-re',  # Реальное время
                 '-stream_loop', '-1',  # Бесконечный цикл
                 '-i', default_video_path,
 

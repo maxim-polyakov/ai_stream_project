@@ -3114,28 +3114,24 @@ class FFmpegStreamManager:
 
                 # Вход 0: бесконечный фоновый поток из дефолтного видео
                 '-stream_loop', '-1',  # Бесконечный цикл
+                '-re',  # ВАЖНО: Реальное время для синхронизации
                 '-i', default_video_path,
 
                 # Вход 1: MPEG-TS поток через pipe (основной контент)
                 '-f', 'mpegts',
+                '-thread_queue_size', '2048',  # Увеличиваем буфер для pipe
                 '-i', 'pipe:0',
 
-                # СЛОЖНЫЙ ФИЛЬТР: объединяем потоки
-                # Используем [1:v] если есть видео в MPEG-TS, иначе [0:v] (фоновое)
-                # Аудио всегда из MPEG-TS
+                # ПРОСТОЙ И РАБОЧИЙ ФИЛЬТР: concat
                 '-filter_complex',
-                '[1:v]setpts=PTS-STARTPTS[v_main];'  # Сбрасываем PTS для основного видео
-                '[0:v]setpts=PTS-STARTPTS[v_bg];'  # Сбрасываем PTS для фона
-
-                # Если в MPEG-TS есть видео, используем его, иначе фоновое видео
-                '[v_main]select=if(gt(n\,0)\,lt(n\,2))[v_temp];'  # Выбираем первые 2 кадра MPEG-TS для проверки
-                '[v_temp]null[v_check];'  # Проверяем доступность видео
-
-                # Автоматическое переключение: MPEG-TS видео если есть, иначе фон
-                '[v_check][v_bg]concat=n=2:v=1:a=0[final_video];',
+                # Масштабируем оба видео до нужного размера
+                f'[0:v]scale={self.video_width}:{self.video_height},setpts=PTS-STARTPTS[bg];'
+                f'[1:v]scale={self.video_width}:{self.video_height},setpts=PTS-STARTPTS[main];'
+                # Объединяем: сначала фон, потом основное видео
+                '[bg][main]concat=n=2:v=1:a=0[outv]',
 
                 # Выбор потоков
-                '-map', '[final_video]',  # Видео из фильтра
+                '-map', '[outv]',  # Видео из фильтра (объединенное)
                 '-map', '1:a:0',  # Аудио из MPEG-TS потока
 
                 # Видео кодирование
@@ -3169,9 +3165,10 @@ class FFmpegStreamManager:
                 # Формат вывода с улучшенной обработкой ошибок
                 '-f', 'flv',
                 '-flvflags', 'no_duration_filesize',
-                '-max_muxing_queue_size', '1024',
+                '-max_muxing_queue_size', '2048',  # Увеличиваем
                 '-muxdelay', '0',
                 '-muxpreload', '0',
+                '-flush_packets', '1',  # Важно для pipe
 
                 self.rtmp_url
             ]

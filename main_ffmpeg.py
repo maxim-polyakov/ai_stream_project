@@ -3016,7 +3016,6 @@ class FFmpegStreamManager:
                 'ffmpeg',
 
                 # Входные параметры
-                '-re',
                 '-fflags', '+genpts+igndts+discardcorrupt',
                 '-analyzeduration', '0',
                 '-probesize', '32',

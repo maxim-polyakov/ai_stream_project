@@ -2410,6 +2410,8 @@ class FFmpegStreamManager:
         """Главный контроллер потока - с сохранением состояния при перезапуске"""
         logger.info("🎬 Запуск контроллера непрерывного MPEG-TS потока")
 
+        self._controller_stop_event = threading.Event()
+
         try:
             # Инициализируем состояние контроллера
             if not hasattr(self, '_controller_is_first_run'):
@@ -2429,7 +2431,7 @@ class FFmpegStreamManager:
             stop_event = threading.Event()
 
             # Основной цикл контроллера
-            while self.is_streaming:
+            while self.is_streaming and not self._controller_stop_event.is_set():
                 # Проверяем FFmpeg
                 if not self._check_ffmpeg_alive():
                     logger.error("❌ FFmpeg процесс завершился. Останавливаю контроллер...")
@@ -2979,7 +2981,7 @@ class FFmpegStreamManager:
 
     def _periodic_cache_cleanup(self):
         """Периодическая очистка кэша"""
-        while self.is_streaming:
+        while self.is_streaming and not getattr(self, '_cleanup_stop_event', threading.Event()).is_set():
             try:
                 time.sleep(3600)  # Проверяем каждый час
                 self._cleanup_sent_files()
@@ -3510,6 +3512,8 @@ class FFmpegStreamManager:
     def _monitor_ffmpeg_with_restart(self):
         """Мониторинг FFmpeg с автовосстановлением при отключении YouTube"""
         try:
+            self._monitor_stop_event = threading.Event()
+
             stream_connected = False
             last_bitrate_warning = 0
             restart_count = 0
@@ -3518,123 +3522,124 @@ class FFmpegStreamManager:
 
             logger.info("📡 Запущен мониторинг FFmpeg с автовосстановлением")
 
-            for line in iter(self.stream_process.stderr.readline, b''):
-                line = line.decode('utf-8', errors='ignore').strip()
+            while self.is_streaming and not self._monitor_stop_event.is_set():
+                for line in iter(self.stream_process.stderr.readline, b''):
+                    line = line.decode('utf-8', errors='ignore').strip()
 
-                # Отладочная информация
-                if 'frame=' in line and 'fps=' in line:
-                    current_time = time.time()
+                    # Отладочная информация
+                    if 'frame=' in line and 'fps=' in line:
+                        current_time = time.time()
 
-                    # Парсим информацию о битрейте
-                    if 'bitrate=' in line:
-                        try:
-                            import re
-                            bitrate_match = re.search(r'bitrate=\s*([\d\.]+)\s*kbits/s', line)
-                            if bitrate_match:
-                                current_bitrate = float(bitrate_match.group(1))
-                                current_time = time.time()
+                        # Парсим информацию о битрейте
+                        if 'bitrate=' in line:
+                            try:
+                                import re
+                                bitrate_match = re.search(r'bitrate=\s*([\d\.]+)\s*kbits/s', line)
+                                if bitrate_match:
+                                    current_bitrate = float(bitrate_match.group(1))
+                                    current_time = time.time()
 
-                                # Логируем битрейт каждые 10 секунд
-                                if current_time - last_bitrate_warning > 10:
-                                    logger.info(f"📊 Текущий битрейт: {current_bitrate:.1f} kbps")
-                                    last_bitrate_warning = current_time
+                                    # Логируем битрейт каждые 10 секунд
+                                    if current_time - last_bitrate_warning > 10:
+                                        logger.info(f"📊 Текущий битрейт: {current_bitrate:.1f} kbps")
+                                        last_bitrate_warning = current_time
 
-                                    # ВНИМАНИЕ: YouTube может отключить стрим при битрейте < 1000 kbps
-                                    if current_bitrate < 1000:
-                                        logger.warning(f"⚠️ ОЧЕНЬ НИЗКИЙ БИТРЕЙТ: {current_bitrate:.1f} kbps")
-                                        logger.warning(f"⚠️ YouTube может отключить стрим при битрейте < 1000 kbps")
+                                        # ВНИМАНИЕ: YouTube может отключить стрим при битрейте < 1000 kbps
+                                        if current_bitrate < 1000:
+                                            logger.warning(f"⚠️ ОЧЕНЬ НИЗКИЙ БИТРЕЙТ: {current_bitrate:.1f} kbps")
+                                            logger.warning(f"⚠️ YouTube может отключить стрим при битрейте < 1000 kbps")
 
-                                        # НЕ ПЕРЕЗАПУСКАЕМ при низком битрейте, просто логируем
-                                        socketio.emit('stream_warning', {
-                                            'message': f'Очень низкий битрейт: {current_bitrate:.1f} kbps',
-                                            'bitrate': current_bitrate,
-                                            'action': 'monitor_only'
-                                        })
-                        except Exception as e:
-                            logger.debug(f"Ошибка парсинга битрейта: {e}")
+                                            # НЕ ПЕРЕЗАПУСКАЕМ при низком битрейте, просто логируем
+                                            socketio.emit('stream_warning', {
+                                                'message': f'Очень низкий битрейт: {current_bitrate:.1f} kbps',
+                                                'bitrate': current_bitrate,
+                                                'action': 'monitor_only'
+                                            })
+                            except Exception as e:
+                                logger.debug(f"Ошибка парсинга битрейта: {e}")
 
-                    if hasattr(self, '_last_stats_log') and current_time - self._last_stats_log < 5:
-                        continue
-                    self._last_stats_log = current_time
-                    logger.debug(f"📊 FFmpeg stats: {line}")
+                        if hasattr(self, '_last_stats_log') and current_time - self._last_stats_log < 5:
+                            continue
+                        self._last_stats_log = current_time
+                        logger.debug(f"📊 FFmpeg stats: {line}")
 
-                # Подключение к YouTube
-                elif 'rtmp://' in line and any(x in line.lower() for x in ['connected', 'publish', 'live']):
-                    if not stream_connected:
-                        stream_connected = True
-                        logger.info("✅ Успешное подключение к YouTube")
-                        socketio.emit('stream_connected', {'status': 'connected'})
+                    # Подключение к YouTube
+                    elif 'rtmp://' in line and any(x in line.lower() for x in ['connected', 'publish', 'live']):
+                        if not stream_connected:
+                            stream_connected = True
+                            logger.info("✅ Успешное подключение к YouTube")
+                            socketio.emit('stream_connected', {'status': 'connected'})
 
-                        # Сбрасываем счетчик перезапусков при успешном подключении
-                        restart_count = 0
+                            # Сбрасываем счетчик перезапусков при успешном подключении
+                            restart_count = 0
 
-                # КРИТИЧЕСКИЕ ОШИБКИ, которые требуют перезапуска
-                elif any(x in line.lower() for x in ['broken pipe', 'end of file', 'error writing trailer']):
-                    logger.error(f"💥 КРИТИЧЕСКАЯ ОШИБКА: {line}")
+                    # КРИТИЧЕСКИЕ ОШИБКИ, которые требуют перезапуска
+                    elif any(x in line.lower() for x in ['broken pipe', 'end of file', 'error writing trailer']):
+                        logger.error(f"💥 КРИТИЧЕСКАЯ ОШИБКА: {line}")
 
-                    # Проверяем, не слишком ли часто перезапускаем
-                    current_time = time.time()
-                    if restart_count >= max_restarts and (current_time - last_restart_time < 60):
-                        logger.error(f"❌ Слишком много перезапусков ({restart_count}). Пауза 60 секунд.")
-                        time.sleep(60)
-                        continue
+                        # Проверяем, не слишком ли часто перезапускаем
+                        current_time = time.time()
+                        if restart_count >= max_restarts and (current_time - last_restart_time < 60):
+                            logger.error(f"❌ Слишком много перезапусков ({restart_count}). Пауза 60 секунд.")
+                            time.sleep(60)
+                            continue
 
-                    logger.info("🔄 Пробую безопасный перезапуск FFmpeg...")
+                        logger.info("🔄 Пробую безопасный перезапуск FFmpeg...")
 
-                    # Сохраняем состояние контроллера перед перезапуском
-                    controller_state = {
-                        'is_first_run': getattr(self, '_controller_is_first_run', True),
-                        'sent_files_count': getattr(self, '_sent_files_count', 0)
-                    }
+                        # Сохраняем состояние контроллера перед перезапуском
+                        controller_state = {
+                            'is_first_run': getattr(self, '_controller_is_first_run', True),
+                            'sent_files_count': getattr(self, '_sent_files_count', 0)
+                        }
+
+                        # Пробуем безопасный перезапуск
+                        if self._safe_restart_stream():
+                            restart_count += 1
+                            last_restart_time = current_time
+
+                            # ВОССТАНАВЛИВАЕМ состояние контроллера
+                            self._controller_is_first_run = controller_state['is_first_run']
+                            self._sent_files_count = controller_state['sent_files_count']
+
+                            logger.info(f"✅ FFmpeg перезапущен (попытка {restart_count})")
+                            logger.info(f"🔄 Контроллер продолжит с состояния: {controller_state}")
+
+                            socketio.emit('stream_recovered', {
+                                'message': 'Стрим восстановлен после ошибки',
+                                'restart_count': restart_count,
+                                'controller_state': controller_state,
+                                'timestamp': datetime.now().isoformat()
+                            })
+
+                            return  # Выходим из мониторинга, новый процесс будет запущен
+                        else:
+                            logger.error("❌ Не удалось перезапустить FFmpeg")
+
+                    # Предупреждения (не требуют перезапуска)
+                    elif any(x in line.lower() for x in ['warning', 'non-monotonic']):
+                        logger.warning(f"⚠️ FFmpeg warning: {line}")
+                        socketio.emit('stream_warning', {'message': line})
+
+                # Процесс завершен
+                return_code = self.stream_process.wait()
+                logger.info(f"FFmpeg завершился с кодом: {return_code}")
+
+                # Если код ошибки не 0, пробуем перезапустить
+                if return_code != 0:
+                    logger.warning(f"⚠️ FFmpeg завершился с ошибкой, пробую перезапустить...")
+
+                    # НЕ сбрасываем is_streaming, иначе контроллер остановится
+                    # self.is_streaming = False  # НЕ ДЕЛАЕМ ЭТОГО!
+
+                    socketio.emit('stream_error', {
+                        'time': datetime.now().isoformat(),
+                        'exit_code': return_code,
+                        'auto_restart': True
+                    })
 
                     # Пробуем безопасный перезапуск
-                    if self._safe_restart_stream():
-                        restart_count += 1
-                        last_restart_time = current_time
-
-                        # ВОССТАНАВЛИВАЕМ состояние контроллера
-                        self._controller_is_first_run = controller_state['is_first_run']
-                        self._sent_files_count = controller_state['sent_files_count']
-
-                        logger.info(f"✅ FFmpeg перезапущен (попытка {restart_count})")
-                        logger.info(f"🔄 Контроллер продолжит с состояния: {controller_state}")
-
-                        socketio.emit('stream_recovered', {
-                            'message': 'Стрим восстановлен после ошибки',
-                            'restart_count': restart_count,
-                            'controller_state': controller_state,
-                            'timestamp': datetime.now().isoformat()
-                        })
-
-                        return  # Выходим из мониторинга, новый процесс будет запущен
-                    else:
-                        logger.error("❌ Не удалось перезапустить FFmpeg")
-
-                # Предупреждения (не требуют перезапуска)
-                elif any(x in line.lower() for x in ['warning', 'non-monotonic']):
-                    logger.warning(f"⚠️ FFmpeg warning: {line}")
-                    socketio.emit('stream_warning', {'message': line})
-
-            # Процесс завершен
-            return_code = self.stream_process.wait()
-            logger.info(f"FFmpeg завершился с кодом: {return_code}")
-
-            # Если код ошибки не 0, пробуем перезапустить
-            if return_code != 0:
-                logger.warning(f"⚠️ FFmpeg завершился с ошибкой, пробую перезапустить...")
-
-                # НЕ сбрасываем is_streaming, иначе контроллер остановится
-                # self.is_streaming = False  # НЕ ДЕЛАЕМ ЭТОГО!
-
-                socketio.emit('stream_error', {
-                    'time': datetime.now().isoformat(),
-                    'exit_code': return_code,
-                    'auto_restart': True
-                })
-
-                # Пробуем безопасный перезапуск
-                time.sleep(2)
-                self._safe_restart_stream()
+                    time.sleep(2)
+                    self._safe_restart_stream()
 
         except Exception as e:
             logger.error(f"Ошибка мониторинга FFmpeg: {e}")
@@ -3643,15 +3648,13 @@ class FFmpegStreamManager:
             self._safe_restart_stream()
 
     def stop_stream(self):
-        """Остановка стрима без сброса состояния контроллера"""
-        logger.info("🛑 Остановка стрима (сохраняю состояние контроллера)...")
+        """Полная остановка стрима со всеми потоками"""
+        logger.info("🛑 ПОЛНАЯ остановка стрима и всех потоков...")
 
-        # НЕ СБРАСЫВАЕМ is_streaming сразу, чтобы контроллер мог восстановиться
-        # self.is_streaming = False  # НЕ ДЕЛАЕМ ЭТОГО!
+        # 1. Устанавливаем флаги остановки для ВСЕХ потоков
+        self.is_streaming = False
 
-        # Останавливаем процесс FFmpeg
-        time.sleep(0.5)
-
+        # 2. Останавливаем FFmpeg процесс
         try:
             if hasattr(self, 'ffmpeg_stdin') and self.ffmpeg_stdin:
                 try:
@@ -3665,21 +3668,54 @@ class FFmpegStreamManager:
                     time.sleep(0.5)
                     if self.stream_process.poll() is None:
                         self.stream_process.kill()
+                        time.sleep(0.5)
                 except:
                     pass
-
         except Exception as e:
-            logger.error(f"Ошибка при остановке: {e}")
+            logger.error(f"Ошибка при остановке FFmpeg: {e}")
 
-        # Сбрасываем только процессные атрибуты, но не состояние контроллера
+        # 3. Останавливаем контроллер потока (если есть флаг)
+        if hasattr(self, '_controller_stop_event'):
+            try:
+                self._controller_stop_event.set()
+            except:
+                pass
+
+        # 4. Останавливаем мониторинг FFmpeg (если есть флаг)
+        if hasattr(self, '_monitor_stop_event'):
+            try:
+                self._monitor_stop_event.set()
+            except:
+                pass
+
+        # 5. Очищаем очереди
+        self.audio_queue.clear()
+        self.video_queue.clear()
+
+        # 6. Сбрасываем процессные атрибуты
         self.stream_process = None
         self.ffmpeg_stdin = None
         self.ffmpeg_pid = None
 
-        # Устанавливаем is_streaming = False только для внешних потребителей
-        # Внутренние флаги контроллера сохраняем
+        # 7. Останавливаем воспроизведение
+        self.is_playing_audio = False
+        self.is_playing_video = False
 
-        logger.info("✅ FFmpeg процесс остановлен (состояние контроллера сохранено)")
+        # 8. Останавливаем отправку данных (если есть флаг)
+        if hasattr(self, 'is_sending_data'):
+            self.is_sending_data = False
+
+        logger.info("✅ Стрим и все потоки полностью остановлены")
+
+        # 9. Отправляем событие в WebSocket
+        try:
+            socketio.emit('stream_stopped', {
+                'time': datetime.now().isoformat(),
+                'message': 'Стрим полностью остановлен'
+            })
+        except:
+            pass
+
         return True
 
     def get_status(self):

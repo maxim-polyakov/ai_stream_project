@@ -3647,6 +3647,35 @@ class FFmpegStreamManager:
             time.sleep(2)
             self._safe_restart_stream()
 
+    def _cleanup_temporary_cache_files(self):
+        """Очистка временных файлов из кэша MPEG-TS при остановке"""
+        try:
+            if not hasattr(self, 'mpegts_cache_dir') or not os.path.exists(self.mpegts_cache_dir):
+                return
+
+            deleted_count = 0
+
+            # Удаляем все временные файлы .ts
+            for filename in os.listdir(self.mpegts_cache_dir):
+                if filename.endswith('.ts'):
+                    try:
+                        filepath = os.path.join(self.mpegts_cache_dir, filename)
+                        os.unlink(filepath)
+                        deleted_count += 1
+                    except Exception as e:
+                        logger.warning(f"Не удалось удалить {filename}: {e}")
+
+            # Очищаем кэш в памяти
+            if hasattr(self, 'mpegts_cache'):
+                self.mpegts_cache.clear()
+                logger.info("✅ Кэш MPEG-TS очищен из памяти")
+
+            if deleted_count > 0:
+                logger.info(f"✅ Удалено {deleted_count} временных файлов из кэша MPEG-TS")
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка очистки временных файлов кэша: {e}")
+
     def stop_stream(self):
         """Полная остановка стрима со всеми потоками"""
         logger.info("🛑 ПОЛНАЯ остановка стрима и всех потоков...")
@@ -3654,43 +3683,73 @@ class FFmpegStreamManager:
         # 1. Устанавливаем флаги остановки для ВСЕХ потоков
         self.is_streaming = False
 
-        # 2. Останавливаем FFmpeg процесс
-        try:
-            if hasattr(self, 'ffmpeg_stdin') and self.ffmpeg_stdin:
-                try:
-                    self.ffmpeg_stdin.close()
-                except:
-                    pass
-
-            if hasattr(self, 'stream_process') and self.stream_process:
-                try:
-                    self.stream_process.terminate()
-                    time.sleep(0.5)
-                    if self.stream_process.poll() is None:
-                        self.stream_process.kill()
-                        time.sleep(0.5)
-                except:
-                    pass
-        except Exception as e:
-            logger.error(f"Ошибка при остановке FFmpeg: {e}")
-
-        # 3. Останавливаем контроллер потока (если есть флаг)
+        # 2. Устанавливаем стоп-события для всех контроллеров
         if hasattr(self, '_controller_stop_event'):
             try:
                 self._controller_stop_event.set()
+                logger.info("✅ Контроллер потока получил сигнал остановки")
             except:
                 pass
 
-        # 4. Останавливаем мониторинг FFmpeg (если есть флаг)
         if hasattr(self, '_monitor_stop_event'):
             try:
                 self._monitor_stop_event.set()
+                logger.info("✅ Монитор FFmpeg получил сигнал остановки")
             except:
                 pass
+
+        if hasattr(self, '_cleanup_stop_event'):
+            try:
+                self._cleanup_stop_event.set()
+                logger.info("✅ Очистка кэша получила сигнал остановки")
+            except:
+                pass
+
+        # 3. Останавливаем отправку данных
+        if hasattr(self, 'is_sending_data'):
+            self.is_sending_data = False
+
+        # 4. Останавливаем FFmpeg процесс
+        try:
+            # Закрываем stdin чтобы прекратить прием данных
+            if hasattr(self, 'ffmpeg_stdin') and self.ffmpeg_stdin:
+                try:
+                    self.ffmpeg_stdin.close()
+                    logger.info("✅ FFmpeg stdin закрыт")
+                except:
+                    pass
+
+            # Останавливаем процесс FFmpeg
+            if hasattr(self, 'stream_process') and self.stream_process:
+                try:
+                    # Отправляем SIGTERM
+                    self.stream_process.terminate()
+                    logger.info("✅ FFmpeg процессу отправлен SIGTERM")
+
+                    # Ждем завершения
+                    time.sleep(1)
+
+                    # Если процесс еще жив, отправляем SIGKILL
+                    if self.stream_process.poll() is None:
+                        self.stream_process.kill()
+                        logger.info("✅ FFmpeg процессу отправлен SIGKILL")
+                        time.sleep(0.5)
+
+                    # Гарантируем завершение
+                    try:
+                        self.stream_process.wait(timeout=2)
+                    except:
+                        pass
+
+                except Exception as e:
+                    logger.error(f"Ошибка при остановке FFmpeg: {e}")
+        except Exception as e:
+            logger.error(f"Ошибка при остановке FFmpeg: {e}")
 
         # 5. Очищаем очереди
         self.audio_queue.clear()
         self.video_queue.clear()
+        logger.info("✅ Очереди очищены")
 
         # 6. Сбрасываем процессные атрибуты
         self.stream_process = None
@@ -3701,17 +3760,20 @@ class FFmpegStreamManager:
         self.is_playing_audio = False
         self.is_playing_video = False
 
-        # 8. Останавливаем отправку данных (если есть флаг)
-        if hasattr(self, 'is_sending_data'):
-            self.is_sending_data = False
+        # 8. Дополнительная очистка кэша MPEG-TS
+        if hasattr(self, 'mpegts_cache'):
+            # Очищаем временные файлы из кэша
+            self._cleanup_temporary_cache_files()
 
+        # 9. Логируем завершение
         logger.info("✅ Стрим и все потоки полностью остановлены")
 
-        # 9. Отправляем событие в WebSocket
+        # 10. Отправляем событие в WebSocket
         try:
             socketio.emit('stream_stopped', {
                 'time': datetime.now().isoformat(),
-                'message': 'Стрим полностью остановлен'
+                'message': 'Стрим полностью остановлен',
+                'pid': self.ffmpeg_pid
             })
         except:
             pass

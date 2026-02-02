@@ -3683,6 +3683,8 @@ class FFmpegStreamManager:
         # 1. Устанавливаем флаги остановки для ВСЕХ потоков
         self.is_streaming = False
 
+
+
         # 2. Устанавливаем стоп-события для всех контроллеров
         if hasattr(self, '_controller_stop_event'):
             try:
@@ -5162,6 +5164,9 @@ def api_control():
 def api_stop_stream():
     """Остановка стрима"""
     try:
+
+        stream_manager.is_discussion_active = False
+        
         ffmpeg_manager.stop_stream()
 
         socketio.emit('stream_stopped', {

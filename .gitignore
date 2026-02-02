@@ -8,3 +8,6 @@ client_secret.json
 token.json
 *.json
 ffmpeg.exe
+/mpegts_cache
+/stream_ui
+/video_cache

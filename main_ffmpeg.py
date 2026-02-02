@@ -3015,9 +3015,11 @@ class FFmpegStreamManager:
             ffmpeg_cmd = [
                 'ffmpeg',
 
-                # Входные параметры - исправляем обработку MPEG-TS
-                '-f', 'mpegts',
-                '-fflags', '+genpts',  # Генерация временных меток
+                '-re',  # Чтение в реальном времени
+                '-fflags', '+genpts+igndts+discardcorrupt',  # Критически важно для MPEG-TS!
+                '-analyzeduration', '0',  # Не анализировать заранее
+                '-probesize', '32',  # Минимальный размер анализа
+                '-f', 'mpegts',  # Формат ввода - MPEG-TS
                 '-i', 'pipe:0',
 
                 # Исправление проблемы с DTS (временными метками)

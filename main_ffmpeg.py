@@ -2439,7 +2439,7 @@ class FFmpegStreamManager:
                 # ВАЖНОЕ ИСПРАВЛЕНИЕ: Раздельная логика ожидания файлов
                 if self._controller_is_first_run:
                     # При первом запуске ждем минимум 2 файла
-                    required_files = 2
+                    required_files = 1
                     if len(self.mpegts_cache) < required_files:
                         logger.info(
                             f"⏳ Ожидание файлов для первого запуска: {len(self.mpegts_cache)}/{required_files}")

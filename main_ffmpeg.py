@@ -2993,6 +2993,7 @@ class FFmpegStreamManager:
             return {'success': False, 'error': 'Stream Key не установлен'}
 
         try:
+            default_video_path = self._create_default_video_file()
             self.start_time = time.time()
 
             # Инициализируем очереди
@@ -3021,6 +3022,17 @@ class FFmpegStreamManager:
                 '-probesize', '32',
                 '-f', 'mpegts',
                 '-i', 'pipe:0',
+
+                '-stream_loop', '-1',        # Бесконечный повтор
+                '-re',                       # Воспроизведение в реальном времени
+                '-i', default_video_path,
+
+                '-filter_complex',
+                '[0:v]null[v_main];[1:v]null[v_backup];'
+                '[v_main][v_backup]concat=n=2:v=1:a=0[v_final]',
+
+                '-map', '[v_final]',         # Видео из фильтра
+                '-map', '0:a:0',
 
                 # Исправление временных меток
                 '-use_wallclock_as_timestamps', '1',

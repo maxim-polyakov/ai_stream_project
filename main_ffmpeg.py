@@ -2986,6 +2986,93 @@ class FFmpegStreamManager:
             except Exception as e:
                 logger.error(f"❌ Ошибка периодической очистки кэша: {e}")
 
+    def _background_silence_generator(self):
+        """Фоновый генератор тишины для поддержания pipe активным"""
+        logger.info("🔇 Запуск фонового генератора тишины для MPEG-TS pipe...")
+
+        # Создаем небольшой MPEG-TS фрагмент тишины
+        silence_ts = self._create_silence_mpegts()
+
+        if not silence_ts:
+            logger.error("❌ Не удалось создать MPEG-TS тишины")
+            return
+
+        while self.is_streaming and self.ffmpeg_stdin:
+            try:
+                # Проверяем, есть ли данные для отправки
+                # Если нет, отправляем тишину
+                if not hasattr(self, 'is_sending_data') or not self.is_sending_data:
+                    with open(silence_ts, 'rb') as f:
+                        silence_data = f.read()
+
+                    if silence_data and self.ffmpeg_stdin:
+                        try:
+                            self.ffmpeg_stdin.write(silence_data)
+                            self.ffmpeg_stdin.flush()
+                            logger.debug("🔇 Отправлен фрагмент тишины в pipe")
+                        except:
+                            pass
+
+                # Ждем перед следующей отправкой
+                time.sleep(1)
+
+            except Exception as e:
+                logger.error(f"❌ Ошибка генератора тишины: {e}")
+                time.sleep(1)
+
+        # Очищаем временный файл
+        if os.path.exists(silence_ts):
+            try:
+                os.unlink(silence_ts)
+            except:
+                pass
+
+        logger.info("🛑 Генератор тишины остановлен")
+
+    def _create_silence_mpegts(self) -> Optional[str]:
+        """Создание небольшого MPEG-TS файла с тишиной"""
+        try:
+            temp_file = tempfile.NamedTemporaryFile(suffix='.ts', delete=False)
+            temp_file.close()
+
+            cmd = [
+                'ffmpeg',
+                '-f', 'lavfi',
+                '-i', f'color=c=black:s={self.video_width}x{self.video_height}:r=1:d=1',
+                '-f', 'lavfi',
+                '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100:d=1',
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',
+                '-tune', 'zerolatency',
+                '-pix_fmt', 'yuv420p',
+                '-b:v', '100k',
+                '-c:a', 'aac',
+                '-b:a', '64k',
+                '-ar', '44100',
+                '-ac', '2',
+                '-t', '1',
+                '-f', 'mpegts',
+                '-y',
+                temp_file.name
+            ]
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+
+            if result.returncode == 0 and os.path.exists(temp_file.name):
+                file_size = os.path.getsize(temp_file.name)
+                logger.info(f"✅ Создан MPEG-TS тишины: {file_size} байт")
+                return temp_file.name
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка создания MPEG-TS тишины: {e}")
+
+        return None
+
     def start_stream(self, use_audio: bool = True):
         """Запуск единого FFmpeg процесса для видео и аудио"""
         if not self.stream_key:
@@ -3001,6 +3088,12 @@ class FFmpegStreamManager:
             self.is_playing_audio = False
             self.is_playing_video = False
 
+            # Получаем дефолтное видео для заполнения эфира
+            default_video_path = self._create_default_video_file()
+            if not default_video_path:
+                logger.error("❌ Не удалось создать/найти дефолтное видео для заполнения эфира")
+                return {'success': False, 'error': 'Не удалось создать фоновое видео'}
+
             # УВЕЛИЧИВАЕМ БИТРЕЙТ ДЛЯ YOUTUBЕ
             video_bitrate = '4500k'  # Минимум для 1080p30
             maxrate = '6000k'  # Максимальный битрейт
@@ -3011,18 +3104,44 @@ class FFmpegStreamManager:
             logger.info(f"🔗 RTMP URL: {self.rtmp_url}")
             logger.info("⚠️  Минимальные требования YouTube для 1080p: видео 4500k, аудио 128k")
 
-            # ВАЖНО: ОДИН PIPE для видео+аудио в формате MPEG-TS
+            # НОВЫЙ ФИЛЬТР: Используем сложный фильтр для непрерывного потока
+            # 1. Создаем бесконечный фоновый поток из дефолтного видео
+            # 2. Создаем MPEG-TS поток через pipe
+            # 3. Объединяем их для непрерывности
+
             ffmpeg_cmd = [
                 'ffmpeg',
 
-                # Входные параметры - исправляем обработку MPEG-TS
+                # Вход 0: бесконечный фоновый поток из дефолтного видео
+                '-re',  # Реальное время
+                '-stream_loop', '-1',  # Бесконечный цикл
+                '-i', default_video_path,
+
+                # Вход 1: MPEG-TS поток через pipe (основной контент)
                 '-f', 'mpegts',
                 '-i', 'pipe:0',
 
+                # СЛОЖНЫЙ ФИЛЬТР: объединяем потоки
+                # Используем [1:v] если есть видео в MPEG-TS, иначе [0:v] (фоновое)
+                # Аудио всегда из MPEG-TS
+                '-filter_complex',
+                '[1:v]setpts=PTS-STARTPTS[v_main];'  # Сбрасываем PTS для основного видео
+                '[0:v]setpts=PTS-STARTPTS[v_bg];'  # Сбрасываем PTS для фона
 
-                # Видео кодирование - оптимизировано для потоковой передачи
+                # Если в MPEG-TS есть видео, используем его, иначе фоновое видео
+                '[v_main]select=if(gt(n\,0)\,lt(n\,2))[v_temp];'  # Выбираем первые 2 кадра MPEG-TS для проверки
+                '[v_temp]null[v_check];'  # Проверяем доступность видео
+
+                # Автоматическое переключение: MPEG-TS видео если есть, иначе фон
+                '[v_check][v_bg]concat=n=2:v=1:a=0[final_video];',
+
+                # Выбор потоков
+                '-map', '[final_video]',  # Видео из фильтра
+                '-map', '1:a:0',  # Аудио из MPEG-TS потока
+
+                # Видео кодирование
                 '-c:v', 'libx264',
-                '-preset', 'veryfast',  # Быстрее чем medium для снижения задержки
+                '-preset', 'veryfast',
                 '-tune', 'zerolatency',
                 '-pix_fmt', 'yuv420p',
                 '-profile:v', 'high',
@@ -3030,7 +3149,7 @@ class FFmpegStreamManager:
                 '-g', '60',
                 '-keyint_min', '60',
                 '-sc_threshold', '0',
-                '-bf', '0',  # Убрать B-кадры для уменьшения задержки
+                '-bf', '0',
                 '-b:v', video_bitrate,
                 '-maxrate', maxrate,
                 '-bufsize', bufsize,
@@ -3038,28 +3157,154 @@ class FFmpegStreamManager:
                 '-s', f'{self.video_width}x{self.video_height}',
                 '-x264opts', 'nal-hrd=cbr:force-cfr=1',
                 '-flags', '+global_header',
+                '-force_key_frames', 'expr:gte(t,n_forced*2)',
 
-                # Аудио кодирование - исправляем синхронизацию
+                # Аудио кодирование
                 '-c:a', 'aac',
                 '-b:a', audio_bitrate,
                 '-ar', '44100',
                 '-ac', '2',
                 '-strict', 'experimental',
-                '-async', '1000',  # Синхронизация аудио
+                '-async', '1000',
 
                 # Формат вывода с улучшенной обработкой ошибок
                 '-f', 'flv',
                 '-flvflags', 'no_duration_filesize',
-                '-max_muxing_queue_size', '1024',  # Критически важно!
+                '-max_muxing_queue_size', '1024',
                 '-muxdelay', '0',
                 '-muxpreload', '0',
 
                 self.rtmp_url
             ]
 
-            logger.info(f"🚀 Запуск FFmpeg с MPEG-TS pipe...")
-            logger.info(
-                f"📊 Настройки: видео={video_bitrate}, аудио={audio_bitrate}, {self.video_width}x{self.video_height}")
+            # Альтернативная простая версия с fallback
+            ffmpeg_cmd_simple = [
+                'ffmpeg',
+
+                # Создаем тестовый источник для фона (бесконечный)
+                '-f', 'lavfi',
+                '-i', f'color=c=black:s={self.video_width}x{self.video_height}:r={self.video_fps}',
+
+                # Вход для MPEG-TS потока
+                '-f', 'mpegts',
+                '-i', 'pipe:0',
+
+                # Фильтр для overlay (MPEG-TS поверх фона)
+                '-filter_complex',
+                f'[0:v]scale={self.video_width}:{self.video_height}[bg];'  # Фон
+                '[1:v]scale=iw:-1[main];'  # Основное видео
+                '[bg][main]overlay=(W-w)/2:(H-h)/2:shortest=1[v];',  # Накладываем
+
+                '-map', '[v]',  # Видео из фильтра
+                '-map', '1:a:0',  # Аудио из MPEG-TS
+
+                # Видео кодирование
+                '-c:v', 'libx264',
+                '-preset', 'veryfast',
+                '-tune', 'zerolatency',
+                '-pix_fmt', 'yuv420p',
+                '-profile:v', 'high',
+                '-level', '4.1',
+                '-g', '60',
+                '-keyint_min', '60',
+                '-sc_threshold', '0',
+                '-bf', '0',
+                '-b:v', video_bitrate,
+                '-maxrate', maxrate,
+                '-bufsize', bufsize,
+                '-r', str(self.video_fps),
+                '-s', f'{self.video_width}x{self.video_height}',
+                '-x264opts', 'nal-hrd=cbr:force-cfr=1',
+                '-flags', '+global_header',
+                '-force_key_frames', 'expr:gte(t,n_forced*2)',
+
+                # Аудио кодирование
+                '-c:a', 'aac',
+                '-b:a', audio_bitrate,
+                '-ar', '44100',
+                '-ac', '2',
+                '-strict', 'experimental',
+                '-async', '1000',
+
+                # Формат вывода
+                '-f', 'flv',
+                '-flvflags', 'no_duration_filesize',
+                '-max_muxing_queue_size', '1024',
+                '-muxdelay', '0',
+                '-muxpreload', '0',
+
+                self.rtmp_url
+            ]
+
+            # Более надежная версия с буферизацией и тестовым видео
+            ffmpeg_cmd_reliable = [
+                'ffmpeg',
+
+                # Вход 1: тестовый источник (бесконечный)
+                '-f', 'lavfi',
+                '-i', f'color=c=black:s={self.video_width}x{self.video_height}:r={self.video_fps}:duration=999999',
+
+                # Вход 2: MPEG-TS поток (основной контент)
+                '-f', 'mpegts',
+                '-thread_queue_size', '512',  # Увеличиваем буфер
+                '-i', 'pipe:0',
+
+                # Используем простой фильтр для надежности
+                # FFmpeg автоматически использует видео из второго входа когда оно доступно
+                '-map', '1:v:0?',  # Видео из MPEG-TS (опционально)
+                '-map', '0:v:0?',  # Видео из тестового источника (опционально)
+                '-map', '1:a:0',  # Аудио из MPEG-TS
+
+                # Автоматическое переключение источников
+                '-filter_complex',
+                '[1:v]null[main];[0:v]null[bg];'  # Определяем источники
+                '[bg][main]concat=n=2:v=1:a=0[v];',  # Конкатенируем
+
+                # Видео кодирование
+                '-c:v', 'libx264',
+                '-preset', 'veryfast',
+                '-tune', 'zerolatency',
+                '-pix_fmt', 'yuv420p',
+                '-profile:v', 'high',
+                '-level', '4.1',
+                '-g', '60',
+                '-keyint_min', '60',
+                '-sc_threshold', '0',
+                '-bf', '0',
+                '-b:v', video_bitrate,
+                '-maxrate', maxrate,
+                '-bufsize', bufsize,
+                '-r', str(self.video_fps),
+                '-s', f'{self.video_width}x{self.video_height}',
+                '-x264opts', 'nal-hrd=cbr:force-cfr=1',
+                '-flags', '+global_header',
+                '-force_key_frames', 'expr:gte(t,n_forced*2)',
+
+                # Аудио кодирование
+                '-c:a', 'aac',
+                '-b:a', audio_bitrate,
+                '-ar', '44100',
+                '-ac', '2',
+                '-strict', 'experimental',
+                '-async', '1000',
+
+                # Формат вывода
+                '-f', 'flv',
+                '-flvflags', 'no_duration_filesize',
+                '-max_muxing_queue_size', '2048',  # Увеличиваем буфер
+                '-muxdelay', '0',
+                '-muxpreload', '0',
+
+                self.rtmp_url
+            ]
+
+            # Используем надежную версию
+            ffmpeg_cmd = ffmpeg_cmd_reliable
+
+            logger.info(f"🚀 Запуск НЕПРЕРЫВНОГО FFmpeg стрима...")
+            logger.info(f"🎬 Фоновое видео: бесконечный черный экран")
+            logger.info(f"📥 Основной контент: MPEG-TS через pipe")
+            logger.info(f"📊 Настройки: видео={video_bitrate}, аудио={audio_bitrate}")
 
             # Запускаем FFmpeg процесс
             try:
@@ -3080,6 +3325,8 @@ class FFmpegStreamManager:
             self.ffmpeg_stdin = self.stream_process.stdin  # Для MPEG-TS потока
 
             logger.info(f"✅ FFmpeg запущен (PID: {self.ffmpeg_pid})")
+            logger.info("🎬 Фоновый поток запущен (бесконечный черный экран)")
+            logger.info("📥 Ожидание MPEG-TS данных через pipe...")
 
             # АВТОМАТИЧЕСКОЕ ДОБАВЛЕНИЕ ВИДЕО ИЗ КЭША ПРИ ЗАПУСКЕ
             logger.info("🔍 Автоматическое добавление видео из кэша...")
@@ -3097,15 +3344,19 @@ class FFmpegStreamManager:
 
             threading.Thread(target=self._periodic_cache_cleanup, daemon=True).start()
 
+            # Запускаем фоновый генератор тишины (чтобы pipe не был пустым)
+            threading.Thread(target=self._background_silence_generator, daemon=True).start()
+
             socketio.emit('stream_started', {
                 'pid': self.ffmpeg_pid,
                 'rtmp_url': self.rtmp_url,
                 'has_video': True,
                 'has_audio': True,
-                'mode': 'mpegts_pipe',
+                'mode': 'continuous_with_background',
                 'bitrate': video_bitrate,
                 'resolution': f'{self.video_width}x{self.video_height}',
                 'fps': self.video_fps,
+                'background_type': 'infinite_black',
                 'videos_added_from_cache': auto_added
             })
 
